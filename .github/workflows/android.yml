@@ -1,0 +1,67 @@
+name: Build Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Ensure Target for Active Toolchain
+        run: rustup target add aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Download NNUE Net
+        run: |
+          if [ -f net.txt ]; then
+            NET_URL=$(cat net.txt | tr -d '\r\n')
+            NET_FILE=$(basename "$NET_URL")
+            echo "Downloading NNUE net from $NET_URL..."
+            curl -fsSL --retry 3 "$NET_URL" -o "$NET_FILE"
+            echo "CODA_EVALFILE=$(pwd)/$NET_FILE" >> $GITHUB_ENV
+          else
+            echo "Warning: net.txt not found!"
+          fi
+
+      - name: Build Coda for Android
+        run: |
+          cargo ndk -t arm64-v8a --platform 24 build \
+            --release \
+            --features embedded-net \
+            --bin coda \
+            --config 'build.rustflags=[]'
+          
+          mkdir -p dist/bin
+          cp target/aarch64-linux-android/release/coda dist/bin/coda
+
+      - name: Verify Binary
+        run: |
+          ls -lh dist/bin/
+          file dist/bin/*
+
+      - name: Upload Android Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coda-android-arm64
+          path: dist/bin/*
