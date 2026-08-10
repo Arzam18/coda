@@ -600,6 +600,7 @@ mod tests {
     /// move that doesn't apply to the position after `e4f4`.
     #[test]
     fn search_pv_legal_oezkrut_move79() {
+
         crate::init();
         let tb = match make_tb() {
             Some(tb) => tb,

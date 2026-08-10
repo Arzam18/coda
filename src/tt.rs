@@ -627,15 +627,15 @@ pub const MATE_SCORE: i32 = 29000; // distinct from Infinity = 30000
 pub const TB_WIN: i32 = 28800;
 
 /// Lowest magnitude a true mate score can take. A mate found at ply `p` is
-/// stored as `MATE_SCORE - p`, and the search caps ply at `MAX_PLY` (=128,
-/// search.rs), so the deepest mate is `MATE_SCORE - MAX_PLY` = 28872.
+/// stored as `MATE_SCORE - p`, and the search caps ply at `MAX_PLY` (=160,
+/// search.rs), so the deepest mate is `MATE_SCORE - MAX_PLY` = 28840.
 ///
 /// Mate-recognition guards MUST compare against this, NOT a hardcoded
 /// `MATE_SCORE - 100` (=28900): that bound sits ABOVE the deepest mate, so
-/// mates at ply 100..=128 (mate-in-~50..64 — reachable now that searches hit
-/// depth 50-64) fall in `[28872, 28900)` and were misclassified as ordinary
+/// mates at ply 100..=160 (mate-in-~50..80 — reachable now that searches hit
+/// depth 50-80) fall in `[28840, 28900)` and were misclassified as ordinary
 /// scores (mis-scaled, NMP/pruned, mis-reported). Stays clear of the TB band
-/// (`TB_WIN` = 28800): the gap `[28800, 28872)` is empty, so this never
+/// (`TB_WIN` = 28800): the gap `[28800, 28840)` is empty, so this never
 /// admits a TB score as a mate. (`MATE_SCORE - 100` is also why
 /// `is_decisive` exists — TB scores slip under it; that helper is unchanged.)
 pub const MATE_IN_MAX_PLY: i32 = MATE_SCORE - crate::search::MAX_PLY as i32;
@@ -646,7 +646,7 @@ pub fn is_mate_score(score: i32) -> bool {
 }
 
 /// True for any decisive score: mate OR tablebase range. The widespread
-/// `|s| < MATE_IN_MAX_PLY` (= 28872) mate guards admit TB scores (TB_WIN =
+/// `|s| < MATE_IN_MAX_PLY` (= 28840) mate guards admit TB scores (TB_WIN =
 /// 28800, stored as TB_WIN - ply, sits below the mate band) — use this where
 /// TB scores must also be excluded (SF/Stormphrax is_decisive;
 /// 2026-06-11 audit T2.3).
@@ -735,7 +735,7 @@ mod tests {
     /// The mate-recognition boundary must (a) catch the deepest possible mate
     /// (`MATE_SCORE - MAX_PLY`, mate-in-~64), and (b) never admit a TB score.
     /// Regressing to a hardcoded `MATE_SCORE - 100` reintroduces the
-    /// misclassification of mates at ply 100..=128.
+    /// misclassification of mates at ply 100..=160.
     #[test]
     fn test_mate_in_max_ply_boundary() {
         let max_ply = crate::search::MAX_PLY as i32;
@@ -1012,3 +1012,67 @@ mod targeted_tests {
     }
 }
 
+
+/// Reported-score scale, in percent (100 = unscaled). Display-only: applied at
+/// the UCI `score cp` boundary by [`format_uci_score`], never to the value the
+/// search reasons about. Exists because Coda's cp are denominated on LC0's
+/// scale, which matters for score-triggered tournament rules — one-sided resign
+/// adjudication and CCRL-style "opening too lopsided" rejection both key off the
+/// printed number.
+///
+/// **Default 39 = divide reported cp by ~2.56.** The prod-net value was 43,
+/// measured 2026-08-04 by four independent routes that agreed:
+///
+/// | method | Coda(prod) / field |
+/// |---|---|
+/// | `SEE_MATERIAL_SCALE` (internal, Elo-tuned, no external reference) | 2.11 |
+/// | CCRL 126th Amateur D1, 31 games vs SF at real LTC depth | 2.27 |
+/// | same, median across 15 opponents | 2.27 |
+/// | LC0-label arithmetic (Coda 0.675 x label vs SF 0.258 x label) | 2.62 |
+///
+/// The BT4 production net (60F72A31) reads **1.114x** the prod net's scale —
+/// consistent across all 8 peers (1.098-1.134) and corroborated by held-out
+/// labels (1.158) and static evals (1.161) — so 43 / 1.114 = 39.
+///
+/// Measure with `eval_scale_probe.py`, which pins ScoreScale=100 so it reads
+/// INTERNAL cp. Do NOT mix `eval-fens` (static) with searched scores.
+///
+/// Root cause is a units convention, NOT a training defect: SF trains on the
+/// same LC0 data with essentially the same WRM in-scaling (295.65 vs our 300)
+/// and simply divides by `NormalizeToPawnValue` before printing. We did not.
+/// Confirmed by prediction: SF should measure 0.256 x label; it measures 0.258.
+///
+/// This is DISPLAY-ONLY by design. Compressing the scale INTERNALLY was measured
+/// and rejected — it costs eval resolution (distinct eval values 1588 -> 1256
+/// across an in_scaling 300 -> 190 sweep, -21%) and barely touches the
+/// material-dependent shape (per-band spread 1.52x -> 1.44x). SF keeps full
+/// internal resolution and divides only when printing; so do we.
+///
+/// NOTE: `eval-fens` / `eval-dist` emit INTERNAL cp and are deliberately
+/// unaffected by this. Tooling that compares Coda's eval to another engine
+/// (net_report's overscore) must normalise separately.
+pub static REPORT_SCALE_PCT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(39);
+
+/// Format a search score as a UCI `score ...` field, applying the display scale.
+///
+/// **Only ordinary centipawn scores are scaled.** Mate scores are a ply count,
+/// not a magnitude. Tablebase scores are the subtle case: they are stored as
+/// `TB_WIN - ply` (28800 downwards), which sits BELOW `MATE_IN_MAX_PLY` (28840),
+/// so an `is_mate_score` guard would let them fall through to the cp branch and
+/// silently divide a tablebase win into a mid-range number. Guard with
+/// [`is_decisive`] instead, which covers both bands.
+pub fn format_uci_score(score: i32) -> String {
+    if is_mate_score(score) {
+        let mate_in = if score > 0 {
+            (MATE_SCORE - score + 1) / 2
+        } else {
+            -(MATE_SCORE + score + 1) / 2
+        };
+        return format!("score mate {}", mate_in);
+    }
+    if is_decisive(score) {
+        return format!("score cp {}", score); // TB band: report raw
+    }
+    let pct = REPORT_SCALE_PCT.load(std::sync::atomic::Ordering::Relaxed);
+    format!("score cp {}", if pct == 100 { score } else { score * pct / 100 })
+}

@@ -4,41 +4,43 @@
 /// Each active threat on the board contributes one feature index into the threat
 /// accumulator. Feature indices are perspective-relative with king-file mirroring.
 ///
-/// Reference: threat-feature encoding after Stockfish's threat features; the
-/// interaction map and target counts below follow Stockfish's tables.
+/// ATTRIBUTION
+///
+/// Threat inputs are not Coda's idea and not any single engine's. The input
+/// encoding was introduced in **Monty** by Viren6 and jw1912, who actively
+/// encouraged A/B engines to try it. It then spread quickly through the top
+/// engines, in this order:
+///
+///   Monty (AGPL)         origin, Viren6 / jw1912
+///   PlentyChess (GPL-3)  2025-10-12
+///   Stockfish (GPL-3)    2025-11-12, SFNNv10
+///   Reckless (AGPL)      2025-12-03
+///
+/// and is now used by Viridithas, Stormphrax, Hobbes and others. See
+/// PlentyChess PR #400 for the fullest public account of who contributed what.
+///
+/// Coda added threat inputs to its existing NNUE architecture. The interaction
+/// map and target counts follow the same shape as Stockfish's tables; those are
+/// functional facts about which pieces attack which, so every implementation
+/// converges on them.
+///
+/// **Reckless was the implementation Coda referenced while writing this.** Our
+/// 2026-07 licence audit found parts of the result too closely modelled on it,
+/// and those parts were reimplemented in Coda's own expression (see
+/// docs/license_analysis_2026-07-13.md). Rewriting the expression was the right
+/// fix for the licence question, but it is not a reason to drop the credit, and
+/// for a while we did drop it. This notice restores it.
+///
 /// Total features: ~66,864 (depends on piece-pair filtering).
 
-/// X-ray threat emission gate. Coda's threat enumeration emits X-ray features
-/// (a slider's threat THROUGH one blocker) that SF/Reckless do NOT. A net
-/// trained `--xray 0` never saw these features, so its inference MUST skip them
-/// (else mismatch corrupts eval). Set at net load from `xray_trained`; an env
-/// override (`CODA_NO_XRAY=1`) forces off on ANY net. Default ON →
-/// bit-identical for X-ray-trained (prod) nets.
-static EMIT_XRAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// Set X-ray emission from the loaded net's `xray_trained` flag (folds in the
-/// `CODA_NO_XRAY` env override). Called once per `NNUENet::load`.
-pub fn set_emit_xray(net_xray_trained: bool) {
-    let env_off = std::env::var("CODA_NO_XRAY").is_ok();
-    EMIT_XRAY.store(net_xray_trained && !env_off, std::sync::atomic::Ordering::Release);
-}
-
-/// Whether X-ray threat features should be emitted.
-#[inline(always)]
-pub fn emit_xray() -> bool {
-    EMIT_XRAY.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Test-only serialization guard for the process-global `EMIT_XRAY`.
 /// `cargo test` runs tests concurrently; any test that *mutates* `EMIT_XRAY`
 /// (the x-ray-OFF fuzzers) and any test that *depends* on its default value
 /// (threat enumeration/consistency tests) MUST hold this lock for their whole
 /// body, or the mutator's window corrupts a concurrent reader (spurious
-/// failures — see the x-ray-off test-isolation fix). Acquire with
-/// `.lock().unwrap_or_else(|e| e.into_inner())` so a genuinely-failing test's
-/// poison doesn't cascade into unrelated panics.
-#[cfg(test)]
-pub(crate) static XRAY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// failures — see the x-ray-off test-isolation fix).
+///
 
 #[cfg(feature = "profile-threats")]
 pub mod apply_stats {
@@ -76,12 +78,31 @@ pub mod apply_stats {
     // This is the architecture-pure "threat-model density" number.
     static GEN_MOVES: AtomicU64 = AtomicU64::new(0);
     static GEN_DELTAS: AtomicU64 = AtomicU64::new(0);
+    // Laziness sizing: how many generated entries are ever REPLAYED (unique —
+    // first walkback visit only, dual counts once). generated - consumed =
+    // delta-generation work that lazy generation could skip entirely.
+    static GEN_CONSUMED: AtomicU64 = AtomicU64::new(0);
 
     /// Record per-move generated delta count (once per make_move, at absorb).
     #[inline(always)]
     pub fn record_generated(n: usize) {
         GEN_MOVES.fetch_add(1, Ordering::Relaxed);
         GEN_DELTAS.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// Record first replay consumption of a generated entry (unique per
+    /// push/absorb generation instance; update_dual marks once).
+    #[inline(always)]
+    pub fn record_first_consume() {
+        GEN_CONSUMED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Refresh-cause split (walkback/Finny scoping, 2026-07-31):
+    // 0 = king mirror crossing, 1 = no accurate ancestor, 2 = delta overflow.
+    static REFRESH_CAUSE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    #[inline(always)]
+    pub fn record_refresh_cause(c: usize) {
+        REFRESH_CAUSE[c.min(2)].fetch_add(1, Ordering::Relaxed);
     }
 
     // Replay-gap distribution: plies replayed per materialization (index -
@@ -196,6 +217,21 @@ pub mod apply_stats {
         eprintln!(
             "  GENERATED (caching-immune): {} moves, {} deltas, avg {:.2} deltas/move (vs deltas/apply-call above which lazy-replay inflates)",
             gm, gd, gd as f64 / gm.max(1) as f64
+        );
+        {
+            let mc = REFRESH_CAUSE[0].load(Ordering::Relaxed);
+            let na = REFRESH_CAUSE[1].load(Ordering::Relaxed);
+            let ov = REFRESH_CAUSE[2].load(Ordering::Relaxed);
+            let tot = (mc + na + ov).max(1);
+            eprintln!("  REFRESH CAUSES (can_update=None): mirror-cross {} ({:.1}%), no-ancestor {} ({:.1}%), overflow {} ({:.1}%)",
+                mc, 100.0*mc as f64/tot as f64, na, 100.0*na as f64/tot as f64, ov, 100.0*ov as f64/tot as f64);
+        }
+        let gc = GEN_CONSUMED.load(Ordering::Relaxed);
+        eprintln!(
+            "  CONSUMED (unique first-replay): {} of {} generated = {:.1}% (remainder = {:.1}% of delta-generation work a lazy scheme could skip)",
+            gc, gm,
+            100.0 * gc as f64 / gm.max(1) as f64,
+            100.0 * (gm.saturating_sub(gc)) as f64 / gm.max(1) as f64
         );
         let rc = REPLAY_CALLS.load(Ordering::Relaxed);
         let g2p = REPLAY_GAP2P.load(Ordering::Relaxed);
@@ -539,7 +575,76 @@ struct ThreatTables {
     num_features: usize,
 }
 
-static THREAT_TABLES: std::sync::OnceLock<ThreatTables> = std::sync::OnceLock::new();
+// Two feature spaces are built at startup and the loaded net selects one:
+//   king-attacker ON  = 66,864 features (legacy/current prod nets)
+//   king-attacker OFF = 60,144 features (matches SF SFNNv13 full_threats.h
+//                       and Hobbes 3.0, both of which exclude the king as a
+//                       threat ATTACKER; king-as-victim was never tracked)
+// The net header's num_threat_features IS the marker — no extra flag bit.
+// Both table sets cost ~50 KB each, so building both is cheaper than any
+// scheme that defers construction until a net is known.
+static THREAT_TABLES_KING: std::sync::OnceLock<ThreatTables> = std::sync::OnceLock::new();
+static THREAT_TABLES_NOKING: std::sync::OnceLock<ThreatTables> = std::sync::OnceLock::new();
+/// Active table set. Release-stored at init and on net load, Acquire-loaded
+/// by readers (ARM ordering standard) — helper threads must see a fully
+/// constructed table set, and net loads happen before search threads spawn.
+static ACTIVE_TABLES: std::sync::atomic::AtomicPtr<ThreatTables> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// Mirrors the active set's king-attacker flag for the generation-side skips
+/// (hot path: avoids dereferencing the table pointer just to read one bool).
+static KING_ATTACKER_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Feature counts of the two supported threat spaces.
+pub const THREAT_FEATURES_KING: usize = 66864;
+pub const THREAT_FEATURES_NOKING: usize = 60144;
+
+/// Point the threat machinery at the feature space a just-loaded net was
+/// trained for. Returns Err for any count that is neither space — loading a
+/// mismatched net previously SUCCEEDED SILENTLY, indexing weight rows with a
+/// different feature space and producing garbage eval with no crash.
+pub fn select_feature_space(net_num_threat_features: usize) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let (cell, king) = match net_num_threat_features {
+        THREAT_FEATURES_KING => (&THREAT_TABLES_KING, true),
+        THREAT_FEATURES_NOKING => (&THREAT_TABLES_NOKING, false),
+        n => {
+            return Err(format!(
+                "net declares {} threat features; this build supports {} (king-attacker) \
+                 or {} (no-king). The count is the feature-space marker — a mismatched \
+                 net would index the wrong weight rows and eval garbage.",
+                n, THREAT_FEATURES_KING, THREAT_FEATURES_NOKING
+            ))
+        }
+    };
+    let ptr = cell.get().expect("init_threats() must run before net load")
+        as *const ThreatTables as *mut ThreatTables;
+    KING_ATTACKER_ON.store(king, Ordering::Release);
+    ACTIVE_TABLES.store(ptr, Ordering::Release);
+    Ok(())
+}
+
+
+/// Serialises tests that touch the process-global threat feature space.
+///
+/// `select_feature_space()` (called on every net load) swaps ACTIVE_TABLES and
+/// KING_ATTACKER_ON. Tests that load a real net therefore mutate global state
+/// that the threat-consistency tests depend on — and the repo root contains
+/// both 66,864 and 60,144 nets, so a parallel net-load can flip the space out
+/// from under a fuzz walk that already sized its weights for the other one
+/// (observed: "gap-fuzz divergence ... incr=-177 scratch=780").
+/// Both sides of that race must hold this lock. `unwrap_or_else(into_inner)`
+/// so one genuinely-failing test doesn't poison every other test.
+#[cfg(test)]
+pub(crate) static FEATURE_SPACE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// True when the active feature space tracks the king as an attacker.
+/// Generation-side skips read this to avoid emitting deltas the index
+/// mapping would discard anyway.
+#[inline(always)]
+fn king_attacker_on() -> bool {
+    KING_ATTACKER_ON.load(std::sync::atomic::Ordering::Acquire)
+}
 const FLIPPED_COLORED_PIECE: [usize; NUM_COLORED_PIECES] = [6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5];
 
 #[inline(always)]
@@ -552,9 +657,10 @@ fn flipped_colored_piece(cp: usize) -> usize {
 #[inline(always)]
 fn get_threat_tables() -> &'static ThreatTables {
     // SAFETY: init_threats() is called from `crate::init()` before any
-    // helper search threads spawn. OnceLock provides Acquire/Release
-    // ordering for the value, so the unchecked unwrap is safe post-init.
-    unsafe { THREAT_TABLES.get().unwrap_unchecked() }
+    // helper search threads spawn and publishes a non-null pointer to a
+    // 'static OnceLock payload; select_feature_space only ever swaps it for
+    // the other 'static payload. Acquire pairs with those Release stores.
+    unsafe { &*ACTIVE_TABLES.load(std::sync::atomic::Ordering::Acquire) }
 }
 
 /// Get the total threat feature count (call after init_threats).
@@ -616,7 +722,30 @@ pub fn piece_attacks_occ(piece_type: u8, color: Color, sq: u32, occ: Bitboard) -
 /// Initialise threat feature lookup tables. Must be called at startup
 /// before any helper search thread spawns.
 pub fn init_threats() {
-    // Built locally, then published via OnceLock for Acquire/Release ordering.
+    use std::sync::atomic::Ordering;
+    let king = build_threat_tables(true);
+    let noking = build_threat_tables(false);
+    let n_king = king.num_features;
+    let n_noking = noking.num_features;
+    let _ = THREAT_TABLES_KING.set(king);
+    let _ = THREAT_TABLES_NOKING.set(noking);
+    debug_assert_eq!(n_king, THREAT_FEATURES_KING);
+    debug_assert_eq!(n_noking, THREAT_FEATURES_NOKING);
+    // Default to the king-attacker space (current prod nets); a net load
+    // re-points this via select_feature_space.
+    let ptr = THREAT_TABLES_KING.get().expect("just set")
+        as *const ThreatTables as *mut ThreatTables;
+    KING_ATTACKER_ON.store(true, Ordering::Release);
+    ACTIVE_TABLES.store(ptr, Ordering::Release);
+    eprintln!("Threat features initialised: {} (king-attacker) / {} (no-king)",
+        n_king, n_noking);
+}
+
+/// Build one feature space. `king_attacker` selects whether the king is
+/// tracked as a threat attacker; it zeroes both the king's interaction-map
+/// row and its per-attacker target count, which is what drops the derived
+/// total from 66,864 to 60,144.
+fn build_threat_tables(king_attacker: bool) -> ThreatTables {
     let mut pairs = [[ThreatPair::default(); NUM_COLORED_PIECES]; NUM_COLORED_PIECES];
     let mut from_offset = [[0i32; 64]; NUM_COLORED_PIECES];
     let mut ray_rank = [[[0u8; 64]; 64]; NUM_COLORED_PIECES];
@@ -643,7 +772,8 @@ pub fn init_threats() {
             }
             slots[cp] = count;
             block_base[cp] = next_base;
-            next_base += PIECE_TARGET_COUNT[pt] * count;
+            let targets = if pt == 5 && !king_attacker { 0 } else { PIECE_TARGET_COUNT[pt] };
+            next_base += targets * count;
         }
     }
     let num_features = next_base as usize;
@@ -658,7 +788,7 @@ pub fn init_threats() {
             let vic_pt = piece_type_of(vic);
             let vic_color = color_of(vic);
 
-            let map = PIECE_INTERACTION_MAP[att_pt][vic_pt];
+            let map = if att_pt == 5 && !king_attacker { -1 } else { PIECE_INTERACTION_MAP[att_pt][vic_pt] };
             let tracked = map >= 0;
             // Same piece-type pairs are symmetric — except same-color pawns.
             let symmetric = att_pt == vic_pt && (att_color != vic_color || att_pt != 0);
@@ -683,16 +813,7 @@ pub fn init_threats() {
         }
     }
 
-    // Publish — OnceLock provides Acquire/Release ordering so reader
-    // threads see the fully-constructed value.
-    let _ = THREAT_TABLES.set(ThreatTables {
-        pairs,
-        from_offset,
-        ray_rank,
-        num_features,
-    });
-
-    eprintln!("Threat features initialised: {} total", num_features);
+    ThreatTables { pairs, from_offset, ray_rank, num_features }
 }
 
 /// Compute a single threat feature index.
@@ -775,62 +896,6 @@ pub fn enumerate_threats<F: FnMut(usize)>(
                     }
                 }
 
-                // X-ray threats: for sliders, find the second piece on each ray
-                // (the piece behind the directly attacked piece). Matches Bullet
-                // training enumeration at ebdf398.
-                // Gated for no-X-ray nets (emit_xray / set_emit_xray).
-                if emit_xray() && (pt == BISHOP || pt == ROOK || pt == QUEEN) {
-                    // Check each ray direction using attack comparison
-                    // For each directly attacked piece, see if removing it reveals another
-                    let mut direct_targets = attacks & occ;
-                    while direct_targets != 0 {
-                        let blocker_sq = direct_targets.trailing_zeros();
-                        direct_targets &= direct_targets - 1;
-
-                        // Compute slider attacks without the blocking piece
-                        let occ_without = occ & !(1u64 << blocker_sq);
-                        let attacks_through = piece_attacks_occ(pt, color, sq, occ_without);
-
-                        // Newly revealed squares: attacked without blocker but not with
-                        let revealed = attacks_through & !attacks & occ_without;
-                        if revealed == 0 { continue; }
-
-                        // Take the closest revealed piece on the ray
-                        // Direction: if slider < blocker, xray is above blocker.
-                        //
-                        // Bounds note: at blocker_sq == 63, the original
-                        // `1u64 << (blocker_sq + 1)` was `1u64 << 64` —
-                        // undefined-behaviour in Rust (panics in debug, x86
-                        // shift wraps to `<< 0` in release giving wrong mask).
-                        // The upstream `revealed == 0` check happens to filter
-                        // this case (no squares > 63), but it's fragile —
-                        // any change to that filter surfaces silent corruption.
-                        let xray_sq = if sq < blocker_sq {
-                            let above_mask = if blocker_sq + 1 < 64 {
-                                !((1u64 << (blocker_sq + 1)) - 1)
-                            } else { 0 };
-                            let above = revealed & above_mask;
-                            if above != 0 { above.trailing_zeros() } else { 64 }
-                        } else {
-                            // blocker_sq >= sq here, so blocker_sq >= 0; shift
-                            // by 0..63 is always defined.
-                            let below = revealed & ((1u64 << blocker_sq) - 1);
-                            if below != 0 { 63 - below.leading_zeros() } else { 64 }
-                        };
-
-                        if xray_sq < 64 {
-                            let xpt = mailbox[xray_sq as usize];
-                            if xpt < 6 {
-                                let xcolor = if white_bb & (1u64 << xray_sq) != 0 { WHITE } else { BLACK };
-                                let xcp = colored_piece(xcolor, xpt);
-                                let idx = threat_index(cp, sq, xcp, xray_sq, mirrored, pov);
-                                if idx >= 0 {
-                                    callback(idx as usize);
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -901,42 +966,6 @@ pub fn enumerate_threats_bullet_ref<F: FnMut(usize)>(
                     }
                 }
 
-                // X-ray threats — same closest-revealed-piece logic as
-                // `enumerate_threats`, but with bf-frame semi-excl.
-                if pt == BISHOP || pt == ROOK || pt == QUEEN {
-                    let mut direct_targets = attacks & occ;
-                    while direct_targets != 0 {
-                        let blocker_sq = direct_targets.trailing_zeros();
-                        direct_targets &= direct_targets - 1;
-                        let occ_without = occ & !(1u64 << blocker_sq);
-                        let attacks_through = piece_attacks_occ(pt, color, sq, occ_without);
-                        let revealed = attacks_through & !attacks & occ_without;
-                        if revealed == 0 { continue; }
-                        let xray_sq = if sq < blocker_sq {
-                            let above = revealed & !((1u64 << (blocker_sq + 1)) - 1);
-                            if above != 0 { above.trailing_zeros() } else { 64 }
-                        } else {
-                            let below = revealed & ((1u64 << blocker_sq) - 1);
-                            if below != 0 { 63 - below.leading_zeros() } else { 64 }
-                        };
-                        if xray_sq < 64 {
-                            let xpt = mailbox[xray_sq as usize];
-                            if xpt < 6 {
-                                let xcolor = if white_bb & (1u64 << xray_sq) != 0 { WHITE } else { BLACK };
-                                let xcp = colored_piece(xcolor, xpt);
-                                let xray_bf = xray_sq ^ bf_flip;
-                                let idx = threat_index_bullet_ref(
-                                    cp, sq, sq_bf,
-                                    xcp, xray_sq, xray_bf,
-                                    mirrored, pov,
-                                );
-                                if idx >= 0 {
-                                    callback(idx as usize);
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1067,47 +1096,6 @@ pub fn enumerate_threats_bullet_postfix_ref<F: FnMut(usize)>(
                     }
                 }
 
-                if pt == BISHOP || pt == ROOK || pt == QUEEN {
-                    let mut direct_targets = attacks & bf_occ;
-                    while direct_targets != 0 {
-                        let blocker_sq = direct_targets.trailing_zeros();
-                        direct_targets &= direct_targets - 1;
-                        let occ_without = bf_occ & !(1u64 << blocker_sq);
-                        let attacks_through =
-                            piece_attacks_occ(pt, pov_for_attack, sq_bf, occ_without);
-                        let revealed = attacks_through & !attacks & occ_without;
-                        if revealed == 0 { continue; }
-                        let xray_sq = if sq_bf < blocker_sq {
-                            let above = revealed & !((1u64 << (blocker_sq + 1)) - 1);
-                            if above != 0 { above.trailing_zeros() } else { 64 }
-                        } else {
-                            let below = revealed & ((1u64 << blocker_sq) - 1);
-                            if below != 0 { 63 - below.leading_zeros() } else { 64 }
-                        };
-                        if xray_sq >= 64 { continue; }
-                        let xpt = bf_mailbox[xray_sq as usize];
-                        if xpt >= 6 { continue; }
-                        let xbf_color: u8 =
-                            if (bf_colors[0] >> xray_sq) & 1 != 0 { 0 } else { 1 };
-                        let xreal_color: Color =
-                            if xbf_color == 0 { real_stm } else { 1 - real_stm };
-                        let xcp = colored_piece(xreal_color, xpt);
-                        let xray_phys = xray_sq ^ bf_flip;
-
-                        let is_pawn = pt == PAWN;
-                        let same_type = pt == xpt;
-                        let semi_excl_pair =
-                            same_type && (bf_color != xbf_color || !is_pawn);
-                        if semi_excl_pair && (sq_bf ^ phys_flip) < (xray_sq ^ phys_flip) {
-                            continue;
-                        }
-
-                        let idx = threat_index(cp, sq_phys, xcp, xray_phys, mirrored, pov);
-                        if idx >= 0 {
-                            callback(idx as usize);
-                        }
-                    }
-                }
             }
         }
     }
@@ -1226,7 +1214,14 @@ fn push_threats_for_piece(
     #[cfg(feature = "profile-threats")]
     let s1_deltas_before = deltas.len() as u64;
 
-    let my_attacks = piece_attacks_occ(piece_type, piece_color, square, occ);
+    // No-king space: the king emits no attacker-side features, so skip the
+    // enumeration rather than emitting deltas the index mapping discards.
+    let skip_king_attacks = piece_type == 5 && !king_attacker_on();
+    let my_attacks = if skip_king_attacks {
+        0
+    } else {
+        piece_attacks_occ(piece_type, piece_color, square, occ)
+    };
     let mut attacked_occ = my_attacks & occ;
     while attacked_occ != 0 {
         let target_sq = attacked_occ.trailing_zeros();
@@ -1244,12 +1239,6 @@ fn push_threats_for_piece(
         deltas.len() as u64 - s1_deltas_before,
     );
 
-    // 1b. X-ray threats FROM this piece, if it's a slider. For each
-    // direct target (blocker), find the next occupant on the same ray
-    // STRICTLY BEYOND the blocker. Previously recomputed full attacks
-    // with the blocker removed per-iteration (one magic lookup each).
-    // Now uses the precomputed RAY_EXTENSION table: one array read
-    // replaces the per-blocker magic lookup.
     #[cfg(feature = "profile-threats")]
     let s1b_start = crate::threats::thr_stats::rdtsc();
     #[cfg(feature = "profile-threats")]
@@ -1266,60 +1255,6 @@ fn push_threats_for_piece(
     let mut own_xray_invalid = 0u64;
     #[cfg(feature = "profile-threats")]
     let mut own_xray_emits = 0u64;
-    if emit_xray() && (piece_type == BISHOP || piece_type == ROOK || piece_type == QUEEN) {
-        let mut direct_targets = my_attacks & occ;
-        #[cfg(feature = "profile-threats")]
-        if direct_targets == 0 {
-            own_xray_no_direct += 1;
-        }
-        while direct_targets != 0 {
-            let blocker_sq = direct_targets.trailing_zeros();
-            direct_targets &= direct_targets - 1;
-            #[cfg(feature = "profile-threats")]
-            {
-                own_xray_blockers += 1;
-            }
-
-            let extension = crate::bitboard::ray_extension(square, blocker_sq);
-            let xray_candidates = extension & occ;
-            if xray_candidates == 0 {
-                #[cfg(feature = "profile-threats")]
-                {
-                    own_xray_no_behind += 1;
-                }
-                continue;
-            }
-
-            // First occupant past the blocker on the same ray direction.
-            let xray_sq = if square < blocker_sq {
-                xray_candidates.trailing_zeros()
-            } else {
-                63 - xray_candidates.leading_zeros()
-            };
-            let xpt = mailbox[xray_sq as usize];
-            if xpt >= 6 {
-                #[cfg(feature = "profile-threats")]
-                {
-                    own_xray_invalid += 1;
-                }
-                continue;
-            }
-            let xcolor = if white_bb & (1u64 << xray_sq) != 0 { WHITE } else { BLACK };
-            deltas.push(RawThreatDelta::new(
-                cp as u8, square as u8,
-                colored_piece(xcolor, xpt) as u8, xray_sq as u8, add,
-            ));
-            #[cfg(feature = "profile-threats")]
-            {
-                own_xray_emits += 1;
-            }
-        }
-    } else {
-        #[cfg(feature = "profile-threats")]
-        {
-            own_xray_nonslider += 1;
-        }
-    }
 
     #[cfg(feature = "profile-threats")]
     crate::threats::thr_stats::record_section(
@@ -1345,7 +1280,6 @@ fn push_threats_for_piece(
     let s2_deltas_before = deltas.len() as u64;
     let rook_att = rook_attacks(square, occ);
     let bishop_att = bishop_attacks(square, occ);
-    let queen_att = rook_att | bishop_att;
 
     let diagonal_sliders = (pieces_bb[BISHOP as usize] | pieces_bb[QUEEN as usize]) & bishop_att;
     let orthogonal_sliders = (pieces_bb[ROOK as usize] | pieces_bb[QUEEN as usize]) & rook_att;
@@ -1361,11 +1295,6 @@ fn push_threats_for_piece(
     // is computed once here and reused. Cost: 2 magic lookups + 4
     // bitwise ops. Savings per skipped slider: 2 magic lookups.
     // Break-even at 1 skipped slider.
-    let ortho_ray_mask = rook_attacks_empty(square);
-    let diag_ray_mask  = bishop_attacks_empty(square);
-    let rays_from_sq_empty = ortho_ray_mask | diag_ray_mask;
-    let past_first_region  = rays_from_sq_empty & !queen_att;
-    let do_z_finding       = emit_xray() && (occ & past_first_region) != 0;
 
     let emit_slider_sees = !skip_slider_sees();
     let mut sliders = (diagonal_sliders | orthogonal_sliders) & occ;
@@ -1391,43 +1320,7 @@ fn push_threats_for_piece(
         //
         // The slider's direct attack on `square` itself is emitted below.
         // This block emits only the Z-level delta.
-        if do_z_finding {
-            // Y = first occupant past `square` on slider_sq's ray through square.
-            // The ray_extension table gives squares strictly beyond `square`
-            // on the slider_sq→square ray direction; mask by occ and take the
-            // first bit in the slider→square direction.
-            //
-            // Replaces two magic lookups (slider_att_through, slider_att_blocked)
-            // and their difference/filter with a single table read.
-            let y_candidates = crate::bitboard::ray_extension(slider_sq, square) & occ;
-            if y_candidates != 0 {
-                let y_sq = if slider_sq < square {
-                    y_candidates.trailing_zeros()
-                } else {
-                    63 - y_candidates.leading_zeros()
-                };
-
-                // Z = first occupant past Y on the same ray, one hop further out.
-                // Same table-driven technique.
-                let z_candidates = crate::bitboard::ray_extension(slider_sq, y_sq) & occ;
-                if z_candidates != 0 {
-                    let z_sq = if slider_sq < square {
-                        z_candidates.trailing_zeros()
-                    } else {
-                        63 - z_candidates.leading_zeros()
-                    };
-                    let zpt = mailbox[z_sq as usize];
-                    if zpt < 6 {
-                        let zcolor = if white_bb & (1u64 << z_sq) != 0 { WHITE } else { BLACK };
-                        deltas.push(RawThreatDelta::new(
-                            slider_cp as u8, slider_sq as u8,
-                            colored_piece(zcolor, zpt) as u8, z_sq as u8,
-                            !add,
-                        ));
-                    }
-                }
-            }
-        } else if !emit_xray() {
+        {
             // X-ray OFF: the slider's direct attack on the first piece past
             // `square` (Y) is blocked/unblocked as `square` appears/vanishes.
             // With x-ray ON that direct feature is PRESERVED as an x-ray to the
@@ -1507,10 +1400,7 @@ fn push_threats_for_piece(
     // has `to` cleared. Without this mask, a moved slider would be iterated
     // as an x-ray candidate for its own source square and emit a spurious
     // 2b delta. Section 2 applies the same filter (`sliders & occ`).
-    let ortho_candidates = (pieces_bb[ROOK as usize] | pieces_bb[QUEEN as usize]) & ortho_ray_mask & occ;
-    let diag_candidates  = (pieces_bb[BISHOP as usize] | pieces_bb[QUEEN as usize]) & diag_ray_mask & occ;
     // 2b is X-ray (slider-through-blocker); gate on the X-ray emission flag.
-    let mut candidates = if emit_xray() { ortho_candidates | diag_candidates } else { 0 };
     #[cfg(feature = "profile-threats")]
     let mut s2b_no_candidates = 0u64;
     #[cfg(feature = "profile-threats")]
@@ -1527,103 +1417,13 @@ fn push_threats_for_piece(
     let mut s2b_sq_emits = 0u64;
     #[cfg(feature = "profile-threats")]
     let mut s2b_no_w = 0u64;
+    // Repair 2026-07-31: this local's feeding code went with the splat/x-ray
+    // cleanup but record_s2b_reasons still takes it; keep it declared (always
+    // 0) so the profile-threats feature compiles. Stale-diagnostic tidy-up is
+    // a separate change.
     #[cfg(feature = "profile-threats")]
-    let mut s2b_w_emits = 0u64;
-    #[cfg(feature = "profile-threats")]
-    if candidates == 0 {
-        s2b_no_candidates += 1;
-    }
+    let s2b_w_emits = 0u64;
 
-    while candidates != 0 {
-        let s_sq = candidates.trailing_zeros();
-        candidates &= candidates - 1;
-        #[cfg(feature = "profile-threats")]
-        {
-            s2b_candidates += 1;
-        }
-
-        // Count blockers strictly between S and sq. between() excludes
-        // endpoints, so occ (not occ_rays) is the right mask — sq is not
-        // in the between set.
-        let between_mask = crate::bitboard::between(s_sq, square);
-        let blockers_between = between_mask & occ;
-        let blockers_count = blockers_between.count_ones();
-        if blockers_count != 1 {
-            // 0 → direct attacker (section 2 handles). 2+ → 2+ level x-ray
-            // (not encoded). Neither emits a 2b delta.
-            #[cfg(feature = "profile-threats")]
-            {
-                if blockers_count == 0 {
-                    s2b_blockers_zero += 1;
-                } else {
-                    s2b_blockers_multi += 1;
-                }
-            }
-            continue;
-        }
-        #[cfg(feature = "profile-threats")]
-        {
-            s2b_exact_one += 1;
-        }
-
-        let s_pt = mailbox[s_sq as usize];
-        // Set-membership already guarantees slider-type match for ray.
-        // Defensive check retained for robustness; should never fail.
-        if s_pt >= 6 {
-            #[cfg(feature = "profile-threats")]
-            {
-                s2b_invalid += 1;
-            }
-            continue;
-        }
-
-        let s_color = if white_bb & (1u64 << s_sq) != 0 { WHITE } else { BLACK };
-        let s_cp = colored_piece(s_color, s_pt);
-        // (S, cp_at_sq, sq) x-ray feature appears/disappears with `add`.
-        deltas.push(RawThreatDelta::new(
-            s_cp as u8, s_sq as u8, cp as u8, square as u8, add,
-        ));
-        #[cfg(feature = "profile-threats")]
-        {
-            s2b_sq_emits += 1;
-        }
-
-        // W = first piece past sq on the ray from S, continuing in the
-        // S→sq direction (away from S past sq). ray_extension(S, sq)
-        // returns squares strictly beyond sq on that ray.
-        // Direction: if S < sq we extend upward (pick lowest bit);
-        //            if S > sq we extend downward (pick highest bit).
-        let w_candidates_bb = crate::bitboard::ray_extension(s_sq, square) & occ;
-        if w_candidates_bb != 0 {
-            let w_sq = if s_sq < square {
-                w_candidates_bb.trailing_zeros()
-            } else {
-                63 - w_candidates_bb.leading_zeros()
-            };
-            let w_pt = mailbox[w_sq as usize];
-            if w_pt < 6 {
-                let w_color = if white_bb & (1u64 << w_sq) != 0 { WHITE } else { BLACK };
-                let w_cp = colored_piece(w_color, w_pt);
-                deltas.push(RawThreatDelta::new(
-                    s_cp as u8, s_sq as u8, w_cp as u8, w_sq as u8, !add,
-                ));
-                #[cfg(feature = "profile-threats")]
-                {
-                    s2b_w_emits += 1;
-                }
-            } else {
-                #[cfg(feature = "profile-threats")]
-                {
-                    s2b_invalid += 1;
-                }
-            }
-        } else {
-            #[cfg(feature = "profile-threats")]
-            {
-                s2b_no_w += 1;
-            }
-        }
-    }
 
     #[cfg(feature = "profile-threats")]
     crate::threats::thr_stats::record_section(
@@ -1653,7 +1453,11 @@ fn push_threats_for_piece(
     let black_pawns = pieces_bb[PAWN as usize] & colors_bb[BLACK as usize] & pawn_attacks(WHITE, square);
     let white_pawns = pieces_bb[PAWN as usize] & colors_bb[WHITE as usize] & pawn_attacks(BLACK, square);
     let knights = pieces_bb[KNIGHT as usize] & knight_attacks(square);
-    let kings = pieces_bb[KING as usize] & king_attacks(square);
+    let kings = if king_attacker_on() {
+        pieces_bb[KING as usize] & king_attacks(square)
+    } else {
+        0
+    };
 
     let mut non_sliders = (black_pawns | white_pawns | knights | kings) & occ;
     while non_sliders != 0 {
@@ -1968,23 +1772,22 @@ unsafe fn apply_threat_indices(
     adds: &[usize],
     subs: &[usize],
 ) {
-    // Prefetch weight rows for upcoming deltas (hide L3 latency)
+    // Prefetch the FIRST CHUNK (128 bytes = 2 lines) of every row before the
+    // kernel starts. The kernels walk all rows chunk-by-chunk, so chunk-0
+    // accesses are the cold misses; later chunks are covered by the in-loop
+    // next-chunk prefetch plus hardware stream prefetchers. Line-0-of-first-
+    // 4-rows (the previous form) left ~15 rows × 2 lines cold per call —
+    // perf annotate showed the row loads (vpmovsxbw) stalling at 16%+ of
+    // the function. Capped at 24 rows to bound issue cost on refresh-sized
+    // delta lists (avg 9.4 rows, p99 ≈ 48).
     #[cfg(target_arch = "x86_64")]
     {
-        for &idx in adds.iter().take(4) {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        for &idx in adds.iter().chain(subs.iter()).take(24) {
             unsafe {
-                std::arch::x86_64::_mm_prefetch(
-                    threat_weights.as_ptr().add(idx * hidden_size) as *const i8,
-                    std::arch::x86_64::_MM_HINT_T0,
-                );
-            }
-        }
-        for &idx in subs.iter().take(4) {
-            unsafe {
-                std::arch::x86_64::_mm_prefetch(
-                    threat_weights.as_ptr().add(idx * hidden_size) as *const i8,
-                    std::arch::x86_64::_MM_HINT_T0,
-                );
+                let row = threat_weights.as_ptr().add(idx * hidden_size);
+                _mm_prefetch(row as *const i8, _MM_HINT_T0);
+                _mm_prefetch(row.add(64) as *const i8, _MM_HINT_T0);
             }
         }
     }
@@ -2082,11 +1885,22 @@ unsafe fn apply_deltas_avx2(
             for i in 0..nregs {
                 regs[i] = _mm256_loadu_si256(src_ptr.add(offset + i * 16) as *const __m256i);
             }
+            // Per-row next-chunk prefetch: while summing this row's bytes
+            // [offset, offset+CHUNK), pull its [offset+CHUNK, +2 lines) into
+            // L1 so the next outer-chunk iteration streams. Prefetch never
+            // faults, so no bounds guard is needed at the table tail.
+            let pf = offset + CHUNK < hidden_size;
             let mut ai = 0;
             let mut si = 0;
             while ai < adds.len() && si < subs.len() {
                 let aw = w_ptr.add(adds[ai] * hidden_size + offset);
                 let sw = w_ptr.add(subs[si] * hidden_size + offset);
+                if pf {
+                    _mm_prefetch(aw.add(CHUNK) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(aw.add(CHUNK + 64) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sw.add(CHUNK) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sw.add(CHUNK + 64) as *const i8, _MM_HINT_T0);
+                }
                 for i in 0..nregs {
                     let add_w = _mm256_cvtepi8_epi16(_mm_loadu_si128(aw.add(i * 16) as *const __m128i));
                     let sub_w = _mm256_cvtepi8_epi16(_mm_loadu_si128(sw.add(i * 16) as *const __m128i));
@@ -2097,6 +1911,10 @@ unsafe fn apply_deltas_avx2(
             }
             while ai < adds.len() {
                 let aw = w_ptr.add(adds[ai] * hidden_size + offset);
+                if pf {
+                    _mm_prefetch(aw.add(CHUNK) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(aw.add(CHUNK + 64) as *const i8, _MM_HINT_T0);
+                }
                 for i in 0..nregs {
                     let add_w = _mm256_cvtepi8_epi16(_mm_loadu_si128(aw.add(i * 16) as *const __m128i));
                     regs[i] = _mm256_add_epi16(regs[i], add_w);
@@ -2105,6 +1923,10 @@ unsafe fn apply_deltas_avx2(
             }
             while si < subs.len() {
                 let sw = w_ptr.add(subs[si] * hidden_size + offset);
+                if pf {
+                    _mm_prefetch(sw.add(CHUNK) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sw.add(CHUNK + 64) as *const i8, _MM_HINT_T0);
+                }
                 for i in 0..nregs {
                     let sub_w = _mm256_cvtepi8_epi16(_mm_loadu_si128(sw.add(i * 16) as *const __m128i));
                     regs[i] = _mm256_sub_epi16(regs[i], sub_w);
@@ -2192,11 +2014,28 @@ unsafe fn apply_deltas_avx512(
             for i in 0..nregs {
                 regs[i] = _mm512_loadu_si512(src_ptr.add(offset + i * 32) as *const _);
             }
+            // Per-row next-chunk prefetch — same rationale as the AVX2 twin
+            // (chunk-0 cold misses dominate; see apply_threat_indices entry
+            // prefetch). CHUNK here is 512 bytes = 8 lines per row.
+            let pf = offset + CHUNK < hidden_size;
+            macro_rules! pf_row {
+                ($row:expr) => {
+                    if pf {
+                        let mut l = 0;
+                        while l < CHUNK {
+                            _mm_prefetch($row.add(CHUNK + l) as *const i8, _MM_HINT_T0);
+                            l += 64;
+                        }
+                    }
+                };
+            }
             let mut ai = 0;
             let mut si = 0;
             while ai < adds.len() && si < subs.len() {
                 let aw = w_ptr.add(adds[ai] * hidden_size + offset);
                 let sw = w_ptr.add(subs[si] * hidden_size + offset);
+                pf_row!(aw);
+                pf_row!(sw);
                 for i in 0..nregs {
                     let add_w = _mm512_cvtepi8_epi16(_mm256_loadu_si256(aw.add(i * 32) as *const __m256i));
                     let sub_w = _mm512_cvtepi8_epi16(_mm256_loadu_si256(sw.add(i * 32) as *const __m256i));
@@ -2207,6 +2046,7 @@ unsafe fn apply_deltas_avx512(
             }
             while ai < adds.len() {
                 let aw = w_ptr.add(adds[ai] * hidden_size + offset);
+                pf_row!(aw);
                 for i in 0..nregs {
                     let add_w = _mm512_cvtepi8_epi16(_mm256_loadu_si256(aw.add(i * 32) as *const __m256i));
                     regs[i] = _mm512_add_epi16(regs[i], add_w);
@@ -2215,6 +2055,7 @@ unsafe fn apply_deltas_avx512(
             }
             while si < subs.len() {
                 let sw = w_ptr.add(subs[si] * hidden_size + offset);
+                pf_row!(sw);
                 for i in 0..nregs {
                     let sub_w = _mm512_cvtepi8_epi16(_mm256_loadu_si256(sw.add(i * 32) as *const __m256i));
                     regs[i] = _mm512_sub_epi16(regs[i], sub_w);
@@ -2921,95 +2762,4 @@ mod tests {
         assert!(elapsed.as_secs() < 10, "Benchmark took too long: {:?}", elapsed);
     }
 
-    /// Section 2 Z-finding cull: regression guard.
-    ///
-    /// The cull skips the Z-level x-ray delta block when no ray from
-    /// `square` has 2+ occupants. These tests pin down the semantics:
-    /// (a) an endgame with 0/1 occupants per ray must produce the same
-    ///     delta list as a no-cull reference (trivially, since the cull's
-    ///     "skipped" branch produces no Z deltas and the Z block also
-    ///     short-circuits at `revealed_y == 0` / `revealed_z == 0`).
-    /// (b) a position with a genuine Z-chain (S → square → Y → Z) MUST
-    ///     emit the Z delta — the cull must NOT fire.
-    ///
-    /// The primary correctness net is `threat_accum::fuzz_random_games`
-    /// which plays thousands of random moves and compares incremental vs
-    /// refresh. These targeted tests pin the specific cull boundary.
-    #[test]
-    fn test_z_finding_cull_endgame_no_z() {
-        let _xray = XRAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::init();
-        // KP endgame: two kings, one pawn. No sliders means Z-finding
-        // doesn't even enter the slider loop, but this exercises the
-        // pre-check bitboard shape (rays_from_sq_empty, past_first_region)
-        // on a real position.
-        let b = crate::board::Board::from_fen("4k3/8/8/8/8/4P3/8/4K3 w - - 0 1");
-        let mut deltas: Vec<RawThreatDelta> = Vec::new();
-        // Enumerate on the pawn's square (e3 = 20). With no sliders,
-        // section 2 has nothing to emit regardless of cull state.
-        push_threats_for_piece(
-            &mut deltas,
-            &b.pieces, &b.colors, &b.mailbox,
-            b.occupied(), b.colors[WHITE as usize],
-            colored_piece(WHITE, PAWN), WHITE, PAWN,
-            20, true,
-        );
-        // No sliders in this position, no slider → square threats.
-        // Pawn attacks nothing (e3 attacks d4/f4, both empty).
-        // Nothing in sections 1/2/3 applies meaningfully.
-        // The key assertion is we don't panic / produce a sane output.
-        for d in &deltas {
-            assert!(d.from_sq() < 64);
-            assert!(d.to_sq() < 64);
-        }
-    }
-
-    #[test]
-    fn test_z_finding_cull_has_z_chain() {
-        let _xray = XRAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::init();
-        // A position with a genuine slider → square → Y → Z chain:
-        //   R on a1, pawn on a4 (Y), pawn on a6 (Z), enumerate on a2 (square).
-        // Slider (R@a1) sees a2 (direct threat). Y = a4 (first past a2 on
-        // rank-file going up). Z = a6 (first past Y). The Z delta MUST
-        // be emitted when push_threats_for_piece is called for the piece
-        // at a2 appearing (or disappearing).
-        //
-        // Use a white knight on a2 as the subject (so we trigger a real
-        // section 2 walk; any piece works since section 2 is about
-        // sliders seeing `square`).
-        let b = crate::board::Board::from_fen("4k3/8/P7/8/P7/8/N7/R3K3 w - - 0 1");
-        let mut deltas: Vec<RawThreatDelta> = Vec::new();
-        push_threats_for_piece(
-            &mut deltas,
-            &b.pieces, &b.colors, &b.mailbox,
-            b.occupied(), b.colors[WHITE as usize],
-            colored_piece(WHITE, KNIGHT), WHITE, KNIGHT,
-            8, true,  // a2 = 8
-        );
-
-        // Expect: section 2 emits slider R@a1 → N@a2 direct threat.
-        // AND: the Z-level delta for (R@a1, pawn@a6) is emitted (the
-        // x-ray target that flips when a2 gets a piece).
-        //
-        // Sanity check: the rook at a1 should appear as an attacker to
-        // a2 in the emitted deltas.
-        let r = colored_piece(WHITE, ROOK) as u8;
-        let has_r_to_a2 = deltas.iter().any(|d| {
-            d.attacker_cp() == r && d.from_sq() == 0 && d.to_sq() == 8
-        });
-        assert!(has_r_to_a2, "expected R@a1 → square a2 direct threat in deltas");
-
-        // The Z-chain: rook's Y is a4 (sq 24), Z is a6 (sq 40).
-        // The Z delta is a rook-to-a6 entry with `add = !true = false`
-        // (because the piece at square is "appearing", Z is "lost").
-        let has_r_to_a6 = deltas.iter().any(|d| {
-            d.attacker_cp() == r && d.from_sq() == 0 && d.to_sq() == 40
-        });
-        assert!(has_r_to_a6,
-            "expected Z-level delta (R@a1 → pawn@a6) — Z-finding cull must NOT fire here.\n\
-             deltas: {:?}",
-            deltas.iter().map(|d| (d.attacker_cp(), d.from_sq(), d.victim_cp(), d.to_sq(), d.add())).collect::<Vec<_>>()
-        );
-    }
 }

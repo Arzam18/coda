@@ -173,6 +173,40 @@ impl<T: Default + Copy> AlignedVec<T> {
         #[cfg(target_os = "linux")]
         unsafe {
             let size = n * std::mem::size_of::<T>();
+
+            // Tier 1: explicit hugetlb pool (`sysctl vm.nr_hugepages=N`) —
+            // deterministic 2 MiB pages, immune to the broken-THP kernels
+            // where the madvise path below silently yields zero huge pages
+            // (Ubuntu HWE 6.8: AnonHugePages measured 0 kB for the 65 MiB
+            // threat table on both Atlas and the lichess host; same failure
+            // tt.rs documents for the TT). mmap reserves from the pool up
+            // front, so it fails cleanly (→ fall through) when the pool is
+            // absent or exhausted. CODA_NO_HUGETLB skips the tier — the
+            // same-binary A/B toggle for the paired measurement protocol.
+            if std::env::var("CODA_NO_HUGETLB").is_err() {
+                let htlb_size = (size + Self::HUGE_PAGE - 1) & !(Self::HUGE_PAGE - 1);
+                let raw = libc::mmap(
+                    std::ptr::null_mut(),
+                    htlb_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                    -1,
+                    0,
+                );
+                if raw != libc::MAP_FAILED {
+                    // Drop munmaps `cap * size_of::<T>()`; the kernel rounds
+                    // the length up to the VMA's page size (2 MiB here), so
+                    // the full mapping is released.
+                    return Self {
+                        ptr: raw as *mut T,
+                        len: n,
+                        cap: n,
+                        align: Self::HUGE_PAGE,
+                        mmapped: true,
+                    };
+                }
+            }
+
             // Over-allocate by one huge page so the base can be aligned up
             // to a 2 MiB boundary (mmap only guarantees 4 KiB alignment;
             // PMD-size THP only backs 2 MiB-aligned virtual extents).
@@ -294,6 +328,29 @@ pub const NNUE_MAX_KING_BUCKETS: usize = 16;
 /// loadable net: pw = hidden_size/2 must be ≤ this, i.e. hidden_size ≤ 2×this.
 /// Enforced at net load (see Net::read) and asserted at the buffer.
 pub const NNUE_PW_BUF: usize = 1024;
+
+/// Prefetch the head of every weight row an accumulator update will gather.
+/// The rows live in the 25 MB feature-transformer matrix and each update
+/// touches only a handful at scattered indices, so each row's first touch is
+/// a cold miss the hardware streamer cannot predict. Later chunks of the same
+/// row ARE predictable (sequential within the row), so only the head is
+/// pulled here. Same pattern as the threat-apply entry prefetch
+/// (perf/threat-apply-prefetch, OB #3037 +1.67 Elo H1).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_acc_rows(add_rows: &[&[i16]], sub_rows: &[&[i16]], chunk_bytes: usize) {
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    for row in add_rows.iter().chain(sub_rows.iter()) {
+        let p = row.as_ptr() as *const i8;
+        let mut off = 0;
+        while off < chunk_bytes {
+            unsafe { _mm_prefetch(p.add(off), _MM_HINT_T0) };
+            off += 64;
+        }
+    }
+}
+
+
 /// Stack buffer size for L1 output (forward_with_l1_pairwise_body). Bounds
 /// the largest loadable per-bucket L1 width. Enforced at net load and
 /// asserted at the buffer (see HIDDEN32_BUF below).
@@ -491,6 +548,9 @@ unsafe fn simd_acc_fused_avx2(
 
     let mut offset = 0;
 
+    // Pull each gathered row's first chunk in before the tiling loop starts.
+    prefetch_acc_rows(add_rows, sub_rows, REGS * 16 * 2);
+
     // Shared body parameterised on the register count so every pass below
     // runs with a COMPILE-TIME nregs and fully unrolls. Atlas perf
     // annotate (2026-05-06) showed a unified runtime-nregs loop emitting
@@ -574,6 +634,9 @@ unsafe fn simd_acc_fused_avx512(
     let src_ptr = src.as_ptr();
 
     let mut offset = 0;
+
+    // Pull each gathered row's first chunk in before the tiling loop starts.
+    prefetch_acc_rows(add_rows, sub_rows, REGS * 32 * 2);
 
     macro_rules! apply_chunk {
         ($nregs:expr) => {{
@@ -2592,13 +2655,6 @@ pub struct NNUENet {
     pub threat_weights: AlignedVec<i8>,  // [num_threat_features × hidden_size] i8 weights, 64-B rows, hugepage-backed
     pub num_threat_features: usize,
     pub has_threats: bool,
-    /// Whether the net was trained WITH xray threat features. Coda inference
-    /// always emits xrays, so nets with `xray_trained=false` will produce
-    /// garbage eval (weights were learned against direct-attack signal only,
-    /// but inference multiplies them in xray contexts too). v10+ nets record
-    /// this in the header; v9 and earlier default to true (legacy assumption
-    /// since all pre-v10 threat nets were trained with --xray 1 / default).
-    pub xray_trained: bool,
     /// Number of king buckets in this net (16 for uniform/consensus).
     /// PSQ weight block is sized `num_king_buckets * 768 * hidden_size`.
     pub num_king_buckets: usize,
@@ -2704,7 +2760,6 @@ impl NNUENet {
         let mut kb_layout = KbLayout::Uniform;
         // v10+: xray_trained from training_flags byte. v9 legacy default = true
         // (all pre-v10 threat nets were --xray 1 / default at training time).
-        let mut xray_trained: bool = true;
         let hidden_size: usize;
 
         match version {
@@ -2804,14 +2859,25 @@ impl NNUENet {
                 // (all pre-v10 production nets were --xray 1 / default).
                 if version >= 10 {
                     let training_flags = read_u8(reader)?;
-                    xray_trained = training_flags & 1 != 0;
+                    if training_flags & 1 != 0 {
+                        return Err("net was trained WITH x-ray threat features, which \
+                                    Coda no longer enumerates (removed after 0.9.3 — see \
+                                    the v0.9.3 release notes). Its weights were learned \
+                                    against a feature set inference can no longer \
+                                    produce, so it would evaluate garbage. Retrain with \
+                                    --xray 0.".to_string());
+                    }
                     if training_flags & 2 != 0 {
                         return Err("net was trained with a non-uniform output-bucket \
                                     layout that Coda no longer supports; retrain with \
                                     the default uniform output buckets".to_string());
                     }
-                } else {
-                    xray_trained = true;
+                } else if has_threats {
+                    // Every pre-v10 threat net was trained with x-ray features
+                    // (--xray 1 was the default), so none can be inferred now.
+                    return Err("legacy pre-v10 threat net: all such nets were trained \
+                                WITH x-ray threat features, which Coda no longer \
+                                enumerates. Retrain with --xray 0.".to_string());
                 }
                 hidden_size = ft_size;
             }
@@ -3119,7 +3185,6 @@ impl NNUENet {
             threat_weights,
             num_threat_features,
             has_threats,
-            xray_trained,
             num_king_buckets,
             kb_layout,
             king_bucket: king_bucket_tbl,
@@ -3157,13 +3222,17 @@ impl NNUENet {
                 self.hidden_size, crate::threat_accum::MAX_FT_SIZE,
             ));
         }
-        // X-ray emission is GATED on the net's xray_trained flag
-        // (threats::emit_xray, set here). A net trained with --xray 0 thus has
-        // its inference skip X-ray to match training — no mismatch, and the
-        // X-ray generation cost is reclaimed. (LOAD_ANYWAY retained as a CLI/UCI
-        // escape but no longer needed for no-xray nets.)
-        let _ = LOAD_ANYWAY.load(std::sync::atomic::Ordering::Relaxed);
-        crate::threats::set_emit_xray(self.xray_trained);
+        // Point the threat machinery at the feature space this net was trained
+        // for (66,864 king-attacker or 60,144 no-king). The header count IS the
+        // marker; a mismatch previously loaded silently and evaluated garbage.
+        // LoadAnyway downgrades the rejection to a warning for deliberate probes.
+        if let Err(e) = crate::threats::select_feature_space(self.num_threat_features) {
+            if LOAD_ANYWAY.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("WARNING (LoadAnyway): {}", e);
+            } else {
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -5895,6 +5964,258 @@ fn read_i16_slice(r: &mut impl IoRead, dst: &mut [i16]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Eval-mirror differential oracle: `eval(P)` must equal
+    /// `eval(colorflip(P))` EXACTLY for every position. The NNUE eval is
+    /// color-symmetric by construction (stm-relative perspectives share
+    /// one weight set; per-perspective king mirroring and threat-feature
+    /// flips are supposed to make the two sides' feature extraction
+    /// bit-identical under color flip). Any mismatch is a real bug in
+    /// feature indexing (HalfKA buckets, threat flips, promo/EP edge
+    /// cases) — a class that is INVISIBLE to self-play SPRT because both
+    /// sides share the bug. Deterministic seeded playouts; from-scratch
+    /// accumulators only (incremental-vs-recompute consistency is covered
+    /// by the threat_accum incremental tests).
+    ///
+    /// Needs a net: honours `CODA_TEST_NET=<path>`, else looks for
+    /// `net*.nnue` in the repo root, else skips (same convention as
+    /// `test_simd_scalar_consistency`).
+    #[test]
+    fn fuzz_eval_mirror_symmetry() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::board::Board;
+        use crate::movegen::generate_legal_moves;
+
+        // EMIT_XRAY is process-global and NNUENet::load mutates it. This
+        // test both loads a net (mutator) and compares evals in two halves
+
+        crate::init();
+
+        // Candidate nets: CODA_TEST_NET override, else every net*.nnue in
+        // the repo root (sorted, newest-style hash names included). Try each
+        // until one LOADS — stale/unsupported-layout files in the root must
+        // not silently disarm the tripwire (a first-match version skipped on
+        // Atlas because read_dir happened to yield a retired kb10 net first).
+        let candidates: Vec<String> = if let Ok(p) = std::env::var("CODA_TEST_NET") {
+            vec![p]
+        } else {
+            let mut v: Vec<String> = std::fs::read_dir(".")
+                .map(|e| {
+                    e.filter_map(|f| f.ok())
+                        .map(|f| f.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.starts_with("net") && n.ends_with(".nnue"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+        let mut loaded = None;
+        for p in &candidates {
+            match NNUENet::load(p) {
+                // The exact-explanation model below covers DIRECT same-type
+                // mutual contacts only. X-ray-trained nets also emit x-ray
+                // threats, whose same-type mutual geometries (e.g. doubled
+                // majors x-raying through a blocker) hit the same designed
+                // skip but are not in the explanation set — extending it is
+                // future work if x-ray nets return to prod. Select no-x-ray
+                // nets (the production family); reject x-ray-trained ones.
+                Ok(n) => {
+                    loaded = Some((n, p.clone()));
+                    break;
+                }
+                Err(e) => eprintln!("eval-mirror oracle: candidate {} unloadable ({}), trying next", p, e),
+            }
+        }
+        let (net, net_path) = match loaded {
+            Some(x) => x,
+            None => {
+                eprintln!("Skipping eval-mirror oracle: no loadable .nnue among {} candidates", candidates.len());
+                return;
+            }
+        };
+        eprintln!("eval-mirror oracle: net {}", net_path);
+        let h = net.hidden_size;
+
+        fn swap_case(c: char) -> char {
+            if c.is_ascii_uppercase() { c.to_ascii_lowercase() }
+            else if c.is_ascii_lowercase() { c.to_ascii_uppercase() }
+            else { c }
+        }
+        fn mirror_fen(fen: &str) -> String {
+            let p: Vec<&str> = fen.split_whitespace().collect();
+            let board_part = p[0]
+                .split('/')
+                .rev()
+                .map(|r| r.chars().map(swap_case).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("/");
+            let stm = if p[1] == "w" { "b" } else { "w" };
+            let castle = if p[2] == "-" {
+                "-".to_string()
+            } else {
+                let sw: String = p[2].chars().map(swap_case).collect();
+                let mut out = String::new();
+                for c in ['K', 'Q', 'k', 'q'] {
+                    if sw.contains(c) { out.push(c); }
+                }
+                out
+            };
+            let ep = if p[3] == "-" {
+                "-".to_string()
+            } else {
+                let f = &p[3][0..1];
+                let r = if &p[3][1..2] == "3" { "6" } else { "3" };
+                format!("{}{}", f, r)
+            };
+            format!("{} {} {} {} {} {}", board_part, stm, castle, ep, p[4],
+                    p.get(5).copied().unwrap_or("1"))
+        }
+
+        let mut st: u64 = 0xC0DA_5EED_0000_0001;
+        let mut rnd = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+
+        fn enum_feature_set(board: &Board, pov: crate::types::Color) -> std::collections::BTreeSet<usize> {
+            let occ = board.colors[0] | board.colors[1];
+            let king_sq = (board.pieces[crate::types::KING as usize] & board.colors[pov as usize]).trailing_zeros();
+            let mirrored = (king_sq % 8) >= 4;
+            let mut set = std::collections::BTreeSet::new();
+            crate::threats::enumerate_threats(
+                &board.pieces, &board.colors, &board.mailbox, occ, pov, mirrored,
+                |idx| { set.insert(idx); },
+            );
+            set
+        }
+
+        /// Feature indices (both directions) of every same-type opposite-color
+        /// mutual-attack pair on the board — the only relations whose feature
+        /// direction legitimately flips under mirroring.
+        fn mutual_pair_feature_set(board: &Board, pov: crate::types::Color) -> std::collections::BTreeSet<usize> {
+            use crate::types::{WHITE, BLACK, KING};
+            let occ = board.colors[0] | board.colors[1];
+            let king_sq = (board.pieces[KING as usize] & board.colors[pov as usize]).trailing_zeros();
+            let mirrored = (king_sq % 8) >= 4;
+            let mut set = std::collections::BTreeSet::new();
+            // ALL same-type mutual attack/defense contacts, any color combo:
+            // opposite-color (mutual threats) AND same-color (mutual defenses)
+            // both go through the physical-square-order skip.
+            for pt in 0..6u8 {
+                for c1 in [WHITE, BLACK] {
+                    let mut bb1 = board.pieces[pt as usize] & board.colors[c1 as usize];
+                    while bb1 != 0 {
+                        let s1 = bb1.trailing_zeros();
+                        bb1 &= bb1 - 1;
+                        let att1 = crate::threats::piece_attacks_occ(pt, c1, s1, occ);
+                        for c2 in [WHITE, BLACK] {
+                            let mut bb2 = board.pieces[pt as usize] & board.colors[c2 as usize] & att1;
+                            while bb2 != 0 {
+                                let s2 = bb2.trailing_zeros();
+                                bb2 &= bb2 - 1;
+                                if s2 == s1 { continue; }
+                                let att2 = crate::threats::piece_attacks_occ(pt, c2, s2, occ);
+                                if att2 & (1u64 << s1) != 0 {
+                                    let cp1 = crate::threats::colored_piece(c1, pt);
+                                    let cp2 = crate::threats::colored_piece(c2, pt);
+                                    for (a, af, v, vt) in [(cp1, s1, cp2, s2), (cp2, s2, cp1, s1)] {
+                                        let idx = crate::threats::threat_index(a, af, v, vt, mirrored, pov);
+                                        if idx >= 0 { set.insert(idx as usize); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            set
+        }
+
+        let mut checked = 0u64;
+        let mut max_diff = 0i32;
+        let mut sum_diff = 0u64;
+        let mut n_diff = 0u64;
+        let mut worst = (String::new(), 0i32, 0i32);
+        for _game in 0..400 {
+            let mut board = Board::startpos();
+            for _ply in 0..120 {
+                let legal = generate_legal_moves(&board);
+                if legal.len == 0 || board.halfmove >= 100 { break; }
+                let mv = legal.get((rnd() as usize) % legal.len);
+                board.make_move(mv);
+
+                let fen = board.to_fen();
+                let mfen = mirror_fen(&fen);
+                let mboard = Board::from_fen(&mfen);
+
+                // Invariant 1 (EXACT): the PSQ/HalfKA accumulators must swap
+                // perspectives exactly under color flip.
+                let mut a1 = NNUEAccumulator::new(h);
+                a1.force_recompute(&net, &board);
+                a1.recompute_threats_if_needed(&net, &board);
+                let mut a2 = NNUEAccumulator::new(h);
+                a2.force_recompute(&net, &mboard);
+                a2.recompute_threats_if_needed(&net, &mboard);
+                assert!(
+                    a1.psq.view(a1.top, 0) == a2.psq.view(a2.top, 1)
+                        && a1.psq.view(a1.top, 1) == a2.psq.view(a2.top, 0),
+                    "PSQ accumulator mirror asymmetry (real bug): [{}] vs [{}]",
+                    fen, mfen
+                );
+
+                // Invariant 2 (BOUNDED): full eval may differ slightly — the
+                // physical-frame same-type-pair skip in threat features is
+                // deliberately not mirror-symmetric (see enumerate_threats and
+                // docs/threat_eval_asymmetry_2026-06-17.md; training matches
+                // inference, so the net is calibrated to it). Gross deviation
+                // = real bug (flipped feature family, bucket asymmetry).
+                let pc = board.occupied().count_ones();
+                let e1 = net.forward(&a1, board.side_to_move, pc);
+                let e2 = net.forward(&a2, mboard.side_to_move, pc);
+                let d = (e1 - e2).abs();
+                if d > max_diff { max_diff = d; worst = (fen.clone(), e1, e2); }
+                sum_diff += d as u64;
+                if d != 0 {
+                    n_diff += 1;
+                    // EXACT explanation requirement: any eval asymmetry must
+                    // be fully accounted for by the designed same-type
+                    // mutual-attack pair skip (physical-square-order tie
+                    // break, docs/threat_eval_asymmetry_2026-06-17.md). The
+                    // enumerated-feature diff for both perspective pairings
+                    // must be a subset of the position's mutual-pair feature
+                    // indices, with matching counts. Anything else = bug.
+                    for (pov_p, pov_m) in [(crate::types::WHITE, crate::types::BLACK),
+                                           (crate::types::BLACK, crate::types::WHITE)] {
+                        let x = enum_feature_set(&board, pov_p);
+                        let y = enum_feature_set(&mboard, pov_m);
+                        let dx: Vec<usize> = x.difference(&y).copied().collect();
+                        let dy: Vec<usize> = y.difference(&x).copied().collect();
+                        let mp_x = mutual_pair_feature_set(&board, pov_p);
+                        let mp_y = mutual_pair_feature_set(&mboard, pov_m);
+                        let dx_ok = dx.iter().all(|i| mp_x.contains(i));
+                        let dy_ok = dy.iter().all(|i| mp_y.contains(i));
+                        assert!(
+                            dx_ok && dy_ok && dx.len() == dy.len(),
+                            "UNEXPLAINED eval mirror asymmetry (real bug): [{}] vs [{}] \
+                             pov=({},{}) diff-first {:?} diff-second {:?} (mutual-pair-explained: {}/{})",
+                            fen, mfen, pov_p, pov_m, dx, dy, dx_ok, dy_ok
+                        );
+                    }
+                }
+                checked += 1;
+            }
+        }
+        eprintln!(
+            "eval-mirror oracle: {} positions; PSQ exactly symmetric everywhere; \
+             eval diff: {:.1}% nonzero, mean {:.3}cp, max {}cp (worst: [{}] {} vs {})",
+            checked, 100.0 * n_diff as f64 / checked as f64,
+            sum_diff as f64 / checked as f64, max_diff, worst.0, worst.1, worst.2
+        );
+        assert!(checked > 10_000, "oracle degenerated: only {} positions", checked);
+    }
+
     /// Seeded PRNG for deterministic NEON-vs-scalar tests.
     /// xorshift64*, adequate for scrambling test inputs.
     fn rng(seed: u64) -> impl FnMut() -> u64 {
@@ -7158,6 +7479,9 @@ mod tests {
     #[test]
     #[ignore]
     fn measure_threat_weight_norms() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Net loading mutates the process-global EMIT_XRAY — serialize with
+        // every other net-loading test (see fuzz_eval_mirror_symmetry).
         let net_path = "nets/net-v9-768th16x32-w15-e800s800-xray.nnue";
         let net = match NNUENet::load(net_path) {
             Ok(n) => n,
@@ -7244,6 +7568,9 @@ mod tests {
     /// net (e.g. the v9 net to cover the threat + pairwise VNNI path).
     #[test]
     fn test_simd_scalar_consistency() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Net loading mutates the process-global EMIT_XRAY — serialize with
+        // every other net-loading test (see fuzz_eval_mirror_symmetry).
         use crate::board::Board;
 
         crate::init();
@@ -7556,6 +7883,9 @@ mod tests {
     /// prints all positions + diffs for triage.
     #[test]
     fn test_eval_color_symmetry() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Net loading mutates the process-global EMIT_XRAY — serialize with
+        // every other net-loading test (see fuzz_eval_mirror_symmetry).
         use crate::board::Board;
         use crate::threat_accum::ThreatStack;
 
@@ -7643,23 +7973,44 @@ mod tests {
             fails.len(), tolerance_cp);
     }
 
-    /// Tier-1 discovery test: eval changes monotonically when removing
-    /// piece types in value order. Removes one piece at a time from a
-    /// balanced starting position; the eval delta ranking must be
-    /// roughly Queen > Rook > Bishop ≈ Knight > Pawn, all negative for
-    /// the side losing material.
+    /// Tier-1 discovery test: relative piece values.
+    ///
+    /// Measures each trade-off INSIDE a single position instead of by
+    /// subtracting two separately-evaluated ones. Rewritten 2026-08-09
+    /// after the original form went red on prod net 60F72A31.
+    ///
+    /// The original compared startpos-minus-queen against
+    /// startpos-minus-rook. Both are near-certain wins, so both evals sit
+    /// in win-probability saturation and their DIFFERENCE is saturation
+    /// noise rather than a material signal — the 2026-07-04 loosening
+    /// (SLACK=100) was already conceding exactly that. BT4-trained nets
+    /// compress the band harder still (Q..N spans 386cp on 60F72A31 vs
+    /// 685cp on E6C62000), so no fixed slack can rescue the form: on
+    /// 60F72A31 rook-removal (+1587) outranks queen-removal (+1201), with
+    /// knight (+1372) and bishop (+1298) in between.
+    ///
+    /// The asymmetric form has no such problem. White gives up the LESSER
+    /// piece and black the GREATER, so the comparison is encoded in one
+    /// eval and lands in the unsaturated range instead of at two points
+    /// near the win asymptote. Verified on both 60F72A31 and DB9B5605 at
+    /// both side-to-move settings: the tightest observed margin is 317cp
+    /// against the 100cp threshold, and the controls read within 26cp of
+    /// level.
     ///
     /// Detects: inverted piece values, eval-scale sign bugs, bucket
     /// mis-selection producing non-monotone evals at material boundaries.
     #[test]
     fn test_eval_piece_value_monotonicity() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Net loading mutates the process-global EMIT_XRAY — serialize with
+        // every other net-loading test (see fuzz_eval_mirror_symmetry).
         use crate::board::Board;
         use crate::threat_accum::ThreatStack;
 
         crate::init();
         let net = match try_load_v9_net() {
             Some(n) => n,
-            None => { eprintln!("Skipping monotonicity test: no v9 net available"); return; }
+            None => { eprintln!("Skipping piece-value test: no v9 net available"); return; }
         };
 
         fn eval_fen(net: &NNUENet, fen: &str) -> i32 {
@@ -7675,60 +8026,60 @@ mod tests {
             crate::eval::evaluate_nnue(&b, net, &mut acc, &ts)
         }
 
-        // Startpos (balanced). Evals are STM-relative = 0 on a balanced position.
-        let base = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-        let e_base = eval_fen(&net, base);
+        // Sanity: removing any black piece must leave white better. This is
+        // a sign check only — the MAGNITUDES are not comparable across these
+        // positions, which is the whole reason the ordering moved below.
+        for (name, fen) in [
+            ("queen",  "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            ("rook",   "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQk - 0 1"),
+            ("bishop", "rn1qkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            ("knight", "r1bqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            ("pawn",   "rnbqkbnr/1ppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+        ] {
+            let e = eval_fen(&net, fen);
+            eprintln!("  remove black {:<6}: {:+6} cp", name, e);
+            assert!(e > 0, "Removing black {} gave eval={} — expected >0 (white up material)", name, e);
+        }
 
-        // Remove one black piece at a time; STM is white so each removal
-        // should return a POSITIVE eval (white is relatively ahead).
+        // Relative values: white is missing the WEAKER piece, black the
+        // STRONGER one, so white must be clearly ahead. Checked with both
+        // sides to move — evaluate_nnue is STM-relative, so white-to-move
+        // must read >= +MIN_EDGE and black-to-move <= -MIN_EDGE. Testing
+        // both catches a net whose material verdict depends on the tempo.
+        const MIN_EDGE: i32 = 100; // 1.00 pawn; tightest measured margin is 317cp
         let cases = [
-            ("black queen",  "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
-            ("black rook",   "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
-            ("black bishop", "rn1qkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
-            ("black knight", "r1bqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
-            ("black pawn",   "rnbqkbnr/1ppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            ("queen  > rook  ", "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/1NBQKBNR", "Kkq"),
+            ("queen  > bishop", "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RN1QKBNR", "KQkq"),
+            ("queen  > knight", "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/R1BQKBNR", "KQkq"),
+            ("rook   > bishop", "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RN1QKBNR", "KQk"),
+            ("rook   > knight", "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/R1BQKBNR", "KQk"),
+            ("rook   > pawn  ", "1nbqkbnr/pppppppp/8/8/8/8/1PPPPPPP/RNBQKBNR", "KQk"),
+            ("bishop > pawn  ", "rn1qkbnr/pppppppp/8/8/8/8/1PPPPPPP/RNBQKBNR", "KQkq"),
+            ("knight > pawn  ", "r1bqkbnr/pppppppp/8/8/8/8/1PPPPPPP/RNBQKBNR", "KQkq"),
         ];
-
-        let evals: Vec<(&str, i32, i32)> = cases.iter().map(|(name, f)| {
-            let e = eval_fen(&net, f);
-            (*name, e, e - e_base)
-        }).collect();
-
-        eprintln!("Base (startpos) eval: {} cp", e_base);
-        for (name, e, delta) in &evals {
-            eprintln!("  Remove {}: eval={} cp, delta from base = +{} cp", name, e, delta);
+        for (label, layout, rights) in cases {
+            let ew = eval_fen(&net, &format!("{} w {} - 0 1", layout, rights));
+            let eb = eval_fen(&net, &format!("{} b {} - 0 1", layout, rights));
+            eprintln!("  {} : wtm {:+6} cp   btm {:+6} cp", label, ew, eb);
+            assert!(ew >= MIN_EDGE,
+                "{}: white to move reads {}cp, expected >= +{}cp (white gave up the lesser piece)",
+                label.trim(), ew, MIN_EDGE);
+            assert!(eb <= -MIN_EDGE,
+                "{}: black to move reads {}cp, expected <= -{}cp (black gave up the greater piece)",
+                label.trim(), eb, MIN_EDGE);
         }
 
-        // All removals should produce positive evals (white better off).
-        for (name, e, _) in &evals {
-            assert!(*e > 0, "Removing {} gave eval={} — expected >0 (white up material)", name, e);
+        // Controls: symmetric removals must read near level.
+        const MAX_LEVEL: i32 = 100; // measured within 26cp on both nets
+        for (label, fen) in [
+            ("both lose a rook  ", "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/1NBQKBNR w Kk - 0 1"),
+            ("both lose a knight", "r1bqkbnr/pppppppp/8/8/8/8/PPPPPPPP/R1BQKBNR w KQkq - 0 1"),
+        ] {
+            let e = eval_fen(&net, fen);
+            eprintln!("  control {} : {:+6} cp", label, e);
+            assert!(e.abs() <= MAX_LEVEL,
+                "control {}: expected |eval| <= {}cp, got {}cp", label.trim(), MAX_LEVEL, e);
         }
-
-        // Ordering check: queen removal should be the biggest gain;
-        // pawn removal should be the smallest. Bishop/knight may swap
-        // but should both be well above pawn and well below rook.
-        let q = evals[0].2;
-        let r = evals[1].2;
-        let b = evals[2].2;
-        let n = evals[3].2;
-        let p = evals[4].2;
-
-        // Loosened 2026-07-04 (Adam): strict piece-value ordering among the
-        // big pieces is NOT a property a WDL-trained net must satisfy —
-        // "up a rook" and "up a bishop" from the startpos are both
-        // near-certain wins, so their eval difference is win-prob
-        // saturation noise, not a material signal (prod net E6C62000
-        // legitimately scores rook-removal within ~5cp of bishop-removal,
-        // sometimes below). Require only slack-ordering among Q/R/minors;
-        // keep the strict piece-vs-pawn orderings, which do reflect
-        // unsaturated win-prob structure.
-        const SLACK: i32 = 100;
-        assert!(q > r - SLACK, "Queen removal delta ({}) more than {}cp below Rook removal ({})", q, SLACK, r);
-        assert!(r > b - SLACK && r > n - SLACK,
-            "Rook removal ({}) more than {}cp below Bishop ({}) or Knight ({})", r, SLACK, b, n);
-        assert!(b > p, "Bishop removal ({}) not > Pawn ({})", b, p);
-        assert!(n > p, "Knight removal ({}) not > Pawn ({})", n, p);
-        assert!(p > 0, "Pawn removal gave non-positive delta: {}", p);
     }
 
     /// Deterministic PSQ fuzzer: plays random legal games from several
@@ -7741,6 +8092,9 @@ mod tests {
     /// PSQ (king-piece-square) half of the net.
     #[test]
     fn fuzz_psq_accumulator() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Net loading mutates the process-global EMIT_XRAY — serialize with
+        // every other net-loading test (see fuzz_eval_mirror_symmetry).
         use crate::board::Board;
         use crate::movegen::generate_legal_moves;
         use crate::search::build_dirty_piece;
@@ -7847,6 +8201,7 @@ mod tests {
     /// Test Finny table consistency: incremental update vs full recompute.
     #[test]
     fn test_finny_incremental_consistency() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::board::Board;
 
         crate::init();
@@ -7922,6 +8277,7 @@ mod tests {
     /// this one is deterministic and forces the cross-bucket path.
     #[test]
     fn finny_king_march_consistency() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::board::Board;
         use crate::search::build_dirty_piece;
         use crate::types::{flip_color, NO_PIECE_TYPE, make_move, FLAG_NONE};

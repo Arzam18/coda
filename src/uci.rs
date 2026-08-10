@@ -318,6 +318,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name TBHash type spin default 16 min 0 max 1024");
                 println!("option name SyzygyProbeDepth type spin default 4 min 1 max 100");
+                println!("option name ScoreScale type spin default 39 min 25 max 200");
                 // Internal/dev options — advertised only in tuning builds
                 // (`make openbench` / `--features tune`) so they don't clutter GUI
                 // option lists in normal/release builds. The `setoption` handlers
@@ -464,6 +465,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                             // See feedback_egtb_drawn_tiebreak_unfixable_via_sprt.md.
                             // Lichess game I4qJhfQw m103 and VE9mvCIG m~67 both
                             // exhibited Coda skipping the IM-terminal recapture.
+                            let tb_pv_original_first = tb_pv.first().cloned();
                             if wdl == 0 && !tb_pv.is_empty() {
                                 tb_pv[0] = pick_drawn_tb_move(&board, &tb_pv[0], Some(&**tb));
                             }
@@ -476,12 +478,88 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                             if wdl >= 19000 && !tb_pv.is_empty() {
                                 tb_pv[0] = pick_winning_tb_move(&board, &tb_pv[0], tb);
                             }
+                            // CRITICAL: both tiebreaks above REPLACE tb_pv[0]
+                            // with a different move, but tb_pv[1..] is still the
+                            // reply chain probe_root_pv built for the ORIGINAL
+                            // move. After a substitution that tail belongs to a
+                            // line we are no longer playing and is generally
+                            // ILLEGAL in the position actually reached. Only
+                            // tb_pv[0] was validated below, so the stale tail was
+                            // being joined and printed verbatim — cutechess
+                            // "Illegal PV move" (observed 2026-07-25 in the first
+                            // TB-enabled local RR; always at index >= 1, never 0,
+                            // which is the signature of exactly this). Same class
+                            // as the lichess forfeit risk guarded elsewhere.
+                            // probe_root_pv itself is fine and unit-tested
+                            // (tb.rs probe_root_pv_only_legal_moves) — the
+                            // corruption is introduced here, after that boundary.
+                            //
+                            // If a tiebreak REPLACED the first move, everything
+                            // after it is the reply chain to the move we just
+                            // discarded, and is meaningless for the line we will
+                            // actually play — even where it happens to remain
+                            // legal (a king move, a capture elsewhere: legality
+                            // need not depend on what the first move did). A
+                            // legality filter alone would keep those and report a
+                            // legal-but-wrong PV. Treat the tail as invalid by
+                            // construction and rebuild it by re-probing from the
+                            // position the substituted move actually reaches.
+                            if tb_pv_original_first.as_deref() != tb_pv.first().map(|s| s.as_str())
+                                && !tb_pv.is_empty()
+                            {
+                                let head = tb_pv[0].clone();
+                                let mut child = board.clone();
+                                let rebuilt = parse_uci_move(&child, &head)
+                                    .filter(|mv| child.is_legal(*mv, child.pinned(), child.checkers()))
+                                    .map(|mv| {
+                                        child.make_move(mv);
+                                        match tb.probe_root_pv(&child, 31) {
+                                            Some((cont, _)) => {
+                                                let mut v = vec![head.clone()];
+                                                v.extend(cont);
+                                                v
+                                            }
+                                            None => vec![head.clone()],
+                                        }
+                                    })
+                                    .unwrap_or_else(|| vec![head.clone()]);
+                                tb_pv = rebuilt;
+                            }
+                            // Belt-and-braces: walk the (now correctly-sourced)
+                            // chain and truncate at the first move that is not
+                            // legal in the position reached, mirroring the search
+                            // PV guard in build_pv_string.
+                            {
+                                let mut walk = board.clone();
+                                let mut keep = 0usize;
+                                for u in tb_pv.iter() {
+                                    match parse_uci_move(&walk, u) {
+                                        Some(mv)
+                                            if walk.is_legal(
+                                                mv,
+                                                walk.pinned(),
+                                                walk.checkers(),
+                                            ) =>
+                                        {
+                                            walk.make_move(mv);
+                                            keep += 1;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                tb_pv.truncate(keep);
+                            }
                             // Validate the FIRST move of the walked PV — if
                             // TB returns an illegal "king capture" in a mate
                             // position we want to fall through to search.
+                            // (tb_pv may now be EMPTY after the truncation above,
+                            // so the [0] index must stay guarded — an empty chain
+                            // leaves tb_valid false and falls through to search.)
                             let legal = crate::movegen::generate_legal_moves(&board);
                             let mut tb_valid = false;
-                            if let Some(parsed) = parse_uci_move(&board, &tb_pv[0]) {
+                            if let Some(parsed) =
+                                tb_pv.first().and_then(|m| parse_uci_move(&board, m))
+                            {
                                 for i in 0..legal.len {
                                     if move_from(legal.get(i)) == move_from(parsed)
                                         && move_to(legal.get(i)) == move_to(parsed) {
@@ -491,13 +569,11 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                                 }
                             }
                             if tb_valid {
-                                let score_str = if wdl > 0 {
-                                    format!("score cp {}", crate::tt::TB_WIN)
-                                } else if wdl < 0 {
-                                    format!("score cp -{}", crate::tt::TB_WIN)
-                                } else {
-                                    "score cp 0".to_string()
-                                };
+                                let score_str = crate::tt::format_uci_score(
+                                    if wdl > 0 { crate::tt::TB_WIN }
+                                    else if wdl < 0 { -crate::tt::TB_WIN }
+                                    else { 0 },
+                                );
                                 let pv_str = tb_pv.join(" ");
                                 let depth = tb_pv.len().max(1);
                                 println!("info depth {} seldepth {} {} tbhits 1 pv {}",
@@ -970,13 +1046,11 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                                         stop_flag = info.stop.clone();
                                     }
                                 }
-                                let score_str = if wdl > 0 {
-                                    format!("score cp {}", crate::tt::TB_WIN)
-                                } else if wdl < 0 {
-                                    format!("score cp -{}", crate::tt::TB_WIN)
-                                } else {
-                                    "score cp 0".to_string()
-                                };
+                                let score_str = crate::tt::format_uci_score(
+                                    if wdl > 0 { crate::tt::TB_WIN }
+                                    else if wdl < 0 { -crate::tt::TB_WIN }
+                                    else { 0 },
+                                );
                                 println!("info depth 1 seldepth 1 {} tbhits 1 pv {}", score_str, tb_move_str);
                                 println!("bestmove {}", tb_move_str);
                                 continue;
@@ -1607,6 +1681,18 @@ fn parse_option(tokens: &[&str], info: &mut SearchInfo, num_threads: &mut usize,
                 info.move_overhead = ms.min(5000);
             }
         }
+        // Display-only scale for reported `score cp` (100 = unscaled). Does NOT
+        // affect search — see tt::format_uci_score. Matters for tournaments whose
+        // rules key off the printed score (one-sided resign adjudication,
+        // "opening too lopsided" rejection), because Coda's cp are denominated
+        // on LC0's scale rather than the field's.
+        "ScoreScale" => {
+            if let Ok(v) = value.parse::<i32>() {
+                let v = v.clamp(25, 200);
+                crate::tt::REPORT_SCALE_PCT.store(v, std::sync::atomic::Ordering::Relaxed);
+                println!("info string ScoreScale = {}", v);
+            }
+        }
         "SyzygyProbeDepth" => {
             if let Ok(d) = value.parse::<i32>() {
                 info.tb_probe_depth = d.max(1).min(100);
@@ -1634,7 +1720,7 @@ fn parse_option(tokens: &[&str], info: &mut SearchInfo, num_threads: &mut usize,
         }
         "LoadAnyway" => {
             // Diagnostic override — load nets even on training/inference
-            // mismatch (e.g. xray-disabled-trained net). MUST be set
+            // mismatch. MUST be set
             // BEFORE the NNUEFile setoption that triggers load. Default
             // false (refuse to load on mismatch — protects against silent
             // corruption in SPRT / OB / Lichess where log noise is
@@ -1834,6 +1920,7 @@ mod tests {
     /// forfeited-ponder class the fallback exists to cut).
     #[test]
     fn tt_ponder_hint_recovers_after_real_search() {
+
         init();
         let net_path = match crate::search::test_net_path() {
             Some(p) => p,

@@ -14,7 +14,31 @@
 use crate::threats::{RawThreatDelta, MAX_THREAT_DELTAS};
 use crate::types::*;
 
-const MAX_PLY: usize = 256;
+/// Experiment predicate (env CODA_THREAT_REFRESH_ALWAYS, read once): replace
+/// the delta-generation + walkback-replay pipeline with full re-enumeration
+/// at every materialization. search.rs also consults this to skip
+/// `generate_threat_deltas`, so generation and replay stay consistent.
+#[inline]
+pub fn refresh_always() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("CODA_THREAT_REFRESH_ALWAYS").is_ok())
+}
+
+/// Pre-allocated depth of the threat accumulator stack.
+///
+/// Derived from the search's own ply cap rather than hardcoded: `search::MAX_PLY`
+/// bounds the search stack, so entries beyond it were unreachable. The old 256
+/// was 96 entries of pure waste — and not cheap waste: `ThreatEntry` is ~4.6 KB
+/// (2 x FT i16 accumulators + a 128-entry DeltaVec), so the stack was ~1158 KB,
+/// which EXCEEDS the ~1 MB per-process share of a 16 MB L3 at conc=16. Every
+/// make/unmake writes into this structure, so it competes directly with the NNUE
+/// weight rows for the same cache — and weight eviction is the measured cause of
+/// our contended-NPS deficit (misses/Kinstr 0.100 -> 2.525 from conc1 to conc16).
+///
+/// `+8` is slack for QS chains that recurse past the nominal cap. Under-sizing is
+/// safe regardless: `push()` grows the Vec on demand, so exceeding this costs one
+/// reallocation, never correctness.
+const MAX_PLY: usize = crate::search::MAX_PLY + 8;
 
 /// Maximum FT (threat-accumulator) hidden size we support inline.
 /// Production v9 uses 768; FT=1024 architecture probes need 1024.
@@ -104,6 +128,9 @@ pub struct ThreatEntry {
     pub moved_pt: u8,
     /// Color that moved (for per-perspective king mirror check)
     pub moved_color: u8,
+    /// Diagnostic (profile-threats only): whether this generation instance's
+    /// deltas were ever replayed. Sized into struct padding; unused in prod.
+    pub consumed: bool,
 }
 
 impl Default for ThreatEntry {
@@ -121,6 +148,7 @@ impl ThreatEntry {
             mv: NO_MOVE,
             moved_pt: NO_PIECE_TYPE,
             moved_color: WHITE,
+            consumed: false,
         }
     }
 }
@@ -182,6 +210,8 @@ impl ThreatStack {
         entry.delta.clear();
         entry.mv = mv;
         entry.moved_pt = moved_pt;
+        #[cfg(feature = "profile-threats")]
+        { entry.consumed = false; }
     }
 
     /// Pop: decrement index. Saturates at 0 — if push/pop balance is
@@ -290,6 +320,8 @@ impl ThreatStack {
             let entry = &self.stack[i + 1];
             if entry.mv != NO_MOVE {
                 if entry.delta.overflowed() {
+                    #[cfg(feature = "profile-threats")]
+                    crate::threats::apply_stats::record_refresh_cause(2);
                     return None;
                 }
                 if entry.moved_pt == KING && entry.moved_color == pov {
@@ -297,6 +329,8 @@ impl ThreatStack {
                     let to = move_to(entry.mv);
                     if (from % 8 >= 4) != (to % 8 >= 4) {
                         // This perspective's king crossed e-file — mirroring changed.
+                        #[cfg(feature = "profile-threats")]
+                        crate::threats::apply_stats::record_refresh_cause(0);
                         return None;
                     }
                 }
@@ -306,6 +340,8 @@ impl ThreatStack {
                 return Some(i);
             }
         }
+        #[cfg(feature = "profile-threats")]
+        crate::threats::apply_stats::record_refresh_cause(1);
         None
     }
 
@@ -344,6 +380,12 @@ impl ThreatStack {
 
         for ply in (ancestor + 1)..=self.index {
             let entry_mv = self.stack[ply].mv;
+
+            #[cfg(feature = "profile-threats")]
+            if entry_mv != NO_MOVE && !self.stack[ply].consumed {
+                self.stack[ply].consumed = true;
+                crate::threats::apply_stats::record_first_consume();
+            }
 
             if entry_mv == NO_MOVE || self.stack[ply].delta.is_empty() {
                 // Null move or no deltas: copy from previous
@@ -391,6 +433,12 @@ impl ThreatStack {
         for ply in (ancestor + 1)..=self.index {
             let entry_mv = self.stack[ply].mv;
 
+            #[cfg(feature = "profile-threats")]
+            if entry_mv != NO_MOVE && !self.stack[ply].consumed {
+                self.stack[ply].consumed = true;
+                crate::threats::apply_stats::record_first_consume();
+            }
+
             let (prev, curr) = self.stack.split_at_mut(ply);
             let prev_entry = &prev[ply - 1];
             let entry = &mut curr[0];
@@ -435,6 +483,22 @@ impl ThreatStack {
     pub fn ensure_computed(&mut self, net_weights: &[i8], num_features: usize,
                           board: &crate::board::Board) {
         if !self.active { return; }
+
+        // Experiment (CODA_THREAT_REFRESH_ALWAYS): bypass the walkback/replay
+        // machinery and re-enumerate from the board every time. Paired with
+        // skipping delta generation in make_move (search.rs reads the same
+        // predicate), this measures whether the replay path earns its keep —
+        // avg active features/position (~6.8) is close to avg delta rows per
+        // replayed edge (~7.4), so refresh may cost about the same as a
+        // single-edge replay while deleting all generation work.
+        if refresh_always() {
+            for pov in [WHITE, BLACK] {
+                if !self.stack[self.index].accurate[pov as usize] {
+                    self.refresh(net_weights, num_features, board, pov);
+                }
+            }
+            return;
+        }
 
         let idx = self.index;
         if !self.stack[idx].accurate[WHITE as usize] && !self.stack[idx].accurate[BLACK as usize] {
@@ -539,6 +603,7 @@ mod incremental_tests {
     /// that incremental == full-refresh for both perspectives.
     fn run_scenario(name: &str, fen: &str, moves: &[&str]) {
         crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let nf = num_threat_features();
         let weights = make_weights(nf);
 
@@ -807,12 +872,12 @@ mod incremental_tests {
     /// regression.
     #[test]
     fn fuzz_random_games() {
-        let _xray = crate::threats::XRAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         run_fuzz_random_games();
     }
 
     fn run_fuzz_random_games() {
         crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let nf = num_threat_features();
         let weights = make_weights(nf);
 
@@ -934,25 +999,13 @@ mod incremental_tests {
     /// occur constantly.
     #[test]
     fn fuzz_random_walk_with_pops_and_lazy_gaps() {
-        let _xray = crate::threats::XRAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         run_fuzz_walk_with_pops();
     }
 
-    // BUG HUNT: same make/unmake consistency walk but with X-ray emission OFF
-    // (os-noxray regime). Global EMIT_XRAY is process-wide, so this holds
-    // XRAY_TEST_LOCK across the whole flag-flip window — otherwise a concurrent
-    // x-ray-ON test reads the flipped flag and fails spuriously. If it diverges,
-    // the x-ray-OFF incremental delta path is inconsistent with full-recompute.
-    #[test]
-    fn fuzz_random_walk_xray_off() {
-        let _xray = crate::threats::XRAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        crate::threats::set_emit_xray(false);
-        run_fuzz_walk_with_pops();
-        crate::threats::set_emit_xray(true);
-    }
 
     fn run_fuzz_walk_with_pops() {
         crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let nf = num_threat_features();
         let weights = make_weights(nf);
 
@@ -1112,6 +1165,7 @@ mod incremental_tests {
     #[test]
     fn weights_distinguish_features() {
         crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let nf = num_threat_features();
         let w = make_weights(nf.min(4));
         // Feature 0's row should differ from feature 1's row.
@@ -1128,6 +1182,7 @@ mod incremental_tests {
     #[ignore]
     fn dump_diff_b8c6_quiet_knight() {
         crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let nf = num_threat_features();
         let mut board = Board::new();
         // Position after 1.e4 e5 — white to move, then black plays Nc6 on next ply.
@@ -1312,6 +1367,7 @@ mod incremental_tests {
     #[ignore]
     fn dump_diff_rook_capture_with_xray() {
         crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let nf = num_threat_features();
         let mut board = Board::new();
         board.set_fen("k7/n7/8/8/p7/8/8/R3K3 w Q - 0 1");
@@ -1414,6 +1470,7 @@ mod incremental_tests {
     #[ignore]
     fn diag_fuzz_ply28_e1c1() {
         crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let nf = num_threat_features();
 
         // Kiwipete + same xorshift32 PRNG as fuzz_random_games (fen_idx=1, game=0).
@@ -1565,6 +1622,7 @@ mod incremental_tests {
     #[ignore]
     fn measure_feature_sparsity() {
         crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let nf = num_threat_features();
         eprintln!("Measuring activation frequency across {} threat features", nf);
 

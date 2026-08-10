@@ -95,8 +95,7 @@ struct Cli {
     book: Option<String>,
 
     /// DIAGNOSTIC ONLY — load nets even when they mismatch Coda's inference
-    /// configuration (e.g. net trained with --xray 0 while Coda always emits
-    /// xrays). Default is refuse-to-load so mismatches can't silently degrade
+    /// configuration. Default is refuse-to-load so mismatches can't silently degrade
     /// SPRT / OB / Lichess games. Use only when deliberately probing a
     /// mismatched net. Also available as UCI option `LoadAnyway`.
     #[arg(long = "load-anyway", global = true)]
@@ -173,6 +172,48 @@ enum Commands {
         max: usize,
     },
     /// Inspect binpack training data (ply distribution, score stats)
+    /// Dump binpack positions verbatim as TSV: ply, score, move (UCI), fen — one row per
+    /// stored position, in file order, with NO filtering whatsoever.
+    ///
+    /// Exists because every other binpack tool here is blind to skip-mark
+    /// filtering. `sample-positions` silently drops |score|>2000 and in-check
+    /// positions; `inspect-binpack` and `chain-stats` aggregate. Stockfish-style
+    /// filtering MARKS positions with an out-of-range score sentinel rather than
+    /// deleting rows, so row counts and ply histograms are identical before and
+    /// after filtering — only the score field moves. Verifying filtered data
+    /// therefore needs a dump that preserves marked rows exactly where they are.
+    DumpBinpack {
+        /// Input binpack file
+        #[arg(short, long)]
+        input: String,
+        /// Output TSV path ("-" for stdout)
+        #[arg(short, long, default_value = "-")]
+        output: String,
+        /// Max positions to read (0 = all)
+        #[arg(long, default_value_t = 0)]
+        count: usize,
+    },
+    /// Split a binpack into N parts at BLOCK boundaries, for sharding work
+    /// across machines.
+    ///
+    /// The format is `File = Block*`, `Block = "BINP" + u32le(size) + data`, so
+    /// every block boundary is a valid split point and every part is itself a
+    /// valid binpack. Merging is plain concatenation (`cat a b > c`) — no tool
+    /// needed — because a concatenation of Blocks is still a File.
+    ///
+    /// Splitting at an arbitrary BYTE offset instead corrupts the tail part and
+    /// makes readers fault partway through, which is why this walks headers.
+    SplitBinpack {
+        /// Input binpack file
+        #[arg(short, long)]
+        input: String,
+        /// Output prefix; parts are written as <prefix>.000, <prefix>.001, ...
+        #[arg(short, long)]
+        output: String,
+        /// Number of parts
+        #[arg(long, default_value_t = 2)]
+        parts: usize,
+    },
     InspectBinpack {
         /// Input binpack file
         #[arg(short = 'i', long = "input")]
@@ -533,14 +574,6 @@ enum Commands {
         /// HiddenActivation=crelu at load time.
         #[arg(long)]
         hl_crelu: bool,
-        /// Whether the net was trained WITH xray threat features (Bullet
-        /// --xray 1, the default). Coda inference always emits xrays, so
-        /// xray-disabled-trained nets mismatch at inference and are
-        /// refused at load time unless --load-anyway is set. Default true;
-        /// pass --no-xray-trained when converting a Bullet net trained
-        /// with --xray 0.
-        #[arg(long = "no-xray-trained", action = clap::ArgAction::SetFalse)]
-        xray_trained: bool,
     },
     /// Convert .nnue to Bullet checkpoint (for transfer learning)
     ConvertCheckpoint {
@@ -930,6 +963,14 @@ fn main() {
 
         Some(Commands::Epd { path, time, max }) => {
             epd::run_epd(&path, time, max, cli.nnue.as_deref());
+        }
+
+        Some(Commands::DumpBinpack { input, output, count }) => {
+            run_dump_binpack(&input, &output, count);
+        }
+
+        Some(Commands::SplitBinpack { input, output, parts }) => {
+            run_split_binpack(&input, &output, parts);
         }
 
         Some(Commands::InspectBinpack { input, count }) => {
@@ -1329,7 +1370,7 @@ fn main() {
             run_binpack_material(&input, max);
         }
 
-        Some(Commands::ConvertBullet { input, output, screlu, pairwise, hidden, hidden2, int8l1, bucketed_hidden, ft_size, int16_hidden, dual, consensus_buckets, kb_layout, kb_count, threats, output_buckets, hl_crelu, xray_trained }) => {
+        Some(Commands::ConvertBullet { input, output, screlu, pairwise, hidden, hidden2, int8l1, bucketed_hidden, ft_size, int16_hidden, dual, consensus_buckets, kb_layout, kb_count, threats, output_buckets, hl_crelu }) => {
             // Resolve king bucket layout and count. Explicit --kb-layout wins;
             // --consensus-buckets is the legacy path for 16-bucket consensus.
             let layout = if !kb_layout.is_empty() {
@@ -1345,7 +1386,7 @@ fn main() {
             let count = if kb_count > 0 { kb_count } else { layout.default_count() };
 
             let result = if hidden > 0 {
-                bullet_convert::convert_v7(&input, &output, screlu, pairwise, hidden, hidden2, int8l1, bucketed_hidden, ft_size, int16_hidden, dual, layout, count, threats, hl_crelu, xray_trained)
+                bullet_convert::convert_v7(&input, &output, screlu, pairwise, hidden, hidden2, int8l1, bucketed_hidden, ft_size, int16_hidden, dual, layout, count, threats, hl_crelu)
             } else {
                 bullet_convert::convert_v5(&input, &output, screlu, pairwise, output_buckets, layout, count)
             };
@@ -2445,6 +2486,127 @@ fn run_binpack_stats(input: &str) {
         let draw_share = if dropped > 0 { draws as f64 / dropped as f64 * 100.0 } else { 0.0 };
         println!("  {:>9}    {:>10} ({:>5.2}%) ({:>5.2}%)    {:>10} ({:>5.1}%)",
             t, dropped, drop_pct, retain_pct, draws, draw_share);
+    }
+}
+
+/// Verbatim binpack -> TSV dump (ply, score, move, fen). No filtering, sampling
+/// no reordering: row N of the output is position N of the file.
+///
+/// Deliberately does NOT reuse `run_sample_positions`' loop, which drops
+/// |score|>2000 and in-check positions. Those drops make it impossible to
+/// compare a filtered binpack against its unfiltered source, because filtering
+/// works by writing an out-of-range sentinel score and the sampler discards
+/// exactly the rows that carry the sentinel.
+fn run_dump_binpack(input: &str, output: &str, count: usize) {
+    use sfbinpack::CompressedTrainingDataEntryReader;
+    use std::io::Write;
+
+    let file = std::fs::File::open(input)
+        .unwrap_or_else(|_| panic!("Failed to open {}", input));
+    let mut reader = CompressedTrainingDataEntryReader::new(file)
+        .unwrap_or_else(|_| panic!("Failed to parse binpack {}", input));
+
+    let stdout = std::io::stdout();
+    let mut out: Box<dyn Write> = if output == "-" {
+        Box::new(std::io::BufWriter::new(stdout.lock()))
+    } else {
+        Box::new(std::io::BufWriter::new(
+            std::fs::File::create(output)
+                .unwrap_or_else(|_| panic!("Failed to create {}", output)),
+        ))
+    };
+
+    // fen is written LAST so downstream splits can bound the field count; the
+    // move is included because the Stockfish-side filter rules (capture /
+    // promotion) key on the stored move, not just the position.
+    let mut n = 0usize;
+    while reader.has_next() {
+        let entry = reader.next();
+        let fen = entry.pos.fen().unwrap_or_default();
+        if writeln!(out, "{}\t{}\t{}\t{}", entry.ply, entry.score, entry.mv.as_uci(), fen).is_err() {
+            break; // downstream closed (e.g. `| head`)
+        }
+        n += 1;
+        if count > 0 && n >= count { break; }
+    }
+    let _ = out.flush();
+}
+
+/// Split a binpack at block boundaries into `parts` roughly equal pieces.
+///
+/// Walks the `"BINP" + u32le(size)` headers to collect every legal cut point,
+/// then picks the ones closest to even byte splits. Each output is a standalone
+/// valid binpack; `cat` them back together to recover the original exactly.
+fn run_split_binpack(input: &str, output: &str, parts: usize) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    if parts < 1 {
+        eprintln!("--parts must be >= 1");
+        std::process::exit(2);
+    }
+    let mut f = std::fs::File::open(input)
+        .unwrap_or_else(|_| panic!("Failed to open {}", input));
+    let total = f.metadata().expect("stat failed").len();
+
+    // Collect block start offsets by walking headers.
+    let mut starts: Vec<u64> = Vec::new();
+    let mut off: u64 = 0;
+    let mut hdr = [0u8; 8];
+    loop {
+        if off >= total { break; }
+        f.seek(SeekFrom::Start(off)).expect("seek failed");
+        if f.read_exact(&mut hdr).is_err() { break; }
+        if &hdr[0..4] != b"BINP" {
+            eprintln!("WARNING: no BINP magic at offset {} — stopping scan (file truncated or not a binpack)", off);
+            break;
+        }
+        let size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
+        starts.push(off);
+        off += 8 + size;
+    }
+    if starts.is_empty() {
+        eprintln!("No BINP blocks found in {}", input);
+        std::process::exit(2);
+    }
+    let scanned_end = off.min(total);
+    println!("{} blocks, {} bytes scanned (file {} bytes)", starts.len(), scanned_end, total);
+    if scanned_end < total {
+        println!("NOTE: {} trailing bytes are not part of a complete block and will be dropped",
+                 total - scanned_end);
+    }
+
+    let n = parts.min(starts.len());
+    if n < parts {
+        println!("NOTE: only {} blocks available, producing {} parts", starts.len(), n);
+    }
+    // Choose cut indices closest to even byte boundaries.
+    let mut cuts: Vec<usize> = vec![0];
+    for i in 1..n {
+        let target = scanned_end * (i as u64) / (n as u64);
+        let idx = starts.partition_point(|&o| o < target).max(1).min(starts.len() - 1);
+        if idx > *cuts.last().unwrap() { cuts.push(idx); }
+    }
+    cuts.push(starts.len());
+
+    for i in 0..cuts.len() - 1 {
+        let begin = starts[cuts[i]];
+        let end = if cuts[i + 1] < starts.len() { starts[cuts[i + 1]] } else { scanned_end };
+        let path = format!("{}.{:03}", output, i);
+        let mut out = std::io::BufWriter::new(
+            std::fs::File::create(&path).unwrap_or_else(|_| panic!("Failed to create {}", path)));
+        f.seek(SeekFrom::Start(begin)).expect("seek failed");
+        let mut remaining = end - begin;
+        let mut buf = vec![0u8; 8 << 20];
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            f.read_exact(&mut buf[..want]).expect("read failed");
+            out.write_all(&buf[..want]).expect("write failed");
+            remaining -= want as u64;
+        }
+        out.flush().expect("flush failed");
+        println!("  {} : bytes {}..{} ({} blocks, {:.2} GB)",
+                 path, begin, end, cuts[i + 1] - cuts[i],
+                 (end - begin) as f64 / 1073741824.0);
     }
 }
 
