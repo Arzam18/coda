@@ -27,7 +27,12 @@ pub type Threats = u64;
 pub struct History {
     /// Main history: [from_threatened][to_threatened][from][to]
     /// Threat-aware 4D indexing — separate history for moves escaping/entering threats.
-    pub main: [[[[i32; 64]; 64]; 2]; 2],
+    /// i16 storage: the gravity update keeps every entry within ±MAX_HISTORY
+    /// (16384), so i16 is exact, and it halves the table from 64 KB to 32 KB.
+    /// The 4D read in quiet scoring is scattered (threat bits × from × to), and
+    /// at 64 KB the table alone exceeded L1D; perf showed that read as the
+    /// hottest cache-miss site in `next_slow`.
+    pub main: [[[[i16; 64]; 64]; 2]; 2],
     /// Capture history: [piece 1-12][to][captured_type 0-6]
     /// piece uses 1-12 indexing (slot 0 unused).
     /// captured_type uses 0-6 scheme (0=empty, 1=pawn, ..., 6=king).
@@ -45,15 +50,15 @@ impl History {
         if crate::search::FEAT_4D_HISTORY.load(std::sync::atomic::Ordering::Relaxed) {
             let ft = ((threats >> from) & 1) as usize;
             let tt = ((threats >> to) & 1) as usize;
-            self.main[ft][tt][from as usize][to as usize]
+            self.main[ft][tt][from as usize][to as usize] as i32
         } else {
-            self.main[0][0][from as usize][to as usize]
+            self.main[0][0][from as usize][to as usize] as i32
         }
     }
 
     /// Get mutable reference to main history entry for a move given enemy threats.
     #[inline(always)]
-    pub fn main_entry(&mut self, from: u8, to: u8, threats: Threats) -> &mut i32 {
+    pub fn main_entry(&mut self, from: u8, to: u8, threats: Threats) -> &mut i16 {
         if crate::search::FEAT_4D_HISTORY.load(std::sync::atomic::Ordering::Relaxed) {
             let ft = ((threats >> from) & 1) as usize;
             let tt = ((threats >> to) & 1) as usize;
@@ -98,7 +103,7 @@ impl History {
         for t0 in self.main.iter_mut() {
             for t1 in t0.iter_mut() {
                 for row in t1.iter_mut() {
-                    for v in row.iter_mut() { *v = *v * factor / divisor; }
+                    for v in row.iter_mut() { *v = (*v as i32 * factor / divisor) as i16; }
                 }
             }
         }
@@ -116,10 +121,16 @@ impl History {
         }
     }
 
-    /// Update history with gravity (bonus capped, decayed toward zero).
-    pub fn update_history(entry: &mut i32, bonus: i32) {
+    /// Update main history with gravity (bonus capped, decayed toward zero).
+    /// Computed in i32 and stored as i16: with |entry| <= MAX_HISTORY and
+    /// |clamped| <= MAX_HISTORY the result is again within ±MAX_HISTORY, so
+    /// the narrowing is exact (no clamp needed, unlike `update_cont_history`).
+    pub fn update_history(entry: &mut i16, bonus: i32) {
         let clamped = bonus.clamp(-MAX_HISTORY, MAX_HISTORY);
-        *entry += clamped - *entry * clamped.abs() / MAX_HISTORY;
+        let val = *entry as i32;
+        let new_val = val + clamped - val * clamped.abs() / MAX_HISTORY;
+        debug_assert!(new_val.abs() <= MAX_HISTORY);
+        *entry = new_val as i16;
     }
 
     /// Update continuation history (i16 entries) with gravity.
@@ -149,11 +160,10 @@ impl History {
 ///
 /// Every cont-hist read and write derives its sub-table from
 /// `moved_piece_stack[ply]`, so this constant is the single source of truth for
-/// the bound check at each of those sites. They previously hardcoded `< 13`;
-/// a plane-count change that missed even one of them would have silently
-/// dropped writes into the new planes instead of failing loudly, which is the
-/// exact failure mode the 2026-07-21 history audit flagged. Bound-check against
-/// this constant (or `cont_hist.len()`), never a literal.
+/// the bound check at each of those sites. Bound-check against this constant
+/// (or `cont_hist.len()`), never a literal `13`: a plane-count change that
+/// missed even one hardcoded site would silently drop writes into the new
+/// planes rather than failing loudly.
 pub const CONT_PLANES: usize = 13;
 
 /// Map a Coda piece (0-11, color*6+pt) to history piece index (1-12).
@@ -231,6 +241,13 @@ pub struct MovePicker {
     bad_scores: [std::mem::MaybeUninit<i32>; 256],
     bad_len: usize,
     pub skip_quiet: bool,
+    /// QS mode (SF QCAPTURE shape): skip the SEE partition entirely — every
+    /// capture goes to the single picking stage ordered by MVV+captHist, and
+    /// the caller's per-move SEE gate is the only exchange evaluation. The
+    /// main search keeps the partition (its bad-capture stage is load-bearing
+    /// for move_count/LMR interactions); QS's is not, since QS filters
+    /// SEE-bad moves anyway.
+    no_see_partition: bool,
     threats: Threats, // enemy attack bitboard for threat-aware history
     // B1: our own pieces blocking a slider's attack on an enemy piece.
     // Moving one of these creates a discovered attack.
@@ -300,6 +317,7 @@ impl MovePicker {
             bad_scores: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
             bad_len: 0,
             skip_quiet: false,
+            no_see_partition: false,
             threats,
             xray_blockers,
             checkers,
@@ -314,13 +332,11 @@ impl MovePicker {
     }
 
     /// Create a MovePicker for quiescence search (captures only).
-    /// Initialize for quiescence search.
     pub fn new_quiescence(
         tt_move: Move,
         history: &History,
         // Passed in (QS already computes both per node) instead of
-        // recomputed here — consistent with MovePicker::new / new_evasion
-        // (#1923 dedup pattern; audit P1).
+        // recomputed here — consistent with MovePicker::new / new_evasion.
         checkers: Bitboard,
         pinned: Bitboard,
     ) -> Self {
@@ -339,12 +355,12 @@ impl MovePicker {
             bad_scores: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
             bad_len: 0,
             skip_quiet: true,
+            no_see_partition: true,
             threats: 0,
             xray_blockers: 0,
             // Real pin/check masks so the TTMove-stage is_legal check works.
-            // Were hardcoded 0 (fixed 2026-06-11) — same bug class as the
-            // main-picker fix of 2026-04-26 (#890 +3.4): with pinned=0,
-            // is_legal cannot reject pinned-piece TT moves in QS.
+            // These must not be hardcoded to 0: with pinned=0, is_legal cannot
+            // reject pinned-piece TT moves in QS.
             checkers,
             pinned,
             threat_sq: -1,
@@ -400,12 +416,12 @@ impl MovePicker {
             bad_scores: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
             bad_len: 0,
             skip_quiet: false,
-            // C8 audit LIKELY #19: evasion history READS must use the same
-            // enemy_attacks key as beta-cutoff WRITES. Previously hardcoded
-            // to 0, which hashed into a different 4D history slot than the
-            // writes — history written from in-check cutoffs was invisible
-            // to in-check reads. SF keeps reads and writes
-            // symmetric.
+            no_see_partition: false,
+            // Evasion history READS must use the same enemy_attacks key as
+            // beta-cutoff WRITES. Hardcoding this to 0 hashes into a different
+            // 4D history slot than the writes, making history written from
+            // in-check cutoffs invisible to in-check reads. SF keeps reads and
+            // writes symmetric.
             threats,
             xray_blockers: 0, // evasions don't use discovered-attack bonus
             checkers,
@@ -445,7 +461,8 @@ impl MovePicker {
                     // accepts king-into-attacked-square + pinned-piece-off-line,
                     // and Coda's make_move doesn't verify king safety. Without
                     // is_legal, an illegal TT move can reach pv_table[0][0] and
-                    // be emitted as bestmove (lichess 2agDftuq 2026-04-29 forfeit).
+                    // be emitted as bestmove — this has cost a real game by
+                    // forfeit.
                     if self.tt_move != NO_MOVE
                         && is_pseudo_legal(board, self.tt_move)
                         && board.is_legal(self.tt_move, self.pinned, self.checkers)
@@ -541,13 +558,29 @@ impl MovePicker {
             // Dynamic SEE threshold: captures with strong history get a more
             // forgiving threshold. Use captHist only (not MVV) to avoid inflation.
             let capt_hist = capt_hist_score_static(board, history, m);
-            let cap_score = mvv_lva(board, m) + capt_hist;
+            // In flat QS ordering, history also helps decide which captures
+            // survive the searched-move budget. Give it 1.25x weight here as
+            // the midpoint between trunk and the neutral 1.5x probe (#3379).
+            // Main-search capture ordering remains unchanged.
+            let hist_score = if self.no_see_partition {
+                capt_hist * 5 / 4
+            } else {
+                capt_hist
+            };
+            let cap_score = mvv_lva(board, m) + hist_score;
+            if self.no_see_partition {
+                // SF QCAPTURE shape: no SEE here at all. Order by score; the
+                // caller's gate does the one exchange evaluation per move.
+                let idx = self.moves.len;
+                self.moves.push(m);
+                self.scores[idx].write(cap_score);
+                continue;
+            }
             let see_threshold = -capt_hist / 18;
             if !see_ge(board, m, see_threshold) {
-                // Bad capture.
-                // C8 audit LIKELY #24: limit raised to 256 (from 64). 64
-                // could silently drop moves in pathological tactical
-                // positions (multiple queens + rooks with many captures).
+                // Bad capture. The 256 cap must stay generous: a smaller one
+                // silently drops moves in pathological tactical positions
+                // (multiple queens and rooks with many captures available).
                 if self.bad_len < 256 {
                     // Write slot bad_len before incrementing — upholds the
                     // [0..bad_len) initialized invariant.
@@ -608,6 +641,10 @@ impl MovePicker {
         let escape_bonus_q = crate::search::ESCAPE_BONUS_Q.load(Ordering::Relaxed);
         let escape_bonus_r = crate::search::ESCAPE_BONUS_R.load(Ordering::Relaxed);
         let escape_bonus_minor = crate::search::ESCAPE_BONUS_MINOR.load(Ordering::Relaxed);
+        // Indexed by min(pt, 7): pawn/king/NO_PIECE_TYPE get 0.
+        let escape_bonus_by_pt: [i32; 8] = [
+            0, escape_bonus_minor, escape_bonus_minor, escape_bonus_r, escape_bonus_q, 0, 0, 0,
+        ];
         let quiet_check_bonus = crate::search::QUIET_CHECK_BONUS.load(Ordering::Relaxed);
         let quiet_check_see_margin = crate::search::QUIET_CHECK_SEE_MARGIN.load(Ordering::Relaxed);
         let discovered_attack_bonus = crate::search::DISCOVERED_ATTACK_BONUS.load(Ordering::Relaxed);
@@ -667,12 +704,8 @@ impl MovePicker {
             // Escape-capture bonus: bonus for moving a piece off a threatened
             // square. All four (Q/R/B/N) now tunable.
             if self.threats & (1u64 << from) != 0 && piece != NO_PIECE {
-                score += match pt {
-                    4 => escape_bonus_q,
-                    3 => escape_bonus_r,
-                    1 | 2 => escape_bonus_minor,
-                    _ => 0,
-                };
+                // Table instead of a match on piece type (jump table, mispredicts).
+                score += escape_bonus_by_pt[pt.min(7) as usize];
             }
 
             // Quiet check bonus: moves that give direct check (SF +16384).
@@ -692,11 +725,6 @@ impl MovePicker {
                 score += discovered_attack_bonus;
             }
 
-            // (mobility-delta quiet-ordering bonus removed 2026-06-24, move-
-            // ordering audit speed cleanup: it ran TWO piece_attacks_occ slider
-            // calls per quiet move for a weight-34 signal — references precompute
-            // such signals per-node. SPRT tests whether the per-move NPS saving
-            // pays for the lost ordering signal.)
 
             // "Offense bonus": quiet move that lands on a square
             // attacking an enemy non-pawn piece. +6000 flat. Not yet present
@@ -722,11 +750,11 @@ impl MovePicker {
                         let unsafe_square = pt != 0 && (enemy_pawn_attacks & (1u64 << to)) != 0;
                         if !unsafe_square {
                             score += 6000;
-                            // T3.2: "good quiet" — the offense move's
-                            // strongest target is more valuable than us.
-                            // Cheap proxy for positive quiet-SEE.
-                            // QSEE_BONUS hardcoded 6687 after ablation #1257
-                            // H0 at [-3, 3] (-2.1 ±3.0, ~+2 Elo load-bearing).
+                            // "Good quiet": the offense move's strongest target
+                            // is worth more than the piece making the move — a
+                            // cheap proxy for positive quiet-SEE. The 6687 is a
+                            // tuned value and ablation-confirmed load-bearing
+                            // (~2 Elo), not an arbitrary constant.
                             {
                                 let our_val = see_value(pt);
                                 let mut hits = attacks_from_to & enemy_non_pawns;
@@ -752,9 +780,6 @@ impl MovePicker {
                             && popcount(attacks_from_to & enemy_non_pawns) >= 2 {
                             score += kf_bonus;
                         }
-                        // T1.4 Battery bonus removed 2026-05-17: ablation
-                        // #1278 H0 at [0, 3] (+0.2 ±1.1 at 114K games).
-                        // Feature confirmed neutral; code path deleted.
                     }
                 }
             }
@@ -791,20 +816,20 @@ impl MovePicker {
             let to = move_to(m);
             let flags = move_flags(m);
 
-            // C8 audit LIKELY #26: check capture FIRST so capture-promotions
-            // (e.g. pawn-takes-and-promotes) get the capture score path, not
-            // the flat 9000 promotion score that ranked them BELOW regular
-            // captures (10000+MVV+hist).
+            // Test capture FIRST so capture-promotions (e.g.
+            // pawn-takes-and-promotes) take the capture path rather than the
+            // flat promotion score below, which would rank them BELOW ordinary
+            // captures.
             let is_cap = board.piece_type_at(to) != NO_PIECE_TYPE || flags == FLAG_EN_PASSANT;
             let score = if is_cap {
                 // Capture (possibly also a promotion): MVV-LVA + capture
-                // history. mvv_lva now adds the promotion material delta
-                // internally (audit #25), so capture-promotions rank above
-                // regular captures.
-                // P1.11: uncrossable capture band (1<<20) — quiet-history sums
-                // span ±80k, so a 10000-offset let a hot quiet outrank a fresh
-                // capture of the checker. SF (1<<28), Berserk (1e7). mvv+captHist
-                // still order within the band (preserves C8 #26 capture-promo).
+                // history. mvv_lva folds in the promotion material delta, so
+                // capture-promotions rank above ordinary captures.
+                //
+                // The (1<<20) base makes the capture band uncrossable: quiet
+                // history sums span ±80k, so a smaller offset lets a hot quiet
+                // outrank a fresh capture of the checker. SF uses 1<<28,
+                // Berserk 1e7. mvv+captHist still order within the band.
                 (1 << 20) + mvv_lva(board, m) + capt_hist_score_static(board, history, m)
             } else if is_promotion(m) {
                 if flags == FLAG_PROMOTE_Q {
@@ -947,11 +972,10 @@ fn mvv_lva(board: &Board, m: Move) -> i32 {
     let mult = crate::search::MVV_CAP_MULT.load(std::sync::atomic::Ordering::Relaxed);
     let target_pt = board.piece_type_at(to);
 
-    // C8 audit LIKELY #25: non-capture promotions scored 0 in MVV and
-    // empty-slot in capt_hist, ranking BELOW any regular capture with a
-    // small history score. A queen promotion deserves a large base bonus.
-    // Add the promotion material delta (promoted piece - pawn) when the
-    // move is a promotion.
+    // Add the promotion material delta (promoted piece - pawn) so promotions
+    // carry a large base bonus. Without it a non-capture promotion scores 0 in
+    // MVV and hits an empty capt_hist slot, ranking BELOW any ordinary capture
+    // that happens to have a small history score.
     let promo_bonus = if is_promotion(m) {
         let promoted = promotion_piece_type(m);
         (see_value(promoted) - see_value(PAWN)) * mult
@@ -1007,7 +1031,7 @@ pub fn is_pseudo_legal(board: &Board, mv: Move) -> bool {
 
     // En passant: validate thoroughly
     //
-    // C1 (2026-04-22 audit): EP requires that `from` is on the EP-capture
+    // EP requires that `from` is on the EP-capture
     // rank (rank 5 for white, rank 4 for black) AND on a file adjacent to
     // `to`. Without these, a TT-collision move with corrupted from + to +
     // flags (e.g. `a2→d6 FLAG_EN_PASSANT` in a position with ep_square=d6)
@@ -1032,9 +1056,8 @@ pub fn is_pseudo_legal(board: &Board, mv: Move) -> bool {
     }
 
     // Castling: validate rights, path, ROOK-on-corner, and no attacks on
-    // king/intermediate/destination. Rook-on-corner check is the
-    // 2026-05-31 audit addition (finding G+H) — defends against TT-
-    // collision castles on a board where the rook moved away but the
+    // king/intermediate/destination. The rook-on-corner check defends against
+    // TT-collision castles on a board where the rook has moved away but the
     // synthetic FEN / corrupt state still has the right set.
     if flags == FLAG_CASTLE {
         if pt != KING { return false; }
@@ -1174,9 +1197,9 @@ pub fn is_pseudo_legal(board: &Board, mv: Move) -> bool {
     true
 }
 
-/// Move picker for quiescence search.
-/// QS move picker: TT move first, then captures scored by MVV-LVA + captHist.
-/// When in_check, uses evasion mode (all moves, captures scored above quiets).
+/// Capture-only picker used by ProbCut: TT move first, then captures scored by
+/// the shared main-search capture scorer. Never runs in check — the old evasion
+/// mode was dead code and was removed (QS in-check uses MovePicker::new_evasion).
 pub struct QMovePicker {
     tt_move: Move,
     tt_stage: bool, // true = haven't tried TT move yet
@@ -1190,7 +1213,6 @@ pub struct QMovePicker {
     idx: usize,
     pinned: Bitboard,
     checkers: Bitboard,
-    in_check: bool,
 }
 
 impl QMovePicker {
@@ -1199,19 +1221,16 @@ impl QMovePicker {
     pub fn new(
         board: &Board,
         tt_move: Move,
-        in_check: bool,
         history: &History,
         // Passed in — the probcut block runs after the node-entry
-        // pinned/checkers computation (audit P bundle).
+        // pinned/checkers computation.
         pinned: Bitboard,
         checkers: Bitboard,
     ) -> Self {
-
-        let moves = if in_check {
-            generate_evasions(board, checkers, pinned)
-        } else {
-            generate_captures(board)
-        };
+        // Captures only. This picker's sole caller is ProbCut, which never
+        // runs in check — the old in_check/evasion branch here was dead code
+        // (QS in-check uses the full MovePicker::new_evasion, history-scored).
+        let moves = generate_captures(board);
         let mut picker = QMovePicker {
             tt_move: if tt_move != NO_MOVE && is_pseudo_legal(board, tt_move) { tt_move } else { NO_MOVE },
             tt_stage: true,
@@ -1222,7 +1241,6 @@ impl QMovePicker {
             idx: 0,
             pinned,
             checkers,
-            in_check,
         };
 
         // Score moves: MVV-LVA + captHist for captures
@@ -1247,21 +1265,20 @@ impl QMovePicker {
                 // use one capture scorer for both search and QS.
                 let mvv = mvv_lva(board, mv);
                 let capt_hist = capt_hist_score_static(board, history, mv);
-                if in_check {
-                    // Evasion captures: uncrossable band (P1.11, see new_evasion).
-                    picker.scores[i].write((1 << 20) + mvv + capt_hist);
-                } else {
-                    picker.scores[i].write(mvv + capt_hist);
-                }
+                picker.scores[i].write(mvv + capt_hist);
             } else if is_promotion(mv) {
-                if in_check {
-                    let pt = promotion_piece_type(mv);
-                    picker.scores[i].write(if pt == QUEEN { 9000 } else { -1000 });
-                } else {
-                    picker.scores[i].write(see_value(promotion_piece_type(mv)));
-                }
+                // Non-capture promotion: kept on its ORIGINAL see_value scale,
+                // deliberately. This ranks it ~25x below the main picker's
+                // mvv_lva rank for the same move, which looks like forked-
+                // scorer drift -- but "fixing" it to the shared scale failed
+                // non-regression at -1.8 Elo (#3366, bundled with this
+                // deletion). ProbCut trying promotions ahead of captures
+                // evidently changes which cutoffs its verification certifies,
+                // for the worse. Intentional-by-evidence; do not unify without
+                // its own SPRT.
+                picker.scores[i].write(see_value(promotion_piece_type(mv)));
             } else {
-                // Quiet (only in evasion mode)
+                // Unreachable for generate_captures output; defensive score.
                 picker.scores[i].write(-1_000_000);
             }
         }
@@ -1302,17 +1319,8 @@ impl QMovePicker {
             // Skip TT move (already tried)
             if mv == self.tt_move { continue; }
 
-            // Not in check: only return captures/promotions
-            if !self.in_check {
-                let to = move_to(mv);
-                let flags = move_flags(mv);
-                let is_cap = board.piece_type_at(to) != NO_PIECE_TYPE
-                    || flags == FLAG_EN_PASSANT
-                    || is_promotion(mv);
-                if !is_cap {
-                    continue;
-                }
-            }
+            // Captures-only picker: everything generated is a capture or
+            // promotion, so no per-move class filter is needed.
 
             if board.is_legal(mv, self.pinned, self.checkers) {
                 return mv;
@@ -1682,7 +1690,7 @@ mod attackers_probe {
     }
 }
 
-/// Continuation-history read/write SYMMETRY guardrail (2026-07-21 history audit).
+/// Continuation-history read/write SYMMETRY guardrail.
 ///
 /// Every cont-hist read and write picks its sub-table from
 /// `moved_piece_stack[ply - off]`, bound-checked against `CONT_PLANES`. If the

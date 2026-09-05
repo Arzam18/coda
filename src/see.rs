@@ -76,7 +76,7 @@ pub fn see_ge(board: &Board, mv: Move, threshold: i32) -> bool {
     // Remove the initial attacker
     attackers &= occ;
 
-    // Pinned piece masks for each side (SEE audit S4: same approach as SF/Obsidian).
+    // Pinned piece masks for each side (same approach as SF/Obsidian).
     // A pinned piece cannot move off the pin ray, so it usually cannot legally
     // recapture on `to`. Like SF, we do NOT test pin-ray membership and exclude
     // ALL pinned pieces of the side to move. That approximation cuts both ways:
@@ -92,31 +92,43 @@ pub fn see_ge(board: &Board, mv: Move, threshold: i32) -> bool {
         let their_diag = (board.pieces[BISHOP as usize] | board.pieces[QUEEN as usize]) & board.colors[them as usize];
         let their_orth = (board.pieces[ROOK as usize] | board.pieces[QUEEN as usize]) & board.colors[them as usize];
         let (mut pinned, mut pinners) = (0u64, 0u64);
-        let mut p = bishop_attacks(ksq, 0) & their_diag;
+        // `bishop_attacks(ksq, 0)` / `rook_attacks(ksq, 0)` are by definition the
+        // empty-board rays, which we already keep in a 512-byte table each. Going
+        // through the magic path for them costs a PEXT plus a load from the
+        // multi-hundred-KB attack table for a value that never varies.
+        let mut p = bishop_attacks_empty(ksq) & their_diag;
         while p != 0 { let sq = pop_lsb(&mut p); let b = crate::bitboard::between(ksq, sq) & occ_all; if popcount(b) == 1 && b & board.colors[us as usize] != 0 { pinned |= b; pinners |= 1u64 << sq; } }
-        let mut p = rook_attacks(ksq, 0) & their_orth;
+        let mut p = rook_attacks_empty(ksq) & their_orth;
         while p != 0 { let sq = pop_lsb(&mut p); let b = crate::bitboard::between(ksq, sq) & occ_all; if popcount(b) == 1 && b & board.colors[us as usize] != 0 { pinned |= b; pinners |= 1u64 << sq; } }
         (pinned, pinners)
     };
-    let (pinned_w, pinners_b) = pin_info(WHITE);
-    let (pinned_b, pinners_w) = pin_info(BLACK);
-    let pinned = [pinned_w, pinned_b];
-    // pinners[c] = sliders of colour c that pin an enemy piece.
-    let pinners = [pinners_w, pinners_b];
+    // Filled on first touch, per colour. The swap loop only ever consults the
+    // masks for the side currently to move, and for that side it needs both
+    // halves of one `pin_info` call: `pinned` of `stm` and the pinners of its
+    // opponent are exactly what `pin_info(stm)` returns. Computing both colours
+    // up front therefore did two king-ray scans where most calls use one and
+    // many use none — the loop commonly breaks on the first `stm_attackers == 0`
+    // test, before any pin mask is read. Board state read by `pin_info` (kings,
+    // pieces, colours, the original occupancy) does not change across the loop,
+    // so a cached value stays valid for the whole call; only the `& occ` test
+    // against the live occupancy belongs inside the loop.
+    let mut pin_cache: [Option<(Bitboard, Bitboard)>; 2] = [None, None];
 
     loop {
         let mut stm_attackers = attackers & board.colors[stm as usize];
         if stm_attackers == 0 {
             break;
         }
+        let (pinned_stm, pinners_them) =
+            *pin_cache[stm as usize].get_or_insert_with(|| pin_info(stm));
         // Exclude pinned pieces from recapturing (they cannot legally move off
         // the pin ray) — but ONLY while the pinner is still on the board. Once
         // the pinner has been captured (including as the very first capture,
         // which is why `to` was cleared from `occ`), the pin is gone and the
         // piece is free to recapture. Same rule as SF's
         // `if (pinners(~stm) & occupied) stmAttackers &= ~blockers_for_king(stm)`.
-        if pinners[flip_color(stm) as usize] & occ != 0 {
-            stm_attackers &= !pinned[stm as usize];
+        if pinners_them & occ != 0 {
+            stm_attackers &= !pinned_stm;
             if stm_attackers == 0 {
                 break;
             }
@@ -138,14 +150,14 @@ pub fn see_ge(board: &Board, mv: Move, threshold: i32) -> bool {
         attackers &= occ;
 
         stm = flip_color(stm);
-        // In-loop promotion needs NO special case (revert of C8 #40, audit
-        // 2026-06-13 B1): the swap update with the PLAIN pawn value is the
+        // In-loop promotion needs NO special case: the swap update with
+        // the PLAIN pawn value is the
         // exact algebra. Correct accounting for a pawn capturing onto the
         // promotion rank is `balance = -balance - 1 + (Q-P) - Q`: the
         // promoting side gains (Q-P) and puts Q at risk — and those terms
         // cancel to `- P`. The negation next iteration then automatically
         // credits the recapturer +Q while permanently charging the (Q-P)
-        // gain. The C8 #40 form (risk Q without crediting Q-P) made the
+        // gain. Risking Q without crediting Q-P would make the
         // promoting side ~1100cp too pessimistic, flipping SEE verdicts:
         // FEN 3R2k1/4P3/3q4/3r4/8/8/8/6K1 b, Qd6xd8 returned +640 vs true
         // -460 (see test_see_inloop_promotion_*). No reference engine
@@ -339,10 +351,10 @@ mod see_assertive_tests {
         panic!("no legal move {} → {} in {}", from, to, b.to_fen());
     }
 
-    /// In-loop promotion recapture (audit 2026-06-13 B1, the C8 #40 revert).
+    /// In-loop promotion recapture.
     /// QxR, exd8=Q, Rxd8: white loses R+P (740), black loses Q (1200)
-    /// -> true exchange value for black is -460. The C8 #40 form returned
-    /// +640 (sign flip at every SEE threshold in use).
+    /// -> true exchange value for black is -460. Risking Q without crediting
+    /// Q-P returns +640 — a sign flip at every SEE threshold in use.
     #[test]
     fn see_inloop_promotion_recapture_losing() {
         init();
@@ -354,7 +366,7 @@ mod see_assertive_tests {
 
     /// Same motif with queen/rook swapped: RxR, exd8=Q, Qxd8.
     /// White loses R+P (740), black loses R (640) -> +100 for black
-    /// (no sign flip, but C8 #40 returned +640 — large magnitude error).
+    /// (no sign flip, but the mis-accounted form returns +640 — large error).
     #[test]
     fn see_inloop_promotion_recapture_winning() {
         init();
@@ -404,26 +416,15 @@ mod see_assertive_tests {
     #[test]
     fn see_xray_rook_behind_rook() {
         init();
-        // White R on d1, White R on d2, Black R on d8, Black P on d5.
-        // WR d2 captures d5. Sequence:
-        //  +P (100)  -R (500)   +R (500)  -R (500)
-        //   d2×d5    d8×d5      d1×d5     black has no more attackers (stops).
-        // Wait: after d1×d5, Black would lose their last R to nothing, so they stop earlier.
+        // X-ray: White Rd1 sits behind Rd2 on the d-file; Black has Rd8 and
+        // a pawn on d5. The capture under test is Rd2xd5.
         //
-        // Optimal play: +100 -500 = -400 (W loses too much, so W wouldn't start)
-        //   BUT see computes the perfect-exchange value assuming both sides play
-        //   optimally. Let's trace:
-        //   0. W move: d2×d5 → balance = +100
-        //   1. B stands or recaptures? B knows if they do Rxd5, W can continue with
-        //      d1×d5 winning B's rook: +100-500+500 = +100. B choice: recapture
-        //      (lose -100 relative to standing pat at +100). No, that's losing for B.
-        //      Actually from B's perspective, they want to minimize W's gain.
-        //      If B stands: W gains +100.
-        //      If B recaptures (Rxd5): W loses R (-500 from +100 = -400), then W can
-        //        continue (Rxd5): +100-500+500 = +100 again. Then B no more attackers,
-        //        final value = +100. So B capturing gives +100 too.
-        //      Either way, W nets +100.
-        //   Expected SEE = +100.
+        // Both Black replies come to the same value, which is what makes this
+        // a useful x-ray case:
+        //   B stands pat      -> +100 (the pawn)
+        //   B recaptures Rxd5 -> +100 - R + R = +100, because the d1 rook
+        //                        recaptures and Black has no attacker left.
+        // Expected SEE = +100.
         let b = Board::from_fen("3r3k/8/8/3p4/8/8/3R4/3RK3 w - - 0 1");
         let mv = find_move(&b, 11, 35); // d2 → d5
         assert_eq!(see_value_of(&b, mv), 100);

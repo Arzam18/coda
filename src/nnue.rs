@@ -178,8 +178,8 @@ impl<T: Default + Copy> AlignedVec<T> {
             // deterministic 2 MiB pages, immune to the broken-THP kernels
             // where the madvise path below silently yields zero huge pages
             // (Ubuntu HWE 6.8: AnonHugePages measured 0 kB for the 65 MiB
-            // threat table on both Atlas and the lichess host; same failure
-            // tt.rs documents for the TT). mmap reserves from the pool up
+            // threat table on multiple hosts; the same failure tt.rs
+            // documents for the TT). mmap reserves from the pool up
             // front, so it fails cleanly (→ fall through) when the pool is
             // absent or exhausted. CODA_NO_HUGETLB skips the tier — the
             // same-binary A/B toggle for the paired measurement protocol.
@@ -334,8 +334,8 @@ pub const NNUE_PW_BUF: usize = 1024;
 /// touches only a handful at scattered indices, so each row's first touch is
 /// a cold miss the hardware streamer cannot predict. Later chunks of the same
 /// row ARE predictable (sequential within the row), so only the head is
-/// pulled here. Same pattern as the threat-apply entry prefetch
-/// (perf/threat-apply-prefetch, OB #3037 +1.67 Elo H1).
+/// pulled here. Same pattern as the threat-apply entry prefetch, which
+/// measured +1.67 Elo.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn prefetch_acc_rows(add_rows: &[&[i16]], sub_rows: &[&[i16]], chunk_bytes: usize) {
@@ -401,13 +401,11 @@ const PW_SCALE: i32 = (QA * QA) >> FT_SHIFT; // max packed value after shift (12
 const NNUE_MAGIC: u32 = 0x4E4E5545; // "NNUE" in LE
 
 // King bucket tables: computed per-net from the layout field (see
-// compute_king_buckets below) and stored on NNUENet. Prior to 2026-04-20
-// these were `static mut KING_BUCKET: [usize; 64]` / `static mut KING_MIRROR`
-// written by `init_king_buckets_layout` on every net load. That data race
-// (helpers reading while load wrote) was the root cause of the v9 T=4 SMP
-// regression bisected to commit 1356150 — eliminated by making them
-// per-`NNUENet` fields populated at load time and never mutated after.
-// See `fix/smp-king-bucket-race`.
+// compute_king_buckets below) and stored on NNUENet. Do NOT make these
+// process-global `static mut` tables written on every net load: helpers
+// reading while a load writes is a data race, and it was the root cause of a
+// large T=4 SMP regression. They are per-`NNUENet` fields, populated at load
+// time and never mutated after.
 
 /// Consensus king bucket layout: fine-near, coarse-far — a common 16-bucket
 /// pattern across many engines for a mirrored HalfKA net. "Consensus" reflects
@@ -538,7 +536,7 @@ unsafe fn simd_acc_fused_avx2(
     // 12 AVX-2 registers × 16 i16 = 192 elements per chunk. Direct i16 add
     // has no i8→i16 expansion temps, so 12 YMM accumulators + ~3 for
     // address/loop temps sit comfortably in AVX-2's 16-YMM register file.
-    // Same architectural pattern as the AVX-512 REGS=24 (#926 +1.5 Elo H1)
+    // Same architectural pattern as the AVX-512 REGS=24 path (worth ~1.5 Elo)
     // but scaled to AVX-2's smaller register file.
     const REGS: usize = 12;
     const CHUNK: usize = REGS * 16;
@@ -552,9 +550,9 @@ unsafe fn simd_acc_fused_avx2(
     prefetch_acc_rows(add_rows, sub_rows, REGS * 16 * 2);
 
     // Shared body parameterised on the register count so every pass below
-    // runs with a COMPILE-TIME nregs and fully unrolls. Atlas perf
-    // annotate (2026-05-06) showed a unified runtime-nregs loop emitting
-    // a switch covering nregs 2-12 — ~9% of total eval cycles. Tiling per
+    // runs with a COMPILE-TIME nregs and fully unrolls. A unified
+    // runtime-nregs loop instead emits a switch covering nregs 2-12, which
+    // profiled at ~9% of total eval cycles. Tiling per
     // hidden size: h=768 → 4×CHUNK, no tail; h=1024 (current prod) →
     // 5×CHUNK + ONE const 4-register (64-element) pass. The runtime-nregs
     // tail only fires for h not a multiple of 64.
@@ -744,9 +742,9 @@ unsafe fn finny_batch_apply_avx2(
     adds: &[usize],
     subs: &[usize],
 ) {
-    // 12 AVX-2 registers × 16 i16 = 192 elements per chunk. Most of the
-    // OB fleet is AVX-2-only (no AVX-512), so this path covers the bulk
-    // of fleet workers — the AVX-512 sibling covers Zeus/thor. Direct
+    // 12 AVX-2 registers × 16 i16 = 192 elements per chunk. AVX-2 without
+    // AVX-512 is the common baseline, so this is the path most hardware
+    // takes; the AVX-512 sibling covers the rest. Direct
     // i16 add (no expansion temps) keeps 12 YMM accumulators + ~3 temps
     // within AVX-2's 16-YMM register file even when the delta loop
     // persists them across many add/sub iterations.
@@ -1635,6 +1633,162 @@ unsafe fn simd512_l1_int8_dot_sparse_vnni(packed: &[u8], weights: &[i8], nnz_ind
     _mm512_reduce_add_epi32(_mm512_add_epi32(s0, s1))
 }
 
+/// Largest `l1` the dual-L1 activation is written for. `l1_out` is 128 floats
+/// and dual writes `2 * l1` of them, so `l1` cannot exceed this anyway.
+const DUAL_L1_MAX: usize = 64;
+
+/// Dequantising half of the dual-L1 activation:
+/// `crelu[i] = hv[i] / qa_l1`, `screlu[i] = hv[i]^2 / qa_l1^2`.
+///
+/// Split out and hand-vectorised because this is the expensive half. `qa_l1`
+/// is a runtime value, so both of those are genuine IEEE divisions — nothing
+/// the compiler can strength-reduce — and scalar they issue one at a time, two
+/// `vdivss` per neuron. Hand-vectorising rather than nudging the autovectoriser
+/// is deliberate: written against a runtime `l1` it cannot prove the two output
+/// halves disjoint, and even when handed provably disjoint slices its decision
+/// moved with unrelated code under `codegen-units = 16` — it vectorised on one
+/// tree and not on the next. Writing the intrinsics removes the choice.
+///
+/// Bit-identical to the scalar form: `cvtepi32_ps` rounds to nearest-even
+/// exactly as `as f32` does, `mullo_epi32` keeps the low 32 bits exactly as
+/// `i32 * i32` does in release, and `div_ps` is the same IEEE division. The
+/// caller passes activations already clamped to `[0, qa_l1]`, so the square
+/// neither wraps nor rounds for any realistic scale — it would take
+/// `qa_l1 > 46340` to wrap an `i32` and `qa_l1 > 4095` for the square to leave
+/// the exactly-representable f32 range. Covered by
+/// `dual_l1_dequant_matches_scalar`.
+#[inline]
+fn dual_l1_dequant(
+    has_avx512: bool,
+    has_avx2: bool,
+    hv: &[i32],
+    qa_l1_f: f32,
+    qa_l1_sq: f32,
+    crelu: &mut [f32],
+    screlu: &mut [f32],
+) {
+    let n = hv.len();
+    // Real assert, not debug_assert: the SIMD kernels below write `n` lanes
+    // through raw pointers, so this is the bound that keeps them in range.
+    assert!(crelu.len() >= n && screlu.len() >= n,
+            "dual_l1_dequant outputs too small: n={} crelu={} screlu={}",
+            n, crelu.len(), screlu.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx512 && n.is_multiple_of(16) {
+            unsafe { dual_l1_dequant_avx512(hv, qa_l1_f, qa_l1_sq, crelu, screlu) };
+            return;
+        }
+        if has_avx2 && n.is_multiple_of(8) {
+            unsafe { dual_l1_dequant_avx2(hv, qa_l1_f, qa_l1_sq, crelu, screlu) };
+            return;
+        }
+    }
+    // aarch64 is a first-class target and always has NEON, so there is no
+    // runtime check to make — but the scalar loop below would otherwise be the
+    // ARM path, and it is the same two-divisions-per-neuron shape that made
+    // this worth splitting out on x86 in the first place.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (has_avx512, has_avx2);
+        if n.is_multiple_of(4) {
+            unsafe { dual_l1_dequant_neon(hv, qa_l1_f, qa_l1_sq, crelu, screlu) };
+            return;
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = (has_avx512, has_avx2);
+
+    for i in 0..n {
+        crelu[i] = hv[i] as f32 / qa_l1_f;
+        screlu[i] = (hv[i] * hv[i]) as f32 / qa_l1_sq;
+    }
+}
+
+/// NEON sibling of [`dual_l1_dequant_avx512`], 4 neurons per step. `vdivq_f32`
+/// is a true IEEE divide on aarch64 (not the reciprocal-estimate `vrecpe`
+/// sequence), and `vcvtq_f32_s32` rounds to nearest-even under the default
+/// FPCR, so the same bit-identity argument holds here as on x86.
+#[cfg(target_arch = "aarch64")]
+unsafe fn dual_l1_dequant_neon(
+    hv: &[i32],
+    qa_l1_f: f32,
+    qa_l1_sq: f32,
+    crelu: &mut [f32],
+    screlu: &mut [f32],
+) {
+    let dq = vdupq_n_f32(qa_l1_f);
+    let dq2 = vdupq_n_f32(qa_l1_sq);
+    let n = hv.len();
+    let src = hv.as_ptr();
+    let cp = crelu.as_mut_ptr();
+    let sp = screlu.as_mut_ptr();
+    let mut i = 0;
+    while i + 4 <= n {
+        let h = vld1q_s32(src.add(i));
+        let sq = vmulq_s32(h, h);
+        vst1q_f32(cp.add(i), vdivq_f32(vcvtq_f32_s32(h), dq));
+        vst1q_f32(sp.add(i), vdivq_f32(vcvtq_f32_s32(sq), dq2));
+        i += 4;
+    }
+}
+
+/// AVX-512 dual-L1 dequantisation, 16 neurons per step. Requires
+/// `hv.len()` to be a multiple of 16 and both outputs to be at least that long.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dual_l1_dequant_avx512(
+    hv: &[i32],
+    qa_l1_f: f32,
+    qa_l1_sq: f32,
+    crelu: &mut [f32],
+    screlu: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let dq = _mm512_set1_ps(qa_l1_f);
+    let dq2 = _mm512_set1_ps(qa_l1_sq);
+    let n = hv.len();
+    let src = hv.as_ptr();
+    let cp = crelu.as_mut_ptr();
+    let sp = screlu.as_mut_ptr();
+    let mut i = 0;
+    while i + 16 <= n {
+        let h = _mm512_loadu_si512(src.add(i) as *const __m512i);
+        let sq = _mm512_mullo_epi32(h, h);
+        _mm512_storeu_ps(cp.add(i), _mm512_div_ps(_mm512_cvtepi32_ps(h), dq));
+        _mm512_storeu_ps(sp.add(i), _mm512_div_ps(_mm512_cvtepi32_ps(sq), dq2));
+        i += 16;
+    }
+}
+
+/// AVX-2 sibling of [`dual_l1_dequant_avx512`], 8 neurons per step.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dual_l1_dequant_avx2(
+    hv: &[i32],
+    qa_l1_f: f32,
+    qa_l1_sq: f32,
+    crelu: &mut [f32],
+    screlu: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let dq = _mm256_set1_ps(qa_l1_f);
+    let dq2 = _mm256_set1_ps(qa_l1_sq);
+    let n = hv.len();
+    let src = hv.as_ptr();
+    let cp = crelu.as_mut_ptr();
+    let sp = screlu.as_mut_ptr();
+    let mut i = 0;
+    while i + 8 <= n {
+        let h = _mm256_loadu_si256(src.add(i) as *const __m256i);
+        let sq = _mm256_mullo_epi32(h, h);
+        _mm256_storeu_ps(cp.add(i), _mm256_div_ps(_mm256_cvtepi32_ps(h), dq));
+        _mm256_storeu_ps(sp.add(i), _mm256_div_ps(_mm256_cvtepi32_ps(sq), dq2));
+        i += 8;
+    }
+}
+
 /// AVX-512 f32 L2 matmul for L2 == 32: two ZMM accumulators hold the full
 /// L2 row, one FMA pair per `l1_out[i]`. Replaces the generic loop that
 /// LLVM was vectorising with `VGATHERQPS` (13% of total cycles on v9,
@@ -1660,7 +1814,15 @@ unsafe fn l2_fmadd_avx512_x32(
     let mut h_hi = _mm512_loadu_ps(biases.as_ptr().add(l2_off + 16));
     for i in 0..l1_out_count {
         let v = *l1_out.get_unchecked(i);
-        if v == 0.0 { continue; }
+        // Branchless: fmadd with v == 0 contributes 0*w + h == h exactly, so
+        // dropping the skip is BIT-IDENTICAL. The branch was data-dependent on
+        // CReLU output (frequently zero) over only 32 iterations, so it
+        // mispredicted often; profiling on Zen 5 put vucomiss+jnp at ~13% of
+        // forward_with_l1_pairwise_threats, comparable to the float arithmetic
+        // it was skipping. The loads it avoided are from a 4 KB L2 weight block
+        // that is L1-resident anyway, so the skip saved almost no memory
+        // traffic. Scalar fallbacks keep their skip: there a skipped fmadd
+        // costs more than the branch.
         let bcast = _mm512_set1_ps(v);
         let wp = l2_weights_f.as_ptr().add(i * l2_total + l2_off);
         let w_lo = _mm512_loadu_ps(wp);
@@ -1672,11 +1834,9 @@ unsafe fn l2_fmadd_avx512_x32(
     _mm512_storeu_ps(h2.add(16), h_hi);
 }
 
-/// AVX-2 sibling of `l2_fmadd_avx512_x32` for the AVX-2 fleet (Atlas + most
-/// OB workers + lichess host). Same semantics, 8 f32 lanes per YMM →
-/// 4 accumulators for l2 == 32. Atlas perf annotate (2026-05-06) showed
-/// the L2 stage at ~7% of incremental eval cycles in the scalar fallback;
-/// this hoists it to SIMD on the AVX-2 path.
+/// AVX-2 sibling of `l2_fmadd_avx512_x32`. Same semantics, 8 f32 lanes per
+/// YMM → 4 accumulators for l2 == 32. The scalar fallback profiled at ~7% of
+/// incremental eval cycles; this hoists the L2 stage to SIMD on AVX-2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn l2_fmadd_avx2_x32(
@@ -1694,7 +1854,15 @@ unsafe fn l2_fmadd_avx2_x32(
     let mut h3 = _mm256_loadu_ps(biases.as_ptr().add(l2_off + 24));
     for i in 0..l1_out_count {
         let v = *l1_out.get_unchecked(i);
-        if v == 0.0 { continue; }
+        // Branchless: fmadd with v == 0 contributes 0*w + h == h exactly, so
+        // dropping the skip is BIT-IDENTICAL. The branch was data-dependent on
+        // CReLU output (frequently zero) over only 32 iterations, so it
+        // mispredicted often; profiling on Zen 5 put vucomiss+jnp at ~13% of
+        // forward_with_l1_pairwise_threats, comparable to the float arithmetic
+        // it was skipping. The loads it avoided are from a 4 KB L2 weight block
+        // that is L1-resident anyway, so the skip saved almost no memory
+        // traffic. Scalar fallbacks keep their skip: there a skipped fmadd
+        // costs more than the branch.
         let bcast = _mm256_set1_ps(v);
         let wp = l2_weights_f.as_ptr().add(i * l2_total + l2_off);
         let w0 = _mm256_loadu_ps(wp);
@@ -1713,9 +1881,8 @@ unsafe fn l2_fmadd_avx2_x32(
 }
 
 /// AVX-2 f32 SCReLU activation for l2==32 (clamp [0,1] then square).
-/// Replaces the scalar `for k { h2[k].clamp(); h2[k] *= h2[k] }` loop —
-/// Atlas perf annotate (2026-05-06) showed scalar vminss + vmulss for
-/// this loop at ~2% of incremental eval cycles on AVX-2.
+/// Replaces the scalar `for k { h2[k].clamp(); h2[k] *= h2[k] }` loop, whose
+/// vminss + vmulss profiled at ~2% of incremental eval cycles on AVX-2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn screlu_f32_avx2_x32(h2: &mut [f32]) {
@@ -1749,6 +1916,50 @@ unsafe fn crelu_f32_avx2_x32(h2: &mut [f32]) {
 /// AVX-2 f32 dot product of 32 elements with bias. Replaces the scalar
 /// `for k { acc += h2[k] * out_w[k] }` fallback used on AVX-2 hosts —
 /// matches l2_fmadd_avx2_x32's lane structure (4 YMM = 32 floats).
+/// Output-layer dot product, THE canonical association.
+///
+/// Every platform must fold these 32 terms in exactly this order. They used to
+/// be folded three different ways — AVX-512 as `fma(a_lo, b_lo, a_hi * b_hi)`
+/// over 16 lanes then a tree reduce, AVX-2 as a sequential FMA chain over four
+/// 8-lane groups then an hadd-pair reduce, NEON as a 4-lane accumulator over
+/// eight groups then `vaddvq`. Float addition is not associative, so the three
+/// disagreed: AVX-512 vs AVX-2 differed on 61.5% of inputs by up to 3.8e-6.
+/// This is the LAST operation before the evaluation, so that reached the search
+/// directly, and once c463e76 added a material ramp keyed off a threshold it
+/// began flipping pruning decisions — AVX-512 and AVX-2 hosts searched
+/// different trees, disagreed on bench, and mixed-fleet SPRTs averaged two
+/// engines.
+///
+/// The shape is `dot_fmadd_avx2_x32`'s, written out: eight running lanes, one
+/// plain multiply then three fused multiply-adds, folded 8 -> 4 -> 2 -> 1.
+/// `mul_add` (not `a * b + c`) because the vector form fuses, and a fused
+/// multiply-add rounds ONCE where the separate form rounds twice.
+#[inline]
+fn dot_out_canonical(a: &[f32], b: &[f32], bias: f32) -> f32 {
+    if a.len() != 32 || b.len() != 32 {
+        // Off-shape nets: one order, still identical everywhere.
+        let mut acc = bias;
+        for k in 0..a.len().min(b.len()) {
+            acc = a[k].mul_add(b[k], acc);
+        }
+        return acc;
+    }
+    let mut p = [0.0f32; 8];
+    for j in 0..8 {
+        p[j] = a[j] * b[j];
+    }
+    for g in 1..4 {
+        for j in 0..8 {
+            p[j] = a[g * 8 + j].mul_add(b[g * 8 + j], p[j]);
+        }
+    }
+    let s0 = p[0] + p[4];
+    let s1 = p[1] + p[5];
+    let s2 = p[2] + p[6];
+    let s3 = p[3] + p[7];
+    bias + ((s0 + s1) + (s2 + s3))
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_fmadd_avx2_x32(a: &[f32], b: &[f32], bias: f32) -> f32 {
@@ -1772,20 +1983,6 @@ unsafe fn dot_fmadd_avx2_x32(a: &[f32], b: &[f32], bias: f32) -> f32 {
     let s = _mm_hadd_ps(s, s);
     bias + _mm_cvtss_f32(s)
 }
-
-/// AVX-512 f32 horizontal dot product of `len` elements (len == 32).
-/// Replaces the scalar tail reduction in the output-weights dot.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn dot_fmadd_avx512_x32(a: &[f32], b: &[f32], bias: f32) -> f32 {
-    let a_lo = _mm512_loadu_ps(a.as_ptr());
-    let a_hi = _mm512_loadu_ps(a.as_ptr().add(16));
-    let b_lo = _mm512_loadu_ps(b.as_ptr());
-    let b_hi = _mm512_loadu_ps(b.as_ptr().add(16));
-    let sum = _mm512_fmadd_ps(a_lo, b_lo, _mm512_mul_ps(a_hi, b_hi));
-    bias + _mm512_reduce_add_ps(sum)
-}
-
 /// Find non-zero 64-byte chunk indices in a packed u8 buffer (AVX-512).
 /// Returns the number of NNZ chunks. nnz_indices[0..count] contains byte offsets.
 #[cfg(target_arch = "x86_64")]
@@ -1831,7 +2028,15 @@ unsafe fn l2_fmadd_neon_x32(
     ];
     for i in 0..l1_out_count {
         let v = *l1_out.get_unchecked(i);
-        if v == 0.0 { continue; }
+        // Branchless: fmadd with v == 0 contributes 0*w + h == h exactly, so
+        // dropping the skip is BIT-IDENTICAL. The branch was data-dependent on
+        // CReLU output (frequently zero) over only 32 iterations, so it
+        // mispredicted often; profiling on Zen 5 put vucomiss+jnp at ~13% of
+        // forward_with_l1_pairwise_threats, comparable to the float arithmetic
+        // it was skipping. The loads it avoided are from a 4 KB L2 weight block
+        // that is L1-resident anyway, so the skip saved almost no memory
+        // traffic. Scalar fallbacks keep their skip: there a skipped fmadd
+        // costs more than the branch.
         let wp = l2_weights_f.as_ptr().add(i * l2_total + l2_off);
         // vfmaq_n_f32(a, b, c) = a + b * c (c scalar) — single fused op per lane.
         acc[0] = vfmaq_n_f32(acc[0], vld1q_f32(wp), v);
@@ -1874,21 +2079,6 @@ unsafe fn crelu_f32_neon_x32(h2: &mut [f32]) {
         vst1q_f32(p.add(off), vmaxq_f32(zeros, vminq_f32(ones, v)));
     }
 }
-
-/// NEON f32 dot product of 32 elements with bias. Mirror of
-/// `dot_fmadd_avx2_x32` — single fused-MAC accumulator, horizontal reduce.
-#[cfg(target_arch = "aarch64")]
-unsafe fn dot_fmadd_neon_x32(a: &[f32], b: &[f32], bias: f32) -> f32 {
-    let ap = a.as_ptr();
-    let bp = b.as_ptr();
-    let mut acc = vdupq_n_f32(0.0);
-    for k in 0..8 {
-        let off = k * 4;
-        acc = vfmaq_f32(acc, vld1q_f32(ap.add(off)), vld1q_f32(bp.add(off)));
-    }
-    bias + vaddvq_f32(acc)
-}
-
 /// Add a weight row to an accumulator (NEON, 8 × i16 per iteration).
 #[cfg(target_arch = "aarch64")]
 unsafe fn neon_acc_add(acc: &mut [i16], row: &[i16], h: usize) {
@@ -2061,11 +2251,11 @@ unsafe fn neon_screlu_pack(acc: &[i16], out: *mut u8, h: usize) {
         let sq1 = vmulq_s16(c1, c1);
         // >> 8 (unsigned shift) → [0, 254] — must match scalar tail below
         // and x86 `simd_screlu_pack` (SCReLU scale chain: v² / 256, not 512).
-        // C4 (2026-04-22 audit): commit 44baa95 mistakenly changed this to
-        // >>9 alongside the intentional neon_pairwise_pack change, halving
-        // SCReLU activations on aarch64 builds. Only affects v7 non-pairwise
-        // SCReLU nets on aarch64 — aarch64 has no SCReLU-vs-scalar regression
-        // test (unlike neon_pairwise_pack_fused).
+        // This must stay >>8. Changing it to >>9 alongside the (different)
+        // neon_pairwise_pack shift halves SCReLU activations on aarch64
+        // builds, and nothing catches it: this path is v7 non-pairwise SCReLU
+        // on aarch64, which has no SCReLU-vs-scalar regression test of its own
+        // (unlike neon_pairwise_pack_fused).
         let d0 = vreinterpretq_s16_u16(vshrq_n_u16::<8>(vreinterpretq_u16_s16(sq0)));
         let d1 = vreinterpretq_s16_u16(vshrq_n_u16::<8>(vreinterpretq_u16_s16(sq1)));
         // Narrow i16 → u8 with unsigned saturation (values are [0, 254])
@@ -2395,11 +2585,55 @@ unsafe fn neon_l1_int8_dot_x4_dotprod(
     ]
 }
 
+/// Test/benchmark ISA ceiling (env `CODA_ISA_MAX`, read once): caps the SIMD
+/// tier BELOW what the CPU actually supports. 1 = AVX2 only, 2 = + AVX-VNNI /
+/// AVX-512BW, 3 = + AVX-512 VNNI; unset = no cap (normal behaviour).
+///
+/// Exists so one host can exercise another host's kernels. The release matrix
+/// ships one binary per compile target, but a single artefact (e.g.
+/// x86-64-v3) is dispatched at RUNTIME across AVX2-only and AVX-512 CPUs — so
+/// "does a PGO profile collected on an AVX-512 box pessimise the AVX2 kernels
+/// its own binary will run elsewhere?" is otherwise untestable without two
+/// machines. Affects kernel SELECTION only: every tier must produce identical
+/// results, so bench node counts are expected to match across settings, and a
+/// mismatch is a real bug rather than a quirk of this switch.
+pub(crate) fn isa_max() -> u8 {
+    use std::sync::OnceLock;
+    // In-process override, for tests that must evaluate the SAME net at several
+    // ISA tiers in one run. The env var is read once and memoised, which is
+    // right for production but useless to a tier sweep. 0 = inactive, so the
+    // normal path is untouched.
+    #[cfg(test)]
+    {
+        let ov = ISA_MAX_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if ov != 0 {
+            return ov;
+        }
+    }
+    static C: OnceLock<u8> = OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("CODA_ISA_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(u8::MAX)
+    })
+}
+
+/// Test-only ISA ceiling override; 0 = inactive. See [`isa_max`].
+///
+/// `cfg(test)` so production pays nothing: `x86_simd_tier` consults this, and
+/// that sits inside `apply_threat_indices`, ~11% of runtime. The env var
+/// (`CODA_ISA_MAX`) stays available in real binaries for diagnostics — it is
+/// read once and memoised, which is why tests need this second door.
+#[cfg(test)]
+pub static ISA_MAX_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 /// Detect AVX2 support at runtime.
 fn detect_avx2() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        is_x86_feature_detected!("avx2")
+        isa_max() >= 1 && is_x86_feature_detected!("avx2")
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -2411,7 +2645,9 @@ fn detect_avx2() -> bool {
 fn detect_avx512() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
+        isa_max() >= 3
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -2425,7 +2661,8 @@ fn detect_avx512() -> bool {
 fn detect_avx512_vnni() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        is_x86_feature_detected!("avx512f")
+        isa_max() >= 4
+            && is_x86_feature_detected!("avx512f")
             && is_x86_feature_detected!("avx512bw")
             && is_x86_feature_detected!("avx512vnni")
     }
@@ -2441,7 +2678,9 @@ fn detect_avx512_vnni() -> bool {
 fn detect_avx_vnni() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("avxvnni")
+        isa_max() >= 2
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("avxvnni")
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -2479,8 +2718,8 @@ fn detect_i8mm() -> bool {
 
 /// Global "load any net even on training/inference config mismatch" override.
 /// Set via the `--load-anyway` CLI flag or UCI option `LoadAnyway`. Refuses
-/// mismatches by default (noisy — crashes the engine startup) so mismatches
-/// can't silently degrade SPRT/OB/Lichess games. Diagnostic-only escape
+/// mismatches by default (noisy — crashes the engine startup) so they
+/// can't silently degrade automated match runs. Diagnostic-only escape
 /// hatch for intentionally loading a mismatched net.
 pub static LOAD_ANYWAY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2529,6 +2768,10 @@ pub enum L1Kernel {
     /// weights pass the load-time saturation gate
     /// (`sparse_l1::x2_fusion_safe`); unsafe nets fall to DenseAvx2L1_32.
     DenseAvx2L1_32X2,
+    /// AVX2 column-major dense, L1=16 with maddubs-pair fusion — the L1=16
+    /// counterpart of `DenseAvx2L1_32X2`. Same load-time saturation gate
+    /// (`sparse_l1::x2_fusion_safe`); unsafe nets fall back to `DenseAvx2`.
+    DenseAvx2L1_16X2,
     /// AVX2 column-major dense, L1=32 specialisation.
     DenseAvx2L1_32,
     /// AVX2 column-major dense, L1<=16 (the AVX2-fleet prod kernel).
@@ -2597,6 +2840,9 @@ fn select_l1_kernel(
         if has_avx2 && col_ok && l1 == 32 && pw.is_multiple_of(4) {
             return L1Kernel::DenseAvx2L1_32;
         }
+        if has_avx2 && col_ok && l1 == 16 && pw.is_multiple_of(8) && x2_safe {
+            return L1Kernel::DenseAvx2L1_16X2;
+        }
         if has_avx2 && col_ok && l1 <= 16 {
             return L1Kernel::DenseAvx2;
         }
@@ -2654,6 +2900,11 @@ pub struct NNUENet {
     // v9 threat features
     pub threat_weights: AlignedVec<i8>,  // [num_threat_features × hidden_size] i8 weights, 64-B rows, hugepage-backed
     pub num_threat_features: usize,
+    /// Pawn-pair features (v11). These extend the THREAT feature space rather
+    /// than forming a third accumulator: pawn-pair feature `i` is threat-space
+    /// index `num_threat_features + i`, and its weights are appended to
+    /// `threat_weights`. Pack time is therefore unchanged. 0 when absent.
+    pub num_pawn_pair_features: usize,
     pub has_threats: bool,
     /// Number of king buckets in this net (16 for uniform/consensus).
     /// PSQ weight block is sized `num_king_buckets * 768 * hidden_size`.
@@ -2755,6 +3006,7 @@ impl NNUENet {
         let mut hl_crelu = false;
         let mut has_threats = false; // bit 6: threat features (v9+)
         let mut num_threat_features = 0usize;
+        let mut num_pawn_pair_features = 0usize;
         // extended_kb (bit 7) is only read inside the v7+ match arm; declared locally there.
         let mut num_king_buckets: usize = 16; // default (uniform/consensus)
         let mut kb_layout = KbLayout::Uniform;
@@ -2788,7 +3040,7 @@ impl NNUENet {
                 }
                 hidden_size = (h_numer / h_denom) as usize;
             }
-            7..=10 => {
+            7..=11 => {
                 let flags = read_u8(reader)?;
                 use_screlu = flags & 1 != 0;
                 use_pairwise = flags & 2 != 0;
@@ -2879,6 +3131,46 @@ impl NNUENet {
                                 WITH x-ray threat features, which Coda no longer \
                                 enumerates. Retrain with --xray 0.".to_string());
                 }
+                // v11 arch_flags2: a SECOND architecture-flags byte, not a
+                // ninth meaning for a bit in the first one. Bit 5 above already
+                // carries two context-dependent meanings, and that ambiguity is
+                // exactly what produced the --hl-crelu defect; we do not repeat
+                // it. Unlike training_flags (which records TRAINING-side config
+                // inference must match), this byte records ARCHITECTURE.
+                //   bit 0: has_pawn_pair — a u32 feature count follows
+                //   bits 1-7: reserved, must be zero
+                if version >= 11 {
+                    let arch_flags2 = read_u8(reader)?;
+                    if arch_flags2 & !1 != 0 {
+                        return Err(format!(
+                            "unknown arch_flags2 bits set (0x{:02x}); this net uses an \
+                             architecture feature this build does not implement",
+                            arch_flags2
+                        ));
+                    }
+                    if arch_flags2 & 1 != 0 {
+                        num_pawn_pair_features = read_u32(reader)? as usize;
+                        // The encoding is fixed by pawn_pair.rs, so a mismatch
+                        // means the net was exported by a different encoder —
+                        // reject loudly rather than index a shorter table.
+                        if num_pawn_pair_features != crate::pawn_pair::PAWN_PAIR_FEATURES {
+                            return Err(format!(
+                                "net declares {} pawn-pair features but this build \
+                                 enumerates {}; the encodings disagree",
+                                num_pawn_pair_features,
+                                crate::pawn_pair::PAWN_PAIR_FEATURES
+                            ));
+                        }
+                        // Pawn-pair indices live above the threat block in one
+                        // shared space, so the threat block must be present for
+                        // the offset to mean anything.
+                        if !has_threats {
+                            return Err("net has pawn-pair features but no threat \
+                                        features; pawn-pair extends the threat feature \
+                                        space and cannot stand alone".to_string());
+                        }
+                    }
+                }
                 hidden_size = ft_size;
             }
             _ => return Err(format!("unsupported NNUE version: {}", version)),
@@ -2916,7 +3208,7 @@ impl NNUENet {
         // Read input weights (PSQ block sized by kb_count × 768).
         // Hugepage-backed (2 MiB pages): weight rows are indexed effectively
         // at random per node; on 4 KiB pages the two big matrices cost real
-        // dTLB/STLB pressure on small-cache hosts (avx2_gap_audit_2026-07-03).
+        // dTLB/STLB pressure on small-cache hosts.
         let psq_input_size = num_king_buckets * PSQ_INPUTS_PER_BUCKET;
         let mut input_weights: AlignedVec<i16> = AlignedVec::hugepage_zeros(psq_input_size * hidden_size);
         read_i16_slice(reader, &mut input_weights)?;
@@ -2930,9 +3222,17 @@ impl NNUENet {
         // AlignedVec (was a plain Vec<i8>): guarantees rows start 64-B-aligned
         // so each 1 KiB row spans exactly 16 cache lines, not a possible 17;
         // hugepage-backed like the PSQ matrix above.
+        //
+        // v11 appends the pawn-pair block immediately after the threat block,
+        // in the same array and at the same i8 quantisation scale. That scale
+        // is correct by construction rather than by convention: in the trainer
+        // both are columns of the same l0 matrix. Reading them as one run keeps
+        // pawn-pair index `i` addressable as `num_threat_features + i` with no
+        // extra indexing anywhere downstream.
         let mut threat_weights: AlignedVec<i8> = AlignedVec::zeros(0);
-        if has_threats && num_threat_features > 0 {
-            let total = num_threat_features * hidden_size;
+        let num_shared_features = num_threat_features + num_pawn_pair_features;
+        if has_threats && num_shared_features > 0 {
+            let total = num_shared_features * hidden_size;
             threat_weights = AlignedVec::hugepage_zeros(total);
             let mut bytes = vec![0u8; total];
             reader.read_exact(&mut bytes).map_err(|e| format!("read threat weights: {}", e))?;
@@ -2942,7 +3242,13 @@ impl NNUENet {
             threat_weights.advise_collapse();
             println!("info string Loaded {} threat features ({}×{}, {}MB)",
                 num_threat_features, num_threat_features, hidden_size,
-                total / (1024 * 1024));
+                (num_threat_features * hidden_size) / (1024 * 1024));
+            if num_pawn_pair_features > 0 {
+                println!("info string Loaded {} pawn-pair features ({}KB, sharing the \
+                          threat feature space)",
+                    num_pawn_pair_features,
+                    (num_pawn_pair_features * hidden_size) / 1024);
+            }
         }
 
         // Read L1 hidden layer weights (v7)
@@ -3133,11 +3439,25 @@ impl NNUENet {
         // maddubs-pair fusion saturation gate — O(weights), once at load.
         let x2_safe = !l1_weights_sparse.is_empty()
             && crate::sparse_l1::x2_fusion_safe(&l1_weights_sparse, l1_size);
-        if has_avx2 && !has_avx_vnni && !has_avx512_vnni && l1_size == 32 {
-            // Only worth logging where the choice is live (plain-AVX2 hosts).
-            println!("info string maddubs-pair fusion: {}",
-                if x2_safe { "safe — using fused AVX2 L1 kernel" }
-                else { "weights exceed saturation bound — unfused kernel" });
+        // Widths for which a fused AVX2 kernel exists. Before the L1=16 kernel
+        // this reporting was gated on `l1_size == 32`, so it went silent exactly
+        // when production moved to L1=16 — i.e. at the moment the answer changed.
+        let fused_width = l1_size == 32 || l1_size == 16;
+        let plain_avx2 = has_avx2 && !has_avx_vnni && !has_avx512_vnni;
+        if plain_avx2 && fused_width && x2_safe {
+            println!("info string maddubs-pair fusion: safe — using fused AVX2 L1 kernel");
+        }
+        // Announce the REJECTION on every host, not just plain-AVX2 ones. The
+        // gate is per-net and its failure is otherwise invisible: a net that
+        // fails it still loads cleanly and is simply ~4% slower on AVX2 — and
+        // AVX2-without-VNNI is what CCRL runs. Promoting such a net from a
+        // VNNI dev box would drop that tier off the fused path with no signal
+        // at all, which is the silent-wrongness class this codebase keeps
+        // getting bitten by.
+        if fused_width && !x2_safe {
+            println!("info string WARNING: maddubs-pair fusion gate FAILED at L1={} \
+                      (weights exceed the saturation bound). AVX2-without-VNNI hosts \
+                      — including CCRL — fall back to the unfused L1 kernel.", l1_size);
         }
         let l1_kernel = select_l1_kernel(
             use_pairwise,
@@ -3158,6 +3478,7 @@ impl NNUENet {
 
         Ok(NNUENet {
             hidden_size,
+            num_pawn_pair_features,
             input_weights,
             input_biases,
             output_weights,
@@ -3304,7 +3625,7 @@ impl NNUENet {
     /// `target_feature`) so it adopts the caller's codegen context — AVX2 when
     /// inlined into `_inner_avx2`, scalar via the fallback branch here.
     ///
-    /// Why this shape (2026-06-27): a bare `#[target_feature(enable = "avx2")]`
+    /// Why this shape: a bare `#[target_feature(enable = "avx2")]`
     /// on the body makes LLVM autovectorize even its *scalar fallback* loops to
     /// AVX2, which SIGILLs on pre-AVX2 CPUs (e.g. Sandy Bridge / Xeon E5 v1)
     /// the instant the function is entered — even though the runtime
@@ -3645,6 +3966,18 @@ impl NNUENet {
                 }
             }
             #[cfg(target_arch = "x86_64")]
+            L1Kernel::DenseAvx2L1_16X2 => {
+                // L1=16 AVX2 with maddubs-pair fusion — the L1=16 counterpart
+                // of DenseAvx2L1_32X2. Exactness guaranteed by the load-time
+                // x2_fusion_safe gate (else this arm is never selected).
+                unsafe {
+                    crate::sparse_l1::dense_l1_avx2_l1_16_x2(
+                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
+                    );
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
             L1Kernel::DenseAvx2L1_32 => {
                 // L1=32 AVX2 specialisation. Four YMM accumulators (8 neurons
                 // each) instead of the L1=16 path's two. Column-major outer
@@ -3666,15 +3999,16 @@ impl NNUENet {
                 // Replaces the row-major path that scanned the full input per
                 // output neuron (16× cache-line touches per input chunk).
                 //
-                // Dense variant (no zero-check). The old "~89% density"
-                // rationale was stale: re-measured 2026-06-14, the pairwise
-                // input is ~58% nonzero (L1=16) / ~60% (L1=32). But dense still
+                // Dense variant (no zero-check). The "~89% density"
+                // rationale often quoted for sparse L1 does not hold here:
+                // measured, the pairwise
+                // input is ~58% nonzero (L1=16) / ~60% (L1=32). And dense still
                 // wins — a proper SF-style branch-free find_nnz+list kernel was
                 // benched 1.8-2.4x SLOWER than dense at EVERY density. L1 is too
                 // small (16-32 neurons): find_nnz detection cost dominates and
                 // the matmul savings (~40% of a tiny per-chunk op) can't cover
                 // it. Dense straight-line SIMD over input-chunk-major weights is
-                // correct here. See docs/coda_vs_sf_speed_2026-06-14.md.
+                // correct here.
                 unsafe {
                     crate::sparse_l1::dense_l1_avx2(
                         stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
@@ -3790,12 +4124,21 @@ impl NNUENet {
         debug_assert!(l1_out_count <= L1_OUT_BUF, "l1_out_count {} exceeds L1_OUT_BUF {}", l1_out_count, L1_OUT_BUF);
         let mut l1_out = [0.0f32; L1_OUT_BUF];
         if self.dual_l1 {
-            // Dual L1 activation: CReLU(L1) concat SCReLU(L1)
+            // Dual L1 activation: CReLU(L1) concat SCReLU(L1).
+            //
+            // Two stages. The integer stage below is the original expression
+            // untouched — `pw_scale` is a constant, so it is a multiply-shift
+            // rather than a divide and costs little. The dequantising stage is
+            // the expensive one and is hand-vectorised; see `dual_l1_dequant`
+            // for why it is not left to the autovectoriser.
+            assert!(l1 <= DUAL_L1_MAX, "l1 {} exceeds DUAL_L1_MAX {}", l1, DUAL_L1_MAX);
+            let mut hv = [0i32; DUAL_L1_MAX];
             for i in 0..l1 {
-                let h_val = (hidden32[i] / pw_scale).clamp(0, qa_l1);
-                l1_out[i] = h_val as f32 / qa_l1_f;               // CReLU: [0, 1]
-                l1_out[l1 + i] = (h_val * h_val) as f32 / qa_l1_sq; // SCReLU: [0, 1]
+                hv[i] = (hidden32[i] / pw_scale).clamp(0, qa_l1);
             }
+            let (crelu, screlu) = l1_out.split_at_mut(l1);
+            dual_l1_dequant(self.has_avx512, self.has_avx2, &hv[..l1],
+                            qa_l1_f, qa_l1_sq, crelu, screlu);
         } else if self.crelu_hidden.load(std::sync::atomic::Ordering::Relaxed) {
             // Clipped ReLU variant (for nets trained with .crelu() on L1/L2 in Bullet)
             for i in 0..l1 {
@@ -3925,32 +4268,23 @@ impl NNUENet {
             }
             let out_w = &self.out_weights_f[bucket * l2_pb..bucket * l2_pb + l2_pb];
             let bias = self.out_bias_f[bucket];
-            // Output dot — AVX-512 version for the L2=32 case, matches the
-            // L2 matmul's dimensionality so it stays on the hot path.
+            // Output dot. ONE association everywhere — see `dot_out_canonical`
+            // for why, and for what three of them cost us. The AVX-2 kernel is
+            // kept because it IS that association in vector form and going
+            // scalar on x86 measured +0.43%; every other path folds identically
+            // in `dot_out_canonical`. There is deliberately no AVX-512 or NEON
+            // specialisation: 32 multiply-adds once per evaluation are dwarfed
+            // by the ~16K-MAC L1 matmul feeding them, so a wider kernel buys
+            // nothing measurable and each new one is another chance to fold in
+            // a different order.
             #[cfg(target_arch = "x86_64")]
-            let out_f = if self.has_avx512 && l2 == 32 {
-                unsafe { dot_fmadd_avx512_x32(&h2[..32], &out_w[..32], bias) }
-            } else if self.has_avx2 && l2 == 32 {
+            let out_f = if self.has_avx2 && l2 == 32 {
                 unsafe { dot_fmadd_avx2_x32(&h2[..32], &out_w[..32], bias) }
             } else {
-                let mut acc = bias;
-                for k in 0..l2 { acc += h2[k] * out_w[k]; }
-                acc
+                dot_out_canonical(&h2[..l2], &out_w[..l2], bias)
             };
-            #[cfg(target_arch = "aarch64")]
-            let out_f = if self.has_neon && l2 == 32 {
-                unsafe { dot_fmadd_neon_x32(&h2[..32], &out_w[..32], bias) }
-            } else {
-                let mut acc = bias;
-                for k in 0..l2 { acc += h2[k] * out_w[k]; }
-                acc
-            };
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            let out_f = {
-                let mut acc = bias;
-                for k in 0..l2 { acc += h2[k] * out_w[k]; }
-                acc
-            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let out_f = dot_out_canonical(&h2[..l2], &out_w[..l2], bias);
             return (out_f * EVAL_SCALE as f32) as i32;
         }
 
@@ -4479,7 +4813,7 @@ impl NNUENet {
 
         // Get threat accumulators (may be empty for non-threat nets).
         //
-        // C8 audit LIKELY #17: this is the LEGACY threat pipeline using
+        // NOTE: this is the LEGACY threat pipeline using
         // accumulator.threat_white/black fields. Production v9 uses
         // `forward_with_threats` + the ThreatStack at SearchInfo::threat_stack
         // instead, so these fields are never populated on the hot path. If
@@ -4790,9 +5124,9 @@ const ACC_STACK_PLIES: usize = 256;
 /// every AccEntry — 2.67× over-provisioned per array vs production
 /// `hidden_size = 768`, bloating each AccEntry to ~16 KB and making the
 /// per-ply walk drag in unused tail cache lines. Per-callsite L1-miss
-/// decomposition (2026-05-03) showed Coda's accumulator-update path had
-/// 95× more L1 misses than the contiguous layout; this restructure targets that
-/// directly. Each perspective's data lives in its own slot of one
+/// decomposition showed that layout costing 95× more L1 misses in the
+/// accumulator-update path than the contiguous one. Each perspective's data
+/// now lives in its own slot of one
 /// contiguous Box, sized exactly to `hidden_size` — reading `white`
 /// no longer drags `black`, `threat_white`, `threat_black` cache lines
 /// into L1.
@@ -4914,7 +5248,7 @@ pub struct NNUEAccumulator {
     // branch it takes. Read via the `stats_*` accessors for the bench
     // "evals/node" summary. Zero overhead outside the increment itself.
     pub stats_full_rebuilds: u64,
-    /// Rebuild cause splits (added 2026-05-06 for Atlas perf investigation).
+    /// Rebuild cause splits.
     /// kind=0  → king bucket / mirror crossing on the moving side (forced).
     /// root    → top==0 (only fires once per search tree).
     /// chain   → parent ply not computed (lazy-accumulator chain break).
@@ -5089,6 +5423,9 @@ impl NNUEAccumulator {
     /// forward applying per-ply deltas. Each ply's deltas were stored by
     /// store_threat_deltas() after make_move.
     pub fn recompute_threats_if_needed(&mut self, net: &NNUENet, board: &crate::board::Board) {
+        debug_assert_eq!(net.num_pawn_pair_features, 0,
+            "recompute_threats_if_needed does not carry pawn-pair deltas; the \
+             production path is ThreatStack::ensure_computed");
         if !net.has_threats { return; }
         if self.stack[self.top].threat_accurate[0] && self.stack[self.top].threat_accurate[1] { return; }
         let h = self.hidden_size;
@@ -5161,6 +5498,12 @@ impl NNUEAccumulator {
                         curr_w, prev_w,
                         &deltas, &net.threat_weights, h, net.num_threat_features,
                         WHITE, w_mirrored,
+                        // This accumulator's own threat stack is used only by
+                        // the eval-bench and mirror-consistency paths, which do
+                        // not carry pawn-pair deltas. The assert above keeps
+                        // that from becoming silently wrong if a v11 net is
+                        // ever routed here.
+                        &[], 0,
                     );
                 }
                 let (prev_b, curr_b) = self.threat.parent_and_current(src, ply, BLACK as usize);
@@ -5169,6 +5512,7 @@ impl NNUEAccumulator {
                         curr_b, prev_b,
                         &deltas, &net.threat_weights, h, net.num_threat_features,
                         BLACK, b_mirrored,
+                        &[], 0,
                     );
                 }
                 // Swap back
@@ -5647,7 +5991,7 @@ impl NNUEAccumulator {
             entry.acc[..h].copy_from_slice(&net.input_biases[..h]);
             // MaybeUninit skips the 256-byte zero-init memset. piece_indices[..n_pieces]
             // is fully written below; consumers only read that prefix. Same pattern as
-            // forward_with_l1 and apply_threat_deltas (#921, #927, #931).
+            // forward_with_l1 and apply_threat_deltas.
             let mut piece_indices_storage = std::mem::MaybeUninit::<[usize; 32]>::uninit();
             let piece_indices_ptr = scratch_ptr!(piece_indices_storage, usize);
             let mut n_pieces = 0usize;
@@ -5761,9 +6105,9 @@ unsafe fn finny_batch_apply_avx512(
 ) {
     // 24 AVX-512 registers × 32 i16 = 768 elements per chunk — covers the
     // v9 hidden_size=768 in a SINGLE outer iteration. Each weight row is
-    // read once per refresh instead of 3× under the previous REGS=8 /
-    // CHUNK=256 tile. Same register-tiling pattern as `simd_acc_fused_avx512`
-    // (PSQ apply, REGS=8→24 +1.5 Elo H1 SPRT #926).
+    // read once per refresh instead of 3× under a REGS=8 / CHUNK=256 tile.
+    // Same register-tiling pattern as `simd_acc_fused_avx512` (PSQ apply),
+    // where widening REGS from 8 to 24 was worth ~1.5 Elo.
     //
     // Direct i16 add (no i8→i16 expansion temps) keeps register pressure
     // contained: even though the inner delta loop persists the 24 ZMM
@@ -5993,8 +6337,8 @@ mod tests {
         // Candidate nets: CODA_TEST_NET override, else every net*.nnue in
         // the repo root (sorted, newest-style hash names included). Try each
         // until one LOADS — stale/unsupported-layout files in the root must
-        // not silently disarm the tripwire (a first-match version skipped on
-        // Atlas because read_dir happened to yield a retired kb10 net first).
+        // not silently disarm the tripwire (taking only the first match can
+        // skip the check entirely if read_dir yields a retired net first).
         let candidates: Vec<String> = if let Ok(p) = std::env::var("CODA_TEST_NET") {
             vec![p]
         } else {
@@ -6167,9 +6511,9 @@ mod tests {
 
                 // Invariant 2 (BOUNDED): full eval may differ slightly — the
                 // physical-frame same-type-pair skip in threat features is
-                // deliberately not mirror-symmetric (see enumerate_threats and
-                // docs/threat_eval_asymmetry_2026-06-17.md; training matches
-                // inference, so the net is calibrated to it). Gross deviation
+                // deliberately not mirror-symmetric (see enumerate_threats;
+                // training matches inference, so the net is calibrated to
+                // it). Gross deviation
                 // = real bug (flipped feature family, bucket asymmetry).
                 let pc = board.occupied().count_ones();
                 let e1 = net.forward(&a1, board.side_to_move, pc);
@@ -6182,7 +6526,7 @@ mod tests {
                     // EXACT explanation requirement: any eval asymmetry must
                     // be fully accounted for by the designed same-type
                     // mutual-attack pair skip (physical-square-order tie
-                    // break, docs/threat_eval_asymmetry_2026-06-17.md). The
+                    // break). The
                     // enumerated-feature diff for both perspective pairings
                     // must be a subset of the position's mutual-pair feature
                     // indices, with matching counts. Anything else = bug.
@@ -6399,6 +6743,208 @@ mod tests {
         }
     }
 
+    /// Guards the bit-identity claim on `dual_l1_dequant`. This kernel replaced
+    /// a scalar loop in the hot forward path purely for speed, so "same answer"
+    /// is not a tolerance question — every lane must match the scalar
+    /// expression to the last bit, or evaluations silently drift and every
+    /// tuned search threshold drifts with them.
+    ///
+    /// Sweeps the whole `[0, qa_l1]` activation range the caller can produce,
+    /// across several scales and lengths, and compares raw bit patterns rather
+    /// than values so a signed-zero or NaN difference could not pass.
+    #[test]
+    fn dual_l1_dequant_matches_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        let (has512, has2) = (
+            is_x86_feature_detected!("avx512f"),
+            is_x86_feature_detected!("avx2"),
+        );
+        // On aarch64 the NEON arm is unconditional, so the flags are inert and
+        // the loop below still compares the vector path against scalar.
+        #[cfg(not(target_arch = "x86_64"))]
+        let (has512, has2) = (false, false);
+
+        for &qa in &[1i32, 15, 64, 127, 255, 1023, 4095] {
+            let qa_f = qa as f32;
+            let qa_sq = qa_f * qa_f;
+            for &n in &[8usize, 16, 24, 32, 64] {
+                // Walk the clamped range so every length sees both endpoints
+                // and a spread of interior values, including the 0 that CReLU
+                // produces for every negative pre-activation.
+                for phase in 0..4 {
+                    let hv: Vec<i32> = (0..n)
+                        .map(|k| ((k as i64 * (qa as i64 + 1) / n as i64 + phase) as i32).clamp(0, qa))
+                        .collect();
+
+                    let mut c_ref = vec![0f32; n];
+                    let mut s_ref = vec![0f32; n];
+                    for i in 0..n {
+                        c_ref[i] = hv[i] as f32 / qa_f;
+                        s_ref[i] = (hv[i] * hv[i]) as f32 / qa_sq;
+                    }
+
+                    // Exercise each dispatch arm the runtime could pick, not
+                    // just whichever one this host happens to select.
+                    // On aarch64 every arm below routes to NEON (the flags are
+                    // inert there), so the "scalar" entry still exercises the
+                    // vector kernel — which is exactly what needs checking.
+                    for &(use512, use2, arm) in &[
+                        (has512, false, "avx512"),
+                        (false, has2, "avx2"),
+                        (false, false, "scalar/neon"),
+                    ] {
+                        if arm == "avx512" && !has512 { continue; }
+                        if arm == "avx2" && !has2 { continue; }
+                        let mut c = vec![0f32; n];
+                        let mut s = vec![0f32; n];
+                        super::dual_l1_dequant(use512, use2, &hv, qa_f, qa_sq, &mut c, &mut s);
+                        for i in 0..n {
+                            assert_eq!(
+                                c[i].to_bits(), c_ref[i].to_bits(),
+                                "{arm} CReLU mismatch qa={qa} n={n} phase={phase} i={i} hv={}",
+                                hv[i]
+                            );
+                            assert_eq!(
+                                s[i].to_bits(), s_ref[i].to_bits(),
+                                "{arm} SCReLU mismatch qa={qa} n={n} phase={phase} i={i} hv={}",
+                                hv[i]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The vector output-dot must equal the canonical fold BIT FOR BIT.
+    ///
+    /// Not "within a tolerance". The tests this replaces compared each SIMD
+    /// kernel to a scalar reference with `diff < 1e-4`, which is the right
+    /// check for "is the algebra correct" and the wrong one for "will two hosts
+    /// agree" — a few ULP sits inside 1e-4 and still flips a pruning decision
+    /// three plies later. Two kernels both passed those tests while disagreeing
+    /// with EACH OTHER on 61.5% of inputs, which is how AVX-512 and AVX-2 hosts
+    /// ended up searching different trees. Compare bit patterns, and compare
+    /// the paths that actually run against each other.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn output_dot_vector_matches_canonical_bitwise() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            eprintln!("No AVX2+FMA, skipping output-dot equivalence");
+            return;
+        }
+        let mut r = rng(0x0d0e_0f10_1112_1314);
+        let mut checked = 0u32;
+        for trial in 0..20_000 {
+            // Mix of ordinary magnitudes and the near-cancelling cases where
+            // association order actually shows up.
+            let scale = if trial % 4 == 0 { 1e-3 } else if trial % 4 == 1 { 1e3 } else { 1.0 };
+            let a: Vec<f32> = (0..32).map(|_| ((r() % 4000) as f32 / 1000.0 - 2.0) * scale).collect();
+            let b: Vec<f32> = (0..32).map(|_| ((r() % 4000) as f32 / 1000.0 - 2.0) * scale).collect();
+            let bias = (r() % 200) as f32 / 100.0 - 1.0;
+            let v = unsafe { super::dot_fmadd_avx2_x32(&a, &b, bias) };
+            let c = super::dot_out_canonical(&a, &b, bias);
+            assert_eq!(
+                v.to_bits(), c.to_bits(),
+                "output dot differs at trial {trial}: avx2={v:e} canonical={c:e}                  (diff {:e}). Hosts taking different paths would evaluate                  differently and disagree on bench.",
+                (v - c).abs()
+            );
+            checked += 1;
+        }
+        eprintln!("output-dot: {checked} vectors bit-identical (avx2 == canonical)");
+    }
+
+    /// Every kernel the engine picks by CPU capability must compute the SAME
+    /// numbers. Nothing enforced that, and it cost us: from 2026-08-25 AVX-512
+    /// and AVX2 hosts searched differently, OpenBench workers reported "Wrong
+    /// Bench" against each other, and every mixed-fleet SPRT was quietly
+    /// averaging two engines.
+    ///
+    /// Why the existing tests missed it is the instructive part, and it shaped
+    /// this one:
+    ///
+    /// - They compared each SIMD kernel against a SCALAR reference with a
+    ///   TOLERANCE (`test_l2_fmadd_avx512_x32_matches_scalar` asserts
+    ///   `diff < 1e-4`). That is the right check for "is the algebra correct"
+    ///   and the wrong one for "will two hosts agree" — a sub-ULP difference
+    ///   sits inside 1e-4 and still flips a pruning decision three plies later.
+    /// - A first cut of this test swept STATIC evals over 5808 positions at
+    ///   every tier and passed, even on the net that was actively breaking the
+    ///   fleet. Static eval rebuilds the accumulator from scratch; search uses
+    ///   the INCREMENTAL update, the Finny refresh and the threat-delta replay,
+    ///   and the divergence lives in that machinery. A test that cannot catch
+    ///   the bug it was written for is worthless, so this runs a real search.
+    ///
+    /// Node counts are the assertion because they are exactly what the fleet
+    /// disagrees about, and any eval difference that changes a decision shows
+    /// up in them. Skips when no net loads, and says so rather than passing
+    /// quietly.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cross_isa_search_is_bit_identical() {
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::init();
+
+        // Highest tier this CPU can reach; sweeping past it just re-tests the
+        // same kernels, so the test only has teeth up to here.
+        let native_cap: u8 = if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni") { 4 }
+            else if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") { 3 }
+            else if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("avxvnni") { 2 }
+            else if is_x86_feature_detected!("avx2") { 1 }
+            else { 0 };
+        if native_cap < 2 {
+            eprintln!("cross-ISA: CPU reaches only tier {native_cap}; nothing to compare, skipping");
+            return;
+        }
+
+        let net_path: Option<String> = std::env::var("CODA_TEST_NET").ok().or_else(|| {
+            let mut v: Vec<String> = std::fs::read_dir(".")
+                .map(|rd| rd.filter_map(|e| e.ok())
+                    .map(|f| f.file_name().to_string_lossy().to_string())
+                    .filter(|n| n.starts_with("net") && n.ends_with(".nnue"))
+                    .collect())
+                .unwrap_or_default();
+            v.sort();
+            v.into_iter().find(|p| NNUENet::load(p).is_ok())
+        });
+
+        // Depth 12, measured, not guessed: on the net that broke the fleet the
+        // divergence is invisible at 9, 10 and 11 and appears at 12. Shallower
+        // trees simply do not reach the pruning decisions the eval difference
+        // flips, so a cheaper depth would be a test that always passes.
+        //
+        // This is the most expensive test in the suite (~10s: four tiers x a
+        // full bench). It runs only on CPUs that reach tier 2+, so the AVX2
+        // fleet workers skip it entirely and pay nothing.
+        const DEPTH: i32 = 12;
+        let names = ["", "AVX2", "AVX2+AVX-VNNI", "AVX-512BW", "AVX-512 VNNI"];
+        let mut runs: Vec<(u8, u64)> = Vec::new();
+        for tier in 1..=native_cap {
+            ISA_MAX_OVERRIDE.store(tier, std::sync::atomic::Ordering::Relaxed);
+            let n = crate::search::bench_silent(DEPTH, net_path.as_deref());
+            runs.push((tier, n));
+        }
+        ISA_MAX_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let (bt, bn) = runs[0];
+        let bad: Vec<String> = runs.iter().skip(1).filter(|(_, n)| *n != bn)
+            .map(|(t, n)| format!("tier {} ({}) = {} nodes", t, names[*t as usize], n))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "ISA-dependent SEARCH: tier {} ({}) = {} nodes, but {}. Net {}, depth {}. \
+             The engine searches differently on different CPUs, so hosts disagree on \
+             bench and mixed-fleet SPRTs average two engines.",
+            bt, names[bt as usize], bn, bad.join("; "),
+            net_path.as_deref().unwrap_or("<embedded>"), DEPTH
+        );
+        eprintln!("cross-ISA: tiers {:?} all {} nodes at depth {} (net {})",
+                  runs.iter().map(|(t, _)| *t).collect::<Vec<_>>(), bn, DEPTH,
+                  net_path.as_deref().unwrap_or("<embedded>"));
+    }
+
     /// AVX-512 L2 FMA kernel vs scalar reference. Covers the common v9
     /// L2=32 path — a broadcast-FMA fan-out that replaces the gather-heavy
     /// inner loop LLVM used to produce.
@@ -6475,39 +7021,6 @@ mod tests {
             }
         }
     }
-
-    /// AVX-512 output-weights dot vs scalar. Small dimensionality so the
-    /// tolerance is very tight.
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_dot_fmadd_avx512_x32_matches_scalar() {
-        crate::init();
-
-        if !is_x86_feature_detected!("avx512f") {
-            eprintln!("No AVX-512F, skipping output-dot FMA test");
-            return;
-        }
-
-        let mut r = rng(0xc0da_b00b_0000_0222);
-        for _trial in 0..8 {
-            let mut a = vec![0.0f32; 32];
-            let mut b = vec![0.0f32; 32];
-            for v in a.iter_mut() { *v = ((r() as i32 as f32) / 1e9).clamp(-5.0, 5.0); }
-            for v in b.iter_mut() { *v = ((r() as i32 as f32) / 1e9).clamp(-5.0, 5.0); }
-            let bias = ((r() as i32 as f32) / 1e9).clamp(-5.0, 5.0);
-
-            let mut scalar = bias;
-            for i in 0..32 { scalar += a[i] * b[i]; }
-
-            let simd = unsafe { dot_fmadd_avx512_x32(&a, &b, bias) };
-            let diff = (scalar - simd).abs();
-            assert!(
-                diff < 1e-3 || diff / scalar.abs().max(1.0) < 1e-5,
-                "dot_fmadd divergence: scalar={} simd={} diff={}", scalar, simd, diff
-            );
-        }
-    }
-
     /// Scalar reference for finny_batch_apply. Matches the dispatcher's
     /// fallback path byte-for-byte so NEON/AVX2 results can be compared.
     fn finny_batch_apply_scalar_ref(
@@ -7217,25 +7730,6 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn test_dot_fmadd_neon_x32_matches_scalar() {
-        let mut r = rng(0xc0da_b00b_0000_0a33);
-        for _trial in 0..8 {
-            let a: Vec<f32> = (0..32).map(|_| ((r() as i32 as f32) / 1e9).clamp(-5.0, 5.0)).collect();
-            let b: Vec<f32> = (0..32).map(|_| ((r() as i32 as f32) / 1e9).clamp(-5.0, 5.0)).collect();
-            let bias = ((r() as i32 as f32) / 1e9).clamp(-5.0, 5.0);
-
-            let mut scalar = bias;
-            for i in 0..32 { scalar += a[i] * b[i]; }
-            let neon = unsafe { dot_fmadd_neon_x32(&a, &b, bias) };
-            let diff = (scalar - neon).abs();
-            assert!(diff < 1e-3 || diff / scalar.abs().max(1.0) < 1e-5,
-                "dot_fmadd_neon divergence: scalar={} neon={} diff={}", scalar, neon, diff);
-        }
-    }
-
     /// aarch64 counterpart to sparse_l1's `fuzz_dense_avx2_l1_32_matches_scalar`.
     /// The x86 fuzz sweep only ever exercised x86 kernels — ARM got no
     /// equivalent density/seed coverage. This drives the full NEON int8 L1
@@ -7398,7 +7892,7 @@ mod tests {
         assert!(!km[0]);
     }
 
-    /// Regression test for the 2026-04-20 SMP race fix. Concurrently
+    /// Regression test for the king-bucket SMP race. Concurrently
     /// compute king-bucket tables on many threads for different layouts
     /// and verify no tearing / incorrect value. If KING_BUCKET were still
     /// a `static mut` written per layout, this would race; with per-net
@@ -7919,13 +8413,12 @@ mod tests {
         // evals them slightly differently. The non-threat v5 net is EXACTLY 0
         // on every fixture (proving the HalfKA base + king buckets are
         // symmetric); the residual is entirely the threat semi-exclusion.
-        // Training matches inference EXACTLY here (Bullet post-C8-fix
-        // `phys_flip`; `fuzz-threats --postfix` = 0/40000, both STMs,
-        // 2026-06-17), so it is a feature-design tradeoff, not a divergence.
-        // Residuals are NET-dependent: ~10-20cp (v9 s200), 54cp (E4B66CE4),
-        // 113cp (549C20A5 prod). A genuine flip bug instead breaks MOST
-        // fixtures by hundreds of cp (often sign-flipped), which 150cp still
-        // catches loudly. See docs/threat_eval_asymmetry_2026-06-17.md.
+        // Training matches inference EXACTLY here (the trainer's `phys_flip`;
+        // `fuzz-threats --postfix` = 0/40000, both STMs), so it is a
+        // feature-design tradeoff, not a divergence.
+        // Residuals are NET-dependent — anywhere from ~10cp to over 100cp.
+        // A genuine flip bug instead breaks MOST fixtures by hundreds of cp
+        // (often sign-flipped), which a 150cp bar still catches loudly.
         // Non-threat nets keep the tight 50cp bar.
         let tolerance_cp: i32 = if net.has_threats { 150 } else { 50 };
         let h = net.hidden_size;
@@ -7976,18 +8469,15 @@ mod tests {
     /// Tier-1 discovery test: relative piece values.
     ///
     /// Measures each trade-off INSIDE a single position instead of by
-    /// subtracting two separately-evaluated ones. Rewritten 2026-08-09
-    /// after the original form went red on prod net 60F72A31.
+    /// subtracting two separately-evaluated ones.
     ///
-    /// The original compared startpos-minus-queen against
+    /// Do NOT go back to comparing startpos-minus-queen against
     /// startpos-minus-rook. Both are near-certain wins, so both evals sit
     /// in win-probability saturation and their DIFFERENCE is saturation
-    /// noise rather than a material signal — the 2026-07-04 loosening
-    /// (SLACK=100) was already conceding exactly that. BT4-trained nets
-    /// compress the band harder still (Q..N spans 386cp on 60F72A31 vs
-    /// 685cp on E6C62000), so no fixed slack can rescue the form: on
-    /// 60F72A31 rook-removal (+1587) outranks queen-removal (+1201), with
-    /// knight (+1372) and bishop (+1298) in between.
+    /// noise rather than a material signal; no fixed slack rescues it.
+    /// Nets trained on modern relabelled data compress that band further
+    /// still (Q..N can span under 400cp), and on such a net rook-removal
+    /// can outrank queen-removal outright.
     ///
     /// The asymmetric form has no such problem. White gives up the LESSER
     /// piece and black the GREATER, so the comparison is encoded in one

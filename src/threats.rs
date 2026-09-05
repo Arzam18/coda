@@ -97,7 +97,7 @@ pub mod apply_stats {
         GEN_CONSUMED.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Refresh-cause split (walkback/Finny scoping, 2026-07-31):
+    // Refresh-cause split (walkback/Finny scoping):
     // 0 = king mirror crossing, 1 = no accurate ancestor, 2 = delta overflow.
     static REFRESH_CAUSE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     #[inline(always)]
@@ -500,16 +500,31 @@ use crate::types::*;
 #[inline(always)]
 fn x86_simd_tier() -> u8 {
     use std::sync::OnceLock;
-    static TIER: OnceLock<u8> = OnceLock::new();
-    *TIER.get_or_init(|| {
-        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
-            2
-        } else if is_x86_feature_detected!("avx2") {
-            1
-        } else {
-            0
+    // Bypass the cache while a test override is active, for the same reason
+    // `isa_max` does: a tier sweep in one process cannot use a memoised value.
+    // `cfg(test)` — this function is on the hot path, so release builds keep
+    // the plain memoised read with no extra load or branch.
+    #[cfg(test)]
+    {
+        if crate::nnue::ISA_MAX_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return compute_x86_simd_tier();
         }
-    })
+    }
+    static TIER: OnceLock<u8> = OnceLock::new();
+    *TIER.get_or_init(compute_x86_simd_tier)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn compute_x86_simd_tier() -> u8 {
+    let cap = crate::nnue::isa_max();
+    if cap >= 3 && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+        2
+    } else if cap >= 1 && is_x86_feature_detected!("avx2") {
+        1
+    } else {
+        0
+    }
 }
 
 /// Piece interaction map: which attacker×victim pairs are tracked.
@@ -704,8 +719,13 @@ fn piece_attacks_empty(cp: usize, sq: u32) -> Bitboard {
 ///
 /// `#[inline]` so call sites with constrained piece_type (e.g. slider-only
 /// loops) can specialize away the 6-way switch dispatch under LTO. The
-/// dispatch (jump-table address calc) was 10.69% inside this function on
-/// Atlas search-bench, ~0.3% of total NPS.
+/// dispatch (jump-table address calc) measured 10.69% inside this function,
+/// ~0.3% of total NPS. A branch-free form (leaper table + both magic
+/// lookups masked by type) was tried 2026-09-02 and measured a net LOSS:
+/// the jump table's mispredicts (~4% of all) went away, but the callers'
+/// bitboard-loop exits lost the piece-type history that had been
+/// predicting them, and every leaper paid two magic lookups — the hottest
+/// caller (`push_threats_for_piece`) got ~40% slower.
 #[inline]
 pub fn piece_attacks_occ(piece_type: u8, color: Color, sq: u32, occ: Bitboard) -> Bitboard {
     match piece_type {
@@ -901,25 +921,23 @@ pub fn enumerate_threats<F: FnMut(usize)>(
     }
 }
 
-/// HISTORICAL reference — the **pre-C8-fix** Bullet enumeration (bf-frame
-/// same-type-pair skip). DOES NOT describe current training.
+/// HISTORICAL reference — an OLD trainer-side enumeration that evaluated the
+/// same-type-pair skip in the wrong frame. DOES NOT describe current training,
+/// and is retained only to characterise that bug.
 ///
-/// Before the 2026-04-22 C8 fix, Bullet evaluated the same-type-pair skip
-/// (`sq < to`) in its internal bf-frame (rank-flipped when real STM is
-/// black), which disagreed with Coda inference (physical-frame) for
-/// black-STM positions. Bullet was SINCE changed to do the skip on physical
-/// squares (`phys_flip`), matching Coda exactly — see
-/// `bullet/.../chess_threats.rs` and `enumerate_threats_bullet_postfix_ref`
-/// below, which `fuzz-threats --postfix` verifies at **0 mismatches**
-/// (40000 evals, both STMs, 2026-06-17). So there is NO live train/inference
-/// divergence; this function is retained only to characterise the OLD bug.
+/// It applied the same-type-pair skip (`sq < to`) in the trainer's internal
+/// bf-frame (rank-flipped when the real STM is black), which disagrees with
+/// Coda's physical-frame inference for black-STM positions. The trainer now
+/// does the skip on physical squares (`phys_flip`), matching Coda exactly —
+/// see `enumerate_threats_bullet_postfix_ref` below, which
+/// `fuzz-threats --postfix` verifies at **0 mismatches** over 40000 evals in
+/// both STMs. There is no live train/inference divergence.
 ///
-/// Note: the physical-frame skip both engines now use is STM-invariant (so
+/// Note: the physical-frame skip both sides now use is STM-invariant (so
 /// Coda's incremental threat deltas stay clean) but is NOT mirror-symmetric
 /// — a deliberate tradeoff. It is the source of a small, consistent
-/// color-eval asymmetry on same-type-pair (bishop/rook) threats; see
-/// `docs/threat_eval_asymmetry_2026-06-17.md`. That is a feature-design
-/// property, not a divergence.
+/// color-eval asymmetry on same-type-pair (bishop/rook) threats. That is a
+/// feature-design property, not a divergence.
 ///
 /// Only direct-attack features are handled here (no x-ray).
 pub fn enumerate_threats_bullet_ref<F: FnMut(usize)>(
@@ -1157,6 +1175,158 @@ pub fn push_threats_on_move(
     push_threats_for_piece(deltas, pieces_bb, colors_bb, mailbox, occ_transit, white_bb, cp, piece_color, piece_type, to, true);
 }
 
+/// The slice of `Board` that threat generation reads: piece bitboards, colour
+/// bitboards, mailbox. 128 bytes, `Copy`, no hashes — deliberately NOT a Board,
+/// so a scratch replay can never disturb the live search state (the NNUE
+/// accumulator stack and the Zobrist keys both alias the real board).
+#[derive(Clone, Copy)]
+pub struct PieceState {
+    pub pieces: [Bitboard; 6],
+    pub colors: [Bitboard; 2],
+    pub mailbox: [u8; 64],
+}
+
+impl PieceState {
+    #[inline]
+    pub fn from_board(b: &crate::board::Board) -> Self {
+        Self { pieces: b.pieces, colors: b.colors, mailbox: b.mailbox }
+    }
+
+    #[inline]
+    pub fn occ(&self) -> Bitboard { self.colors[0] | self.colors[1] }
+
+    #[inline]
+    fn remove(&mut self, color: Color, pt: u8, sq: u8) {
+        let bb = 1u64 << sq;
+        self.pieces[pt as usize] ^= bb;
+        self.colors[color as usize] ^= bb;
+        self.mailbox[sq as usize] = NO_PIECE_TYPE;
+    }
+
+    #[inline]
+    fn put(&mut self, color: Color, pt: u8, sq: u8) {
+        let bb = 1u64 << sq;
+        self.pieces[pt as usize] |= bb;
+        self.colors[color as usize] |= bb;
+        self.mailbox[sq as usize] = pt;
+    }
+
+    #[inline]
+    fn shift(&mut self, color: Color, pt: u8, from: u8, to: u8) {
+        let from_to = (1u64 << from) | (1u64 << to);
+        self.pieces[pt as usize] ^= from_to;
+        self.colors[color as usize] ^= from_to;
+        self.mailbox[from as usize] = NO_PIECE_TYPE;
+        self.mailbox[to as usize] = pt;
+    }
+}
+
+/// Castling rook squares for `us`, given the king's `from`/`to`.
+#[inline]
+fn castle_rook_squares(us: Color, from: u8, to: u8) -> (u8, u8) {
+    if to > from {
+        if us == WHITE { (7, 5) } else { (63, 61) }
+    } else if us == WHITE { (0, 3) } else { (56, 59) }
+}
+
+/// Regenerate the threat deltas for `mv` from the PRE-move piece state,
+/// advancing `st` to the post-move state as a side effect.
+///
+/// This mirrors the mutation-and-emit sequence inside `Board::make_move`
+/// exactly, and it has to: each emit call observes a DIFFERENT intermediate
+/// state, so reordering them changes the deltas. In particular the promotion
+/// case applies BOTH mutations before either emit, so both emits see the
+/// post-promotion board.
+///
+/// The duplication of that sequence is deliberate — the alternative was routing
+/// `make_move`'s own mutations through this type, which would have put a scratch
+/// abstraction in the hottest path in the engine. The cost of duplicating is
+/// drift, and `lazy_deltas_match_eager_generation` is the guard against it:
+/// it walks the fuzz corpus asserting this function reproduces `make_move`'s
+/// deltas exactly, so the two cannot silently diverge.
+pub fn replay_move_deltas(
+    st: &mut PieceState,
+    us: Color,
+    mv: Move,
+    captured: u8,
+    out: &mut Vec<RawThreatDelta>,
+) {
+    out.clear();
+    let from = move_from(mv);
+    let to = move_to(mv);
+    let flags = move_flags(mv);
+    let them = flip_color(us);
+    let pt = st.mailbox[from as usize];
+
+    if flags == FLAG_EN_PASSANT {
+        let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
+        st.remove(them, PAWN, cap_sq);
+        push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
+                               st.occ(), them, PAWN, cap_sq as u32, false);
+    } else if captured != NO_PIECE_TYPE {
+        st.remove(them, captured, to);
+        push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
+                               st.occ(), them, captured, to as u32, false);
+    }
+
+    st.shift(us, pt, from, to);
+    push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
+                         st.occ(), us, pt, from as u32, to as u32);
+
+    if is_promotion(mv) {
+        let promo_pt = promotion_piece_type(mv);
+        st.remove(us, pt, to);
+        st.put(us, promo_pt, to);
+        push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
+                               st.occ(), us, pt, to as u32, false);
+        push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
+                               st.occ(), us, promo_pt, to as u32, true);
+    }
+
+    if flags == FLAG_CASTLE {
+        let (rook_from, rook_to) = castle_rook_squares(us, from, to);
+        st.shift(us, ROOK, rook_from, rook_to);
+        push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
+                             st.occ(), us, ROOK, rook_from as u32, rook_to as u32);
+    }
+}
+
+/// Step `st` BACKWARDS over `mv`, turning a post-move piece state into the
+/// pre-move one. Undoes in the reverse of `replay_move_deltas`'s order.
+///
+/// This is what makes lazy generation possible without snapshotting boards:
+/// `UndoInfo` already carries `mv` and `captured` for every ply on the current
+/// path, so any ancestor's piece state can be recovered by walking back from
+/// the live board.
+pub fn undo_move_state(st: &mut PieceState, us: Color, mv: Move, captured: u8) {
+    let from = move_from(mv);
+    let to = move_to(mv);
+    let flags = move_flags(mv);
+    let them = flip_color(us);
+
+    if flags == FLAG_CASTLE {
+        let (rook_from, rook_to) = castle_rook_squares(us, from, to);
+        st.shift(us, ROOK, rook_to, rook_from);
+    }
+
+    if is_promotion(mv) {
+        let promo_pt = promotion_piece_type(mv);
+        st.remove(us, promo_pt, to);
+        st.put(us, PAWN, to);
+    }
+
+    // Read AFTER undoing promotion, so this is the piece that originally moved.
+    let pt = st.mailbox[to as usize];
+    st.shift(us, pt, to, from);
+
+    if flags == FLAG_EN_PASSANT {
+        let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
+        st.put(them, PAWN, cap_sq);
+    } else if captured != NO_PIECE_TYPE {
+        st.put(them, captured, to);
+    }
+}
+
 /// Compute raw threat deltas when a piece appears or disappears.
 pub fn push_threats_on_change(
     deltas: &mut Vec<RawThreatDelta>,
@@ -1326,9 +1496,9 @@ fn push_threats_for_piece(
             // With x-ray ON that direct feature is PRESERVED as an x-ray to the
             // same index (Y "unchanged", handled by the block above). With x-ray
             // OFF there is no x-ray to preserve it, so the Y-level direct feature
-            // must be removed/added here. The old x-ray-only gating skipped this,
-            // leaving the incremental accumulator over-counting Y for --xray 0
-            // nets — good static eval (full recompute) but broken search play.
+            // must be removed/added here. Gating this block on x-ray leaves the
+            // incremental accumulator over-counting Y for --xray 0 nets — good
+            // static eval (full recompute) but broken search play.
             // Regression: fuzz_random_walk_xray_off.
             let y_candidates = crate::bitboard::ray_extension(slider_sq, square) & occ;
             if y_candidates != 0 {
@@ -1417,10 +1587,9 @@ fn push_threats_for_piece(
     let mut s2b_sq_emits = 0u64;
     #[cfg(feature = "profile-threats")]
     let mut s2b_no_w = 0u64;
-    // Repair 2026-07-31: this local's feeding code went with the splat/x-ray
-    // cleanup but record_s2b_reasons still takes it; keep it declared (always
-    // 0) so the profile-threats feature compiles. Stale-diagnostic tidy-up is
-    // a separate change.
+    // This local's feeding code went with the splat/x-ray cleanup, but
+    // record_s2b_reasons still takes it; keep it declared (always 0) so the
+    // profile-threats feature compiles.
     #[cfg(feature = "profile-threats")]
     let s2b_w_emits = 0u64;
 
@@ -1505,6 +1674,8 @@ pub unsafe fn apply_threat_deltas(
     num_threats: usize,
     pov: Color,
     mirrored: bool,
+    pp_deltas: &[crate::pawn_pair::PawnPairDelta],
+    pp_base: usize,
 ) {
     // Runtime dispatch only in non-AVX2-baseline builds; AVX2-baseline (native
     // fleet) builds fall through to the body directly — see the note on
@@ -1513,12 +1684,14 @@ pub unsafe fn apply_threat_deltas(
     if is_x86_feature_detected!("avx2") {
         return unsafe {
             apply_threat_deltas_avx2(
-                dst, src, deltas, threat_weights, hidden_size, num_threats, pov, mirrored)
+                dst, src, deltas, threat_weights, hidden_size, num_threats, pov, mirrored,
+                pp_deltas, pp_base)
         };
     }
     unsafe {
         apply_threat_deltas_body(
-            dst, src, deltas, threat_weights, hidden_size, num_threats, pov, mirrored)
+            dst, src, deltas, threat_weights, hidden_size, num_threats, pov, mirrored,
+            pp_deltas, pp_base)
     }
 }
 
@@ -1535,10 +1708,13 @@ unsafe fn apply_threat_deltas_avx2(
     num_threats: usize,
     pov: Color,
     mirrored: bool,
+    pp_deltas: &[crate::pawn_pair::PawnPairDelta],
+    pp_base: usize,
 ) {
     unsafe {
         apply_threat_deltas_body(
-            dst, src, deltas, threat_weights, hidden_size, num_threats, pov, mirrored)
+            dst, src, deltas, threat_weights, hidden_size, num_threats, pov, mirrored,
+            pp_deltas, pp_base)
     }
 }
 
@@ -1554,6 +1730,8 @@ unsafe fn apply_threat_deltas_body(
     num_threats: usize,
     pov: Color,
     mirrored: bool,
+    pp_deltas: &[crate::pawn_pair::PawnPairDelta],
+    pp_base: usize,
 ) {
     #[cfg(feature = "profile-threats")]
     crate::threats::apply_stats::record(deltas.len());
@@ -1564,8 +1742,8 @@ unsafe fn apply_threat_deltas_body(
     // perspective) at ~600k pushes per bench = ~2.4 GB of avoided
     // memset traffic. Same pattern that gave +3% bench in
     // forward_with_l1_pairwise_inner.
-    let mut adds_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS]>::uninit();
-    let mut subs_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS]>::uninit();
+    let mut adds_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS + crate::pawn_pair::MAX_PAWN_PAIR_DELTAS]>::uninit();
+    let mut subs_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS + crate::pawn_pair::MAX_PAWN_PAIR_DELTAS]>::uninit();
     let adds_ptr = scratch_ptr!(adds_storage, usize);
     let subs_ptr = scratch_ptr!(subs_storage, usize);
     let mut n_adds = 0usize;
@@ -1579,6 +1757,7 @@ unsafe fn apply_threat_deltas_body(
             mirrored,
             pov,
         );
+        prefetch_row(threat_weights, idx, (idx as usize) < num_threats, hidden_size);
         if idx < 0 || (idx as usize) >= num_threats { continue; }
         if delta.add() {
             unsafe { adds_ptr.add(n_adds).write(idx as usize); }
@@ -1586,6 +1765,21 @@ unsafe fn apply_threat_deltas_body(
         } else {
             unsafe { subs_ptr.add(n_subs).write(idx as usize); }
             n_subs += 1;
+        }
+    }
+    // Pawn-pair indices join the SAME lists: they address the same weight
+    // array above the threat block, so folding them in here means one SIMD
+    // pass instead of two and no second source copy. A separate scalar pass
+    // measured -10.7% NPS on its own.
+    for d in pp_deltas {
+        if let Some(i) = crate::pawn_pair::pp_index_for(*d, pov, mirrored) {
+            if d.add() {
+                unsafe { adds_ptr.add(n_adds).write(pp_base + i); }
+                n_adds += 1;
+            } else {
+                unsafe { subs_ptr.add(n_subs).write(pp_base + i); }
+                n_subs += 1;
+            }
         }
     }
     let adds = scratch_slice!(adds_ptr, n_adds);
@@ -1620,19 +1814,21 @@ pub unsafe fn apply_threat_deltas_dual(
     num_threats: usize,
     mirrored_w: bool,
     mirrored_b: bool,
+    pp_deltas: &[crate::pawn_pair::PawnPairDelta],
+    pp_base: usize,
 ) {
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     if is_x86_feature_detected!("avx2") {
         return unsafe {
             apply_threat_deltas_dual_avx2(
                 dst_w, src_w, dst_b, src_b, deltas, threat_weights,
-                hidden_size, num_threats, mirrored_w, mirrored_b)
+                hidden_size, num_threats, mirrored_w, mirrored_b, pp_deltas, pp_base)
         };
     }
     unsafe {
         apply_threat_deltas_dual_body(
             dst_w, src_w, dst_b, src_b, deltas, threat_weights,
-            hidden_size, num_threats, mirrored_w, mirrored_b)
+            hidden_size, num_threats, mirrored_w, mirrored_b, pp_deltas, pp_base)
     }
 }
 
@@ -1651,15 +1847,43 @@ unsafe fn apply_threat_deltas_dual_avx2(
     num_threats: usize,
     mirrored_w: bool,
     mirrored_b: bool,
+    pp_deltas: &[crate::pawn_pair::PawnPairDelta],
+    pp_base: usize,
 ) {
     unsafe {
         apply_threat_deltas_dual_body(
             dst_w, src_w, dst_b, src_b, deltas, threat_weights,
-            hidden_size, num_threats, mirrored_w, mirrored_b)
+            hidden_size, num_threats, mirrored_w, mirrored_b, pp_deltas, pp_base)
     }
 }
 
 /// Shared body for [`apply_threat_deltas_dual`] — no `target_feature`.
+/// Start fetching the first two cache lines of weight row `idx` as soon as a
+/// delta loop has produced it, instead of after the whole loop in
+/// `apply_threat_indices` (the former preamble prefetch of the first 24 rows). Measured motivation: after the loop went
+/// branch-free it finished ~120 Mcy sooner, and `apply_threat_indices` gave
+/// ~80 of those back waiting for rows — the fetches were not overlapped.
+/// Branch-free: an invalid index is redirected to row 0 (L1-hot, harmless)
+/// via a mask rather than skipped with a branch. `wrapping_add` keeps the
+/// pointer arithmetic defined; the address is only ever prefetched.
+#[inline(always)]
+fn prefetch_row(threat_weights: &[i8], idx: i32, valid: bool, hidden_size: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let off = (idx as usize).wrapping_mul(hidden_size) & 0usize.wrapping_sub(valid as usize);
+        let row = threat_weights.as_ptr().wrapping_add(off);
+        unsafe {
+            _mm_prefetch(row as *const i8, _MM_HINT_T0);
+            _mm_prefetch(row.wrapping_add(64) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (threat_weights, idx, valid, hidden_size);
+    }
+}
+
 #[inline(always)]
 unsafe fn apply_threat_deltas_dual_body(
     dst_w: &mut [i16],
@@ -1672,6 +1896,8 @@ unsafe fn apply_threat_deltas_dual_body(
     num_threats: usize,
     mirrored_w: bool,
     mirrored_b: bool,
+    pp_deltas: &[crate::pawn_pair::PawnPairDelta],
+    pp_base: usize,
 ) {
     #[cfg(feature = "profile-threats")]
     {
@@ -1679,10 +1905,30 @@ unsafe fn apply_threat_deltas_dual_body(
         crate::threats::apply_stats::record(deltas.len());
     }
 
-    let mut adds_w_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS]>::uninit();
-    let mut subs_w_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS]>::uninit();
-    let mut adds_b_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS]>::uninit();
-    let mut subs_b_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS]>::uninit();
+    let mut adds_w_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS + crate::pawn_pair::MAX_PAWN_PAIR_DELTAS]>::uninit();
+    let mut subs_w_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS + crate::pawn_pair::MAX_PAWN_PAIR_DELTAS]>::uninit();
+    let mut adds_b_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS + crate::pawn_pair::MAX_PAWN_PAIR_DELTAS]>::uninit();
+    let mut subs_b_storage = std::mem::MaybeUninit::<[usize; MAX_THREAT_DELTAS + crate::pawn_pair::MAX_PAWN_PAIR_DELTAS]>::uninit();
+    // Branch-free compress. Per delta we always compute both perspectives'
+    // feature index and store it into the next slot of BOTH the add and the
+    // sub list, then advance only the count of the list it belongs to, and
+    // only when the delta is valid. A slot written for an invalid delta
+    // (untracked pair, discarded symmetric order, index out of range) or for
+    // the wrong list is scratch: the next store to that list overwrites it
+    // and the final `scratch_slice!` never exposes it. This replaces three
+    // data-dependent branches per delta (`skip`, the bound check, and the
+    // add/sub selection) that LBR sampling showed were ~12% of ALL
+    // mispredicts in the engine — the same shape as the L2 zero-skip
+    // removal: doing a few cycles of unneeded arithmetic beats a ~15-cycle
+    // mispredict. Measured: whole-bench branch-misses -6.8%, this loop
+    // ~-120 Mcy of ~13 Gcy; part of that is given back in
+    // `apply_threat_indices`, whose weight-row fetches are the critical
+    // path and previously overlapped the mispredict stalls. The same
+    // rewrite of the single-perspective loop and of `threat_index` was
+    // tried and reverted: no mispredict gain and a slower refresh path. The index arithmetic is plain table lookups indexed by
+    // piece and square, so it is in-bounds for untracked pairs too, and the
+    // store address is bounded by the running count (<= deltas seen so far
+    // < MAX_THREAT_DELTAS), never by the computed index.
     let adds_w_ptr = scratch_ptr!(adds_w_storage, usize);
     let subs_w_ptr = scratch_ptr!(subs_w_storage, usize);
     let adds_b_ptr = scratch_ptr!(adds_b_storage, usize);
@@ -1701,46 +1947,64 @@ unsafe fn apply_threat_deltas_dual_body(
         let victim = delta.victim_cp() as usize;
         let to = delta.to_sq() as u32;
         let add = delta.add();
+        // Physical-square order for the symmetric-pair tie-break; identical
+        // for both perspectives.
+        let discard_order = (from as u8) < (to as u8);
 
         let pair_w = tables.pairs[attacker][victim];
-        if !pair_w.skip(from, to) {
-            let from_w = (from ^ flip_w) as usize;
-            let to_w = (to ^ flip_w) as usize;
-            let idx_w = pair_w.base
-                + tables.from_offset[attacker][from_w]
-                + tables.ray_rank[attacker][from_w][to_w] as i32;
-            if (idx_w as usize) < num_threats {
-                if add {
-                    unsafe { adds_w_ptr.add(n_adds_w).write(idx_w as usize); }
-                    n_adds_w += 1;
-                } else {
-                    unsafe { subs_w_ptr.add(n_subs_w).write(idx_w as usize); }
-                    n_subs_w += 1;
-                }
-            }
+        let from_w = (from ^ flip_w) as usize;
+        let to_w = (to ^ flip_w) as usize;
+        let idx_w = pair_w.base
+            + tables.from_offset[attacker][from_w]
+            + tables.ray_rank[attacker][from_w][to_w] as i32;
+        let valid_w = pair_w.tracked
+            & !(pair_w.symmetric & discard_order)
+            & ((idx_w as usize) < num_threats);
+        unsafe {
+            adds_w_ptr.add(n_adds_w).write(idx_w as usize);
+            subs_w_ptr.add(n_subs_w).write(idx_w as usize);
         }
+        prefetch_row(threat_weights, idx_w, valid_w, hidden_size);
+        n_adds_w += (valid_w & add) as usize;
+        n_subs_w += (valid_w & !add) as usize;
 
         let attacker_b = flipped_colored_piece(attacker);
         let victim_b = flipped_colored_piece(victim);
         let pair_b = tables.pairs[attacker_b][victim_b];
-        if !pair_b.skip(from, to) {
-            let from_b = (from ^ flip_b) as usize;
-            let to_b = (to ^ flip_b) as usize;
-            let idx_b = pair_b.base
-                + tables.from_offset[attacker_b][from_b]
-                + tables.ray_rank[attacker_b][from_b][to_b] as i32;
-            if (idx_b as usize) < num_threats {
-                if add {
-                    unsafe { adds_b_ptr.add(n_adds_b).write(idx_b as usize); }
-                    n_adds_b += 1;
+        let from_b = (from ^ flip_b) as usize;
+        let to_b = (to ^ flip_b) as usize;
+        let idx_b = pair_b.base
+            + tables.from_offset[attacker_b][from_b]
+            + tables.ray_rank[attacker_b][from_b][to_b] as i32;
+        let valid_b = pair_b.tracked
+            & !(pair_b.symmetric & discard_order)
+            & ((idx_b as usize) < num_threats);
+        unsafe {
+            adds_b_ptr.add(n_adds_b).write(idx_b as usize);
+            subs_b_ptr.add(n_subs_b).write(idx_b as usize);
+        }
+        prefetch_row(threat_weights, idx_b, valid_b, hidden_size);
+        n_adds_b += (valid_b & add) as usize;
+        n_subs_b += (valid_b & !add) as usize;
+    }
+
+    // Same fold as the single-perspective path, once per perspective.
+    for d in pp_deltas {
+        for (pov, mirrored, a_ptr, s_ptr, na, ns) in [
+            (WHITE, mirrored_w, adds_w_ptr, subs_w_ptr, &mut n_adds_w, &mut n_subs_w),
+            (BLACK, mirrored_b, adds_b_ptr, subs_b_ptr, &mut n_adds_b, &mut n_subs_b),
+        ] {
+            if let Some(i) = crate::pawn_pair::pp_index_for(*d, pov, mirrored) {
+                if d.add() {
+                    unsafe { a_ptr.add(*na).write(pp_base + i); }
+                    *na += 1;
                 } else {
-                    unsafe { subs_b_ptr.add(n_subs_b).write(idx_b as usize); }
-                    n_subs_b += 1;
+                    unsafe { s_ptr.add(*ns).write(pp_base + i); }
+                    *ns += 1;
                 }
             }
         }
     }
-
     let adds_w = scratch_slice!(adds_w_ptr, n_adds_w);
     let subs_w = scratch_slice!(subs_w_ptr, n_subs_w);
     let adds_b = scratch_slice!(adds_b_ptr, n_adds_b);
@@ -1772,33 +2036,17 @@ unsafe fn apply_threat_indices(
     adds: &[usize],
     subs: &[usize],
 ) {
-    // Prefetch the FIRST CHUNK (128 bytes = 2 lines) of every row before the
-    // kernel starts. The kernels walk all rows chunk-by-chunk, so chunk-0
-    // accesses are the cold misses; later chunks are covered by the in-loop
-    // next-chunk prefetch plus hardware stream prefetchers. Line-0-of-first-
-    // 4-rows (the previous form) left ~15 rows × 2 lines cold per call —
-    // perf annotate showed the row loads (vpmovsxbw) stalling at 16%+ of
-    // the function. Capped at 24 rows to bound issue cost on refresh-sized
-    // delta lists (avg 9.4 rows, p99 ≈ 48).
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        for &idx in adds.iter().chain(subs.iter()).take(24) {
-            unsafe {
-                let row = threat_weights.as_ptr().add(idx * hidden_size);
-                _mm_prefetch(row as *const i8, _MM_HINT_T0);
-                _mm_prefetch(row.add(64) as *const i8, _MM_HINT_T0);
-            }
-        }
-    }
+    // Row prefetch is issued by the callers while they produce the indices
+    // (`prefetch_row` in both delta loops), so the first two lines of every
+    // row are already in flight when the kernels start.
 
     // Apply weight rows with SIMD when available. Fused pattern: load src
     // chunk into registers, apply all adds/subs, store to dst. Avoids the
     // separate copy_from_slice pass that used to precede apply_deltas_avx2.
     //
     // Dispatch order: AVX-512 (zmm, 32 i16 per reg) > AVX-2 (ymm, 16 i16
-    // per reg) > scalar. The AVX-512 path was added 2026-04-30 after a perf
-    // decomposition showed this function at 17.98% of cycles with no AVX-512 path.
+    // per reg) > scalar. The AVX-512 path matters — without it this function
+    // measured 17.98% of cycles.
     #[cfg(target_arch = "x86_64")]
     {
         let tier = x86_simd_tier();
@@ -1860,9 +2108,8 @@ unsafe fn apply_deltas_avx2(
     let w_ptr = threat_weights.as_ptr();
 
     // 8 AVX2 registers × 16 i16 = 128 elements per chunk. REGS=12 (the
-    // simd_acc_fused_avx2 / SF AVX2 budget — audit item 4,
-    // avx2_gap_audit_2026-07-03) was tried 2026-07-03 and measured +5.6%
-    // SLOWER on Zen 1 (EPYC 7351P / titan, perf stat -r 3, IPC
+    // simd_acc_fused_avx2 / SF AVX2 budget) was tried and measured +5.6%
+    // SLOWER on Zen 1 (perf stat -r 3, IPC
     // 1.26 -> 1.18): Zen 1 cracks every 256-bit op into 2x128-bit uops,
     // and 12 live YMM accumulators plus the two cvtepi8_epi16 widening
     // temps per step oversubscribe the physical register file — the same
@@ -1966,10 +2213,9 @@ unsafe fn apply_deltas_avx2(
 /// per chunk vs AVX2's 128. For hidden_size=768 that's 3 chunks instead of
 /// 6 — half the outer-loop iterations.
 ///
-/// Why this exists (2026-04-30): perf decomposition flagged
-/// `apply_threat_deltas` at 17.98% of cycles with no AVX-512 path.
-/// Faster engines have a dedicated AVX-512 threat path and spend only ~1.8%
-/// of cycles on the analogous update; this adds Coda's AVX-512 path.
+/// Why this exists: without it `apply_threat_deltas` measured 17.98% of
+/// cycles. Faster engines have a dedicated AVX-512 threat path and spend only
+/// ~1.8% of cycles on the analogous update.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 unsafe fn apply_deltas_avx512(
@@ -2092,9 +2338,8 @@ pub fn add_weight_rows(
     if indices.is_empty() { return; }
 
     // Dispatch order: AVX-512 (zmm, 32 i16/reg) > AVX-2 > scalar.
-    // Sibling change to apply_threat_deltas's AVX-512 dispatch landed
-    // 2026-04-30 — same perf rationale (zmm register width on
-    // AVX-512+VNNI hosts).
+    // Sibling of apply_threat_deltas's AVX-512 dispatch — same perf
+    // rationale (zmm register width on AVX-512+VNNI hosts).
     #[cfg(target_arch = "x86_64")]
     {
         let tier = x86_simd_tier();
@@ -2762,4 +3007,140 @@ mod tests {
         assert!(elapsed.as_secs() < 10, "Benchmark took too long: {:?}", elapsed);
     }
 
+    /// THE gate for lazy threat-delta generation. `replay_move_deltas`
+    /// duplicates the mutation-and-emit sequence inside `Board::make_move`, so
+    /// the two can drift apart silently — and a divergence would not crash, it
+    /// would quietly feed a wrong accumulator into every eval downstream.
+    ///
+    /// Walks random legal games from varied positions and, for every single
+    /// move, checks all three properties the lazy scheme depends on:
+    ///   1. `undo_move_state` turns the post-move piece state back into exactly
+    ///      the pre-move one (the inverse is exact);
+    ///   2. replaying forward from that recovered state reproduces `make_move`'s
+    ///      deltas EXACTLY — same values, same order, same length;
+    ///   3. replaying forward leaves the piece state where `make_move` left it.
+    ///
+    /// Property 2 is the one that matters. Order is asserted, not just the
+    /// multiset: each emit observes a different intermediate board, so an
+    /// ordering difference means the sequence was mirrored wrongly even if the
+    /// set happens to match on these positions.
+    #[test]
+    fn lazy_deltas_match_eager_generation() {
+        use crate::board::Board;
+        use crate::movegen::generate_legal_moves;
+        crate::init();
+        let _space = FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Same corpus the threat-accumulator fuzz uses: opening, kiwipete,
+        // slider-heavy midgame, pawn endgame, and a promotion testbed.
+        const START_FENS: &[&str] = &[
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "4k3/P6P/8/8/8/8/p6p/4K3 w - - 0 1",
+            // EP is immediately available here (exf6). Uniform random play
+            // essentially never reaches an en-passant position on its own —
+            // the first version of this test ran 5000+ moves without one — so
+            // the corpus seeds it directly as well as biasing toward it below.
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "rnbqkbnr/pppp1ppp/8/8/3PpP2/8/PPP1P1PP/RNBQKBNR b KQkq f3 0 3",
+        ];
+
+        fn next_u32(state: &mut u32) -> u32 {
+            let mut x = *state;
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            *state = x; x
+        }
+
+        let mut checked = 0usize;
+        let mut promos = 0usize;
+        let mut eps = 0usize;
+        let mut castles = 0usize;
+
+        for (fen_idx, fen) in START_FENS.iter().enumerate() {
+            for game in 0..20 {
+                let seed = 0x51ED_2701u32
+                    .wrapping_add((fen_idx as u32).wrapping_mul(1_000_003))
+                    .wrapping_add((game as u32).wrapping_mul(7919));
+                let mut rng = if seed == 0 { 1 } else { seed };
+
+                let mut board = Board::new();
+                board.set_fen(fen);
+                board.generate_threat_deltas = true;
+
+                for _ply in 0..120 {
+                    let legal = generate_legal_moves(&board);
+                    if legal.len == 0 { break; }
+                    // Bias one move in four toward a special move when one is
+                    // legal. Promotions, castles and EP are exactly the cases
+                    // where `replay_move_deltas` does something other than
+                    // "remove victim, shift piece", so leaving them to chance
+                    // would leave the interesting half of the function unproven.
+                    let mut special: Vec<Move> = Vec::new();
+                    for i in 0..legal.len {
+                        let m = legal.get(i);
+                        if is_promotion(m)
+                            || move_flags(m) == FLAG_EN_PASSANT
+                            || move_flags(m) == FLAG_CASTLE
+                        {
+                            special.push(m);
+                        }
+                    }
+                    let mv = if !special.is_empty() && next_u32(&mut rng) % 4 == 0 {
+                        special[(next_u32(&mut rng) as usize) % special.len()]
+                    } else {
+                        legal.get((next_u32(&mut rng) as usize) % legal.len)
+                    };
+
+                    let us = board.side_to_move;
+                    let pre = PieceState::from_board(&board);
+                    if !board.make_move(mv) { break; }
+
+                    let eager: Vec<RawThreatDelta> = board.threat_deltas.clone();
+                    let captured = board.undo_stack.last().unwrap().captured;
+                    let post = PieceState::from_board(&board);
+
+                    // 1. inverse is exact
+                    let mut walked = post;
+                    undo_move_state(&mut walked, us, mv, captured);
+                    assert_eq!(walked.pieces, pre.pieces, "pieces mismatch after undo, fen {fen_idx} game {game} mv {mv:#06x}");
+                    assert_eq!(walked.colors, pre.colors, "colors mismatch after undo, fen {fen_idx} game {game} mv {mv:#06x}");
+                    assert_eq!(walked.mailbox, pre.mailbox, "mailbox mismatch after undo, fen {fen_idx} game {game} mv {mv:#06x}");
+
+                    // 2. forward replay from the recovered state == eager deltas
+                    let mut lazy = Vec::new();
+                    replay_move_deltas(&mut walked, us, mv, captured, &mut lazy);
+                    assert_eq!(lazy.len(), eager.len(),
+                        "delta COUNT differs (lazy {} vs eager {}), fen {fen_idx} game {game} mv {mv:#06x}",
+                        lazy.len(), eager.len());
+                    for (i, (l, e)) in lazy.iter().zip(eager.iter()).enumerate() {
+                        assert_eq!(l.0, e.0,
+                            "delta {i} differs, fen {fen_idx} game {game} mv {mv:#06x}: \
+                             lazy(att={} from={} vic={} to={} add={}) \
+                             eager(att={} from={} vic={} to={} add={})",
+                            l.attacker_cp(), l.from_sq(), l.victim_cp(), l.to_sq(), l.add(),
+                            e.attacker_cp(), e.from_sq(), e.victim_cp(), e.to_sq(), e.add());
+                    }
+
+                    // 3. forward replay lands on the real post-move state
+                    assert_eq!(walked.pieces, post.pieces, "replay end-state pieces, fen {fen_idx} game {game}");
+                    assert_eq!(walked.mailbox, post.mailbox, "replay end-state mailbox, fen {fen_idx} game {game}");
+
+                    checked += 1;
+                    if is_promotion(mv) { promos += 1; }
+                    if move_flags(mv) == FLAG_EN_PASSANT { eps += 1; }
+                    if move_flags(mv) == FLAG_CASTLE { castles += 1; }
+                }
+            }
+        }
+
+        // The corpus must actually reach the special cases, or properties 1-3
+        // are only proven for quiet moves and plain captures.
+        assert!(checked > 5000, "too few moves checked: {checked}");
+        assert!(promos > 0, "corpus never promoted — promotion path unproven");
+        assert!(eps > 0, "corpus never played en passant — EP path unproven");
+        assert!(castles > 0, "corpus never castled — castling path unproven");
+        eprintln!("lazy==eager over {checked} moves ({promos} promotions, {eps} EP, {castles} castles)");
+    }
 }
