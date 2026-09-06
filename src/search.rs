@@ -122,7 +122,15 @@ tunables!(
     // pays a verification re-search and NMP never gets a cheap cutoff. Below
     // this depth the cutoff is taken unverified; above it the re-search acts
     // as the zugzwang guard.
-    (NMP_VERIFY_DEPTH_10X, 80, 40, 200, 20.0, true),
+    // Null-move cutoffs are verified from depth 7 (was 8 after the core SPSA
+    // retune #3436 moved this 68 -> 80). Corpus finding 2026-09-07: among the
+    // retune's 64 parameters this one alone recovers nearly the whole 18%
+    // nodes-to-depth cost the retune added on resolved endgames (0.86x, best
+    // p90 of every single-knob revert); the mechanism is unverified spurious
+    // null-move fail-highs in drawn positions leaving TT bounds that are
+    // later refused and re-searched. Strength-neutral in a 516-game endgame
+    // match; this SPRT is the fleet read.
+    (NMP_VERIFY_DEPTH_10X, 70, 40, 200, 20.0, true),
     (RFP_DEPTH, 17, 2, 20, 2.0, true),
     (RFP_MARGIN_IMP, 26, 0, 150, 6.0, true),
     (RFP_MARGIN_NOIMP, 35, 0, 200, 7.5, true),
