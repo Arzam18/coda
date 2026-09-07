@@ -3151,6 +3151,33 @@ pub(crate) fn search_helper(board: &mut Board, info: &mut SearchInfo, _limits: &
     best_move
 }
 
+/// How many plies of PV the reporting path should try to show.
+///
+/// For an ordinary score there is no ground truth, so the line is grown to a
+/// little past the completed depth. A decisive score is different: it *states*
+/// the length of the line it is claiming.
+///
+/// * A mate score is `MATE_SCORE - plies_to_mate` (the inverse of the encoding
+///   in `tt::format_uci_score`), so the PV is exactly that many plies.
+/// * A tablebase score is `TB_WIN - plies_to_the_probed_node` (search.rs stores
+///   it that way at the interior probe), so the PV runs to the node where the
+///   table answered and stops — there is no searched continuation past it.
+///
+/// Padding past either point prints moves the score does not vouch for: a TT
+/// walk that has wandered off the proved line mates later than announced, or
+/// wanders out of the tablebase entirely. Stopping short of it announces a
+/// mate the line never delivers. So a decisive score pins the target exactly
+/// instead of padding to depth.
+fn pv_target_plies(score: i32, depth: i32) -> usize {
+    if is_mate_score(score) {
+        (MATE_SCORE - score.abs()).max(0) as usize
+    } else if is_decisive(score) {
+        (TB_WIN - score.abs()).max(0) as usize
+    } else {
+        depth.max(0) as usize + 5
+    }
+}
+
 /// Build the UCI PV string from `info.pv_table[0]`, extended via the TT when the
 /// stored line is shorter than `target_depth`. Mirrors the per-iteration PV
 /// extraction in the ID loop EXACTLY (same legality guard — printing an illegal
@@ -3188,7 +3215,8 @@ fn build_pv_string(info: &SearchInfo, board: &Board, target_depth: i32) -> Strin
     }
 
     {
-        while pv_moves < target_depth as usize + 5 {
+        let target = pv_target_plies(info.last_score, target_depth);
+        while pv_moves < target {
             if seen_hashes.iter().filter(|&&h| h == pv_board.hash).count() >= 2 { break; }
             if pv_board.halfmove >= 100 { break; }
             seen_hashes.push(pv_board.hash);
@@ -3859,15 +3887,17 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 seen_hashes.push(pv_board.hash);
             }
 
-            // Extend with TT toward the same target the gate used to test
-            // against. These were inconsistent: the gate required
-            // `pv_moves < depth` but the loop then ran to `depth + 5`, so a
-            // PV one move shorter than `depth` was extended by six while a PV
-            // of exactly `depth` was not extended at all. That produced
-            // alternating long/short PVs across iterations — visible in CCRL
-            // broadcasts as every other line being truncated.
+            // Extend with TT toward `pv_target_plies` (see its doc): a length
+            // past the completed depth for an ordinary score, the exact mate
+            // distance for a mate score. An earlier version tested the gate at
+            // `pv_moves < depth` while the loop ran to `depth + 5`, so a PV one
+            // move shorter than `depth` was extended by six while a PV of
+            // exactly `depth` was not extended at all — alternating long/short
+            // PVs across iterations, visible in CCRL broadcasts as every other
+            // line being truncated.
             {
-                while pv_moves < depth as usize + 5 {
+                let target = pv_target_plies(prev_score, depth);
+                while pv_moves < target {
                     if seen_hashes.iter().filter(|&&h| h == pv_board.hash).count() >= 2 { break; }
                     if pv_board.halfmove >= 100 { break; }
                     seen_hashes.push(pv_board.hash);
@@ -6974,6 +7004,24 @@ fn capture_history_malus(depth: i32) -> i32 {
 }
 
 /// Quiescence search wrapper.
+/// Splice `mv` and the child's PV into `pv_table[ply]` after an alpha raise in
+/// quiescence. No-op at non-PV nodes (their PV is never read) and at the array
+/// edge. `pv_len` is set from the number of entries actually copied, so it can
+/// never claim more than the row holds.
+#[inline]
+fn qs_update_pv(info: &mut SearchInfo, is_pv: bool, ply_u: usize, mv: Move) {
+    if !is_pv || ply_u >= MAX_PLY {
+        return;
+    }
+    info.pv_table[ply_u][0] = mv;
+    let child_len = info.pv_len[ply_u + 1];
+    let copy_len = child_len.min(MAX_PLY - ply_u);
+    for i in 0..copy_len {
+        info.pv_table[ply_u][1 + i] = info.pv_table[ply_u + 1][i];
+    }
+    info.pv_len[ply_u] = 1 + copy_len;
+}
+
 fn quiescence(
     board: &mut Board,
     info: &mut SearchInfo,
@@ -6995,6 +7043,24 @@ fn quiescence_with_depth(
 ) -> i32 {
     info.stats.qnodes += 1;
     info.stats.nodes_by_depth[0] += 1; // TREESTATS: qsearch = bucket 0
+
+    // Triangular PV maintenance, mirroring negamax. QS is where a mate line
+    // ends: once negamax runs out of depth the rest of the mate is proved by
+    // QS check evasions, and if QS records nothing the root PV stops at the
+    // QS boundary. The reporting path then pads the remainder from the TT,
+    // which is a *different* line — that is how a "mate 7" info line ends up
+    // carrying a PV that mates in 8, or one too short to mate at all.
+    // Reset FIRST, before any early return below, so a parent's propagation
+    // reads `pv_len[ply+1] == 0` for a child that short-circuits — the same
+    // discipline as negamax's entry reset (which covers only the first QS
+    // node, not the QS-to-QS recursion).
+    // Pure bookkeeping: nothing in the search reads pv_table/pv_len, so node
+    // counts are unchanged.
+    let qs_pv_node = beta - alpha > 1;
+    let qs_pv_ply = ply as usize;
+    if qs_pv_ply <= MAX_PLY {
+        info.pv_len[qs_pv_ply] = 0;
+    }
 
     // Draw detection: repetition and 50-move rule. No contempt term.
     let draw_score = 0;
@@ -7191,6 +7257,7 @@ fn quiescence_with_depth(
             }
             if score > alpha {
                 alpha = score;
+                qs_update_pv(info, qs_pv_node, qs_pv_ply, mv);
                 if score >= beta {
                     break;
                 }
@@ -7421,6 +7488,7 @@ fn quiescence_with_depth(
         }
         if score > alpha {
             alpha = score;
+            qs_update_pv(info, qs_pv_node, qs_pv_ply, mv);
             if score >= beta {
                 break;
             }

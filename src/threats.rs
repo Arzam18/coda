@@ -757,8 +757,11 @@ pub fn init_threats() {
         as *const ThreatTables as *mut ThreatTables;
     KING_ATTACKER_ON.store(true, Ordering::Release);
     ACTIVE_TABLES.store(ptr, Ordering::Release);
-    eprintln!("Threat features initialised: {} (king-attacker) / {} (no-king)",
-        n_king, n_noking);
+    // Deliberately no banner here. Both counts are compile-time constants (the
+    // debug_asserts above pin them), and the space the loaded net actually
+    // selects is already reported on stdout by the `info string Loaded NNUE
+    // ... threats=<n>` line. Repeating them on stderr only added noise that
+    // UCI harnesses surface as a warning on every engine start.
 }
 
 /// Build one feature space. `king_attacker` selects whether the king is

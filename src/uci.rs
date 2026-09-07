@@ -217,6 +217,30 @@ pub(crate) fn tt_ponder_hint(tt: &crate::tt::TT, after_best: &Board) -> Move {
     NO_MOVE
 }
 
+/// Map a root tablebase WDL onto the score Coda reports for it.
+///
+/// `wdl` here carries a magnitude, not just a sign: `dtz_to_wdl_score` returns
+/// ±20000 for a definite win/loss but ±1 for a cursed win / blessed loss — a
+/// position the tables call decisive, yet which the 50-move rule draws from
+/// this halfmove count. Testing only the sign reported a full `TB_WIN` for
+/// those, so a cursed win printed as a won game and a blessed loss printed as
+/// a lost one; the latter is the dangerous direction, because one-sided resign
+/// adjudication keys off the reported score and would throw away a draw.
+///
+/// The ±19000 threshold is the same "definite, not ambiguous" test the rest of
+/// the TB code already uses — `pick_winning_tb_move`'s gate a few lines up, and
+/// the interior probe's `wdl > 1` promotion in search.rs. Ambiguous values pass
+/// through unchanged, so ±1/0 report as the near-draw they are.
+fn root_tb_report_score(wdl: i32) -> i32 {
+    if wdl >= 19000 {
+        crate::tt::TB_WIN
+    } else if wdl <= -19000 {
+        -crate::tt::TB_WIN
+    } else {
+        wdl
+    }
+}
+
 pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
     let mut board = Board::startpos();
     let mut info = SearchInfo::new(64);
@@ -574,11 +598,8 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                                 }
                             }
                             if tb_valid {
-                                let score_str = crate::tt::format_uci_score(
-                                    if wdl > 0 { crate::tt::TB_WIN }
-                                    else if wdl < 0 { -crate::tt::TB_WIN }
-                                    else { 0 },
-                                );
+                                let score_str =
+                                    crate::tt::format_uci_score(root_tb_report_score(wdl));
                                 let pv_str = tb_pv.join(" ");
                                 let depth = tb_pv.len().max(1);
                                 println!("info depth {} seldepth {} {} tbhits 1 pv {}",
@@ -961,7 +982,18 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                         // account stderr against the engine clock).
                         if pr_elapsed.as_millis() > 20
                             || wait_elapsed.as_millis() > 2000
-                            || (!is_ponder_search && search_elapsed.as_millis() > (si.time_limit + 500) as u128)
+                            // `time_limit == 0` means "no time limit at all"
+                            // (go nodes / go depth / go infinite): search.rs sets
+                            // it to 0 on that path and elsewhere tests
+                            // `info.time_limit > 0` to ask whether TM applies.
+                            // Without the same guard here, an overrun is measured
+                            // against a budget of 500ms that was never imposed, so
+                            // every node- or depth-limited search past half a second
+                            // trips the trace — one stderr line per position in
+                            // analysis mode and in node-limited test harnesses.
+                            || (!is_ponder_search
+                                && si.time_limit > 0
+                                && search_elapsed.as_millis() > (si.time_limit + 500) as u128)
                         {
                             eprintln!(
                                 "TM_TRACE search={}ms fresh={}ms time_limit={}ms wait={}ms println={}ms ponder={} pv_ok={}",
@@ -1049,11 +1081,8 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                                         stop_flag = info.stop.clone();
                                     }
                                 }
-                                let score_str = crate::tt::format_uci_score(
-                                    if wdl > 0 { crate::tt::TB_WIN }
-                                    else if wdl < 0 { -crate::tt::TB_WIN }
-                                    else { 0 },
-                                );
+                                let score_str =
+                                    crate::tt::format_uci_score(root_tb_report_score(wdl));
                                 println!("info depth 1 seldepth 1 {} tbhits 1 pv {}", score_str, tb_move_str);
                                 println!("bestmove {}", tb_move_str);
                                 continue;
@@ -2143,5 +2172,53 @@ mod tests {
         init();
         let tb = match test_tb() { Some(t) => t, None => return };
         assert_tb_root_mates(&tb, "4k3/8/8/8/8/8/8/R3K3 w - - 0 1", 80, "KRvK");
+    }
+
+    /// A cursed win / blessed loss must NOT be reported as a decisive score.
+    ///
+    /// `dtz_to_wdl_score` distinguishes them from real wins by MAGNITUDE (±1 vs
+    /// ±20000), so the root reporting path collapsed on the sign announced
+    /// `score cp 28800` for a position the 50-move rule draws. Against
+    /// matetrack's `cursed.epd` that was 313 of 314 objectively drawn positions
+    /// claimed as won or lost; the blessed-loss direction is the dangerous one,
+    /// since one-sided resign adjudication keys off the reported score.
+    #[test]
+    fn root_tb_report_score_keeps_cursed_results_non_decisive() {
+        use crate::tt::{is_decisive, TB_WIN};
+
+        // Definite results keep the full TB band.
+        assert_eq!(root_tb_report_score(20000), TB_WIN);
+        assert_eq!(root_tb_report_score(-20000), -TB_WIN);
+
+        // Cursed win / blessed loss / draw stay outside it.
+        for wdl in [1, 0, -1] {
+            let reported = root_tb_report_score(wdl);
+            assert!(
+                !is_decisive(reported),
+                "wdl {} reported as decisive score {}",
+                wdl, reported
+            );
+            assert_eq!(reported, wdl, "ambiguous wdl {} should pass through", wdl);
+        }
+    }
+
+    /// The probe layer that feeds `root_tb_report_score`: the same position must
+    /// read as a definite win with a fresh halfmove clock and as a cursed win
+    /// once DTZ no longer fits the remaining 50-move budget. Guards the
+    /// halfmove-aware branch of `dtz_to_wdl_score` — without it, probing at
+    /// `halfmove != 0` at all would be unsafe.
+    #[test]
+    fn tb_root_probe_curses_win_past_the_fifty_move_budget() {
+        init();
+        let tb = match test_tb() { Some(t) => t, None => return };
+        // KBNvK: a definite win, but with a DTZ far enough out that a
+        // near-exhausted halfmove clock turns it into a cursed win.
+        let fresh = crate::board::Board::from_fen("8/8/8/8/8/3k4/8/2BNK3 w - - 0 1");
+        let stale = crate::board::Board::from_fen("8/8/8/8/8/3k4/8/2BNK3 w - - 90 1");
+        let (_, fresh_wdl) = match tb.probe_root(&fresh) { Some(x) => x, None => return };
+        let (_, stale_wdl) = match tb.probe_root(&stale) { Some(x) => x, None => return };
+        assert!(fresh_wdl >= 19000, "halfmove 0: expected definite win, got {}", fresh_wdl);
+        assert_eq!(stale_wdl, 1, "halfmove 90: expected cursed win (1), got {}", stale_wdl);
+        assert!(!crate::tt::is_decisive(root_tb_report_score(stale_wdl)));
     }
 }
