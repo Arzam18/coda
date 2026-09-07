@@ -183,8 +183,11 @@ impl AlignedBuckets {
 
         // Tier 1: explicit hugetlb mapping. Guaranteed real huge pages
         // when the pool is configured; fails cleanly otherwise (fall through).
-        if let Some(ab) = Self::try_hugetlb(len, size) {
-            return Some(ab);
+        // Tier 1 only when the whole table fits in the free pool.
+        if crate::hugepage::pool_can_fit(size) {
+            if let Some(ab) = Self::try_hugetlb(len, size) {
+                return Some(ab);
+            }
         }
 
         // Tier 2/3: 2 MB-aligned heap allocation + THP hints.
@@ -368,11 +371,13 @@ impl TT {
                 );
             };
             let tier = if ab.is_hugetlb() { "explicit hugetlb (MAP_HUGETLB)" } else { "aligned heap + THP" };
+            let bytes = size * std::mem::size_of::<TTBucket>();
             println!(
-                "info string TT {} MB via {} ({} buckets)",
-                (size * std::mem::size_of::<TTBucket>()) >> 20,
+                "info string TT {} MB via {} ({} buckets); hugepages: TT -> {}",
+                bytes >> 20,
                 tier,
-                size
+                size,
+                crate::hugepage::describe(ab.ptr.as_ptr() as *const u8, bytes)
             );
             ab
         };
