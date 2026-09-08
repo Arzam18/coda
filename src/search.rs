@@ -4708,9 +4708,14 @@ fn negamax(
     // causes a cutoff, so the search doesn't waste time in solved endgames.
     // Only at non-root (ply > 0) and non-excluded (not in singular verification).
     //
-    // tb_floor: Some(tb_score) when an in-window PV TB hit raised alpha.
-    // Search must not return / store below this — TB is ground truth.
+    // tb_floor / tb_ceiling: an in-window TB hit is ground truth, and which
+    // side of the value it pins depends on the sign. A definite WIN is a lower
+    // bound — the true value can still be higher (a mate inside the table) —
+    // so it raises alpha and floors the result. A definite LOSS is an upper
+    // bound: the true value can only be lower (we may be mated sooner), never
+    // higher. Search must not return / store outside these.
     let mut tb_floor: Option<i32> = None;
+    let mut tb_ceiling: Option<i32> = None;
     // A centipawn RFP result cannot refute a proven TB loss. Track only nodes
     // with concrete tablebase provenance; a blanket loss-window guard was too
     // broad in testing.
@@ -4780,8 +4785,22 @@ fn negamax(
                     // local search returns best_score < tb_score the final
                     // flag computation stuffs UPPER at sub-TB best_score —
                     // contradicting TB ground truth on every future probe.
-                    alpha = tb_score;
-                    tb_floor = Some(tb_score);
+                    if tb_score > 0 {
+                        alpha = tb_score;
+                        tb_floor = Some(tb_score);
+                    } else {
+                        // A TB loss must NOT raise alpha: alpha claims the value
+                        // is at least this high, and for a loss the bound runs
+                        // the other way. Raising it let the subtree answer with a
+                        // *shallower* loss — the losing side, one ply further
+                        // into the table, probes at `ply + 1` and reports
+                        // `-(TB_WIN - (ply + 1))`, which beats the floor by
+                        // exactly one ply and is returned instead. The drift
+                        // shows up in the root score: a position whose table node
+                        // sits one ply away reported TB_WIN - 2 rather than
+                        // TB_WIN - 1.
+                        tb_ceiling = Some(tb_score);
+                    }
                 }
             }
         }
@@ -6826,6 +6845,17 @@ fn negamax(
     if let Some(floor) = tb_floor {
         if best_score < floor {
             best_score = floor;
+        }
+    }
+    // TB ceiling: the mirror of the floor for a proven loss. The local search
+    // may come back with a less-bad score (see the note at the probe); clamp it
+    // so neither the return value nor the TT store claims better than the table
+    // allows. `tb_score` was in-window when it was recorded, so the clamped
+    // value stays below beta and the flag computation below cannot turn it into
+    // a LOWER bound.
+    if let Some(ceiling) = tb_ceiling {
+        if best_score > ceiling {
+            best_score = ceiling;
         }
     }
 
