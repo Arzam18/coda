@@ -183,8 +183,12 @@ impl<T: Default + Copy> AlignedVec<T> {
             // front, so it fails cleanly (→ fall through) when the pool is
             // absent or exhausted. CODA_NO_HUGETLB skips the tier — the
             // same-binary A/B toggle for the paired measurement protocol.
-            if std::env::var("CODA_NO_HUGETLB").is_err() {
-                let htlb_size = (size + Self::HUGE_PAGE - 1) & !(Self::HUGE_PAGE - 1);
+            // Only touch the pool when the WHOLE region fits in what is free
+            // right now; otherwise go straight to THP (the mmap would fail
+            // anyway, and the free pages are better left to a region that
+            // does fit — the TT of a later-started engine, typically).
+            let htlb_size = (size + Self::HUGE_PAGE - 1) & !(Self::HUGE_PAGE - 1);
+            if std::env::var("CODA_NO_HUGETLB").is_err() && crate::hugepage::pool_can_fit(htlb_size) {
                 let raw = libc::mmap(
                     std::ptr::null_mut(),
                     htlb_size,
@@ -3225,6 +3229,9 @@ impl NNUENet {
         let mut input_weights: AlignedVec<i16> = AlignedVec::hugepage_zeros(psq_input_size * hidden_size);
         read_i16_slice(reader, &mut input_weights)?;
         input_weights.advise_collapse();
+        println!("info string hugepages: PSQ weights {} MB -> {}",
+            (input_weights.len() * 2) >> 20,
+            crate::hugepage::describe(input_weights.as_ptr() as *const u8, input_weights.len() * 2));
 
         // Read input biases
         let mut input_biases = vec![0i16; hidden_size];
@@ -3252,6 +3259,9 @@ impl NNUENet {
                 threat_weights[i] = bytes[i] as i8;
             }
             threat_weights.advise_collapse();
+            println!("info string hugepages: threat weights {} MB -> {}",
+                total >> 20,
+                crate::hugepage::describe(threat_weights.as_ptr() as *const u8, total));
             println!("info string Loaded {} threat features ({}×{}, {}MB)",
                 num_threat_features, num_threat_features, hidden_size,
                 (num_threat_features * hidden_size) / (1024 * 1024));
