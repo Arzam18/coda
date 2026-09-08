@@ -437,6 +437,36 @@ tunables!(
     (DEXT_MARGIN_CORR, 13, 0, 64, 3.0, true),
     (DEXT_MARGIN_BASE, 37, -50, 150, 6.0, true),
     (DEXT_CAP, 9, 4, 32, 2.0, true),
+    // Root-decidedness gate on POSITIVE singular extensions. When the root score
+    // says the game is already decided, the singular test stops discriminating:
+    // every alternative falls below `tt_score - depth`, so nearly every node
+    // reads as singular and the tree runs far past its nominal depth chasing
+    // lines whose outcome is not in doubt. Measured on real-game positions, the
+    // seldepth excess (seldepth - depth) is 5.5 plies in balanced endgames, 13.0
+    // at +250..450cp and 17.5 at +600cp, against a flat ~3 for a reference
+    // engine; suppressing positive extensions costs 15% of the nodes in the
+    // +600cp bucket and returns the excess to 3.
+    //
+    // The score read is the ROOT's, not the node's. #3508 tried scaling the
+    // singular margin by |tt_score| and lost 3.3 Elo: interior nodes inside a
+    // perfectly balanced game routinely sit at 300-500cp, so a node-keyed test
+    // fires everywhere. "This line is winning" is not "this game is decided".
+    //
+    // UNITS: this threshold is in Coda's INTERNAL score units, which are NOT the
+    // cp a GUI shows. `format_uci_score` scales display by REPORT_SCALE_PCT
+    // (default 39), so a position reported as 924cp carries an internal 2370 —
+    // measured directly, and the factor must not be read off the runtime
+    // ScoreScale option, which is display-only and user-settable.
+    //
+    // The buckets that measured the pathology were labelled in DISPLAYED cp:
+    // excess 5.5 plies at |display| <= 60, 13.0 at +250..450, 17.5 at +600. The
+    // default is the lower edge of that band, 250 displayed, converted once:
+    // 250 / 0.39 ~= 640 internal. Setting it at 250 internal instead (~98
+    // displayed) fires the gate on nearly every non-drawish position and costs
+    // 30% of bench — a units slip worth naming, since nothing about the number
+    // looks wrong without the conversion.
+    (SE_ROOT_DECIDED_CP, 640, 250, 5000, 150.0, true),
+    (SE_ROOT_DECIDED_DEPTH, 8, 4, 32, 2.0, true),
     (QUIET_CHECK_BONUS, 14805, 2000, 30000, 1400.0, false),
     // SEE gate on the quiet check bonus (SF movepick.cpp: check bonus only
     // applies when see_ge(m, -75)). Without it Coda orders losing check-sacs
@@ -1230,6 +1260,10 @@ pub struct SearchInfo {
     /// reach), giving a single tunable set that self-adapts STC<->LTC instead
     /// of two constant sets.
     pub root_depth: i32,
+    /// Set once per completed ID iteration: the root score says the game is
+    /// decided and the search is deep enough for that score to be trusted.
+    /// Read at interior nodes to suppress positive singular extensions.
+    pub root_decided: bool,
     /// TMDebug-only stop-time snapshot of the dynamic-TM factors (see TmDbg).
     tm_dbg: TmDbg,
     /// Line-trace forensics (CODA_TRACE_LINE env): zobrist hashes of the
@@ -1363,6 +1397,7 @@ impl SearchInfo {
             depth_nodes: [0; MAX_PLY + 1],
             completed_depth: 0,
             root_depth: 0,
+            root_decided: false,
             tm_dbg: TmDbg::default(),
             trace_hashes: Vec::new(),
             trace_line_mv: Vec::new(),
@@ -3145,6 +3180,9 @@ pub(crate) fn search_helper(board: &mut Board, info: &mut SearchInfo, _limits: &
         prev_best = best_move;
         prev_score = score;
         info.last_score = score;
+        info.root_decided = depth >= tp(&SE_ROOT_DECIDED_DEPTH)
+            && !is_decisive(score)
+            && score.abs() >= tp(&SE_ROOT_DECIDED_CP);
         info.completed_depth = depth;
     }
 
@@ -3820,6 +3858,12 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
 
         prev_score = score;
         info.last_score = score;
+        // Recomputed each completed iteration from that iteration's settled root
+        // score; a mid-iteration abort leaves the previous iteration's verdict,
+        // which is the conservative direction.
+        info.root_decided = depth >= tp(&SE_ROOT_DECIDED_DEPTH)
+            && !is_decisive(score)
+            && score.abs() >= tp(&SE_ROOT_DECIDED_CP);
         info.ponder_depth.store(depth as u64, std::sync::atomic::Ordering::Relaxed);
         info.ponder_stability.store(info.tm_best_stable.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
 
@@ -6086,7 +6130,16 @@ fn negamax(
         // multi-cut above is a pruning device — both stay on, so the flag
         // isolates exactly what its name claims. The singular_ext/double_ext
         // counters above still count DETECTIONS, not applications.
-        if singular_extension > 0 && !FEAT_EXTENSIONS.load(Ordering::Relaxed) {
+        // Root-decidedness gate (see SE_ROOT_DECIDED_CP). Suppresses only the
+        // POSITIVE extension, deliberately leaving the singular search, its
+        // multi-cut and the negative extensions in place: ablating the whole SE
+        // machinery costs 1.49x nodes in balanced endgames, where the negative
+        // extensions are load-bearing, while suppressing positive extensions
+        // alone is what buys the 0.15x in the decided ones. Shares the
+        // FEAT_EXTENSIONS mechanism, which already means exactly this.
+        if singular_extension > 0
+            && (!FEAT_EXTENSIONS.load(Ordering::Relaxed) || info.root_decided)
+        {
             singular_extension = 0;
         }
 
