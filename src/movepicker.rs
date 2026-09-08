@@ -1708,11 +1708,7 @@ mod cont_hist_symmetry_tests {
     /// The declared plane count and the actual array extent must agree.
     #[test]
     fn cont_planes_matches_array_extent() {
-        let h = Box::new(History {
-            main: [[[[0; 64]; 64]; 2]; 2],
-            capture: [[[0; 7]; 64]; 13],
-            cont_hist: [[[[0; 64]; 13]; 64]; CONT_PLANES],
-        });
+        let h = History::boxed_zeroed();
         assert_eq!(h.cont_hist.len(), CONT_PLANES,
             "CONT_PLANES ({}) disagrees with cont_hist's first dimension ({})",
             CONT_PLANES, h.cont_hist.len());
@@ -1729,11 +1725,7 @@ mod cont_hist_symmetry_tests {
         let ply = 7usize;
         for plane in 1..CONT_PLANES {
             for &prior_to in &[0usize, 27, 63] {
-                let mut h = Box::new(History {
-                    main: [[[[0; 64]; 64]; 2]; 2],
-                    capture: [[[0; 7]; 64]; 13],
-                    cont_hist: [[[[0; 64]; 13]; 64]; CONT_PLANES],
-                });
+                let mut h = History::boxed_zeroed();
                 // Sentinel unique per (plane, prior_to) so a mis-derived pointer
                 // reads the wrong number rather than coincidentally matching.
                 let sentinel = (plane as i16) * 100 + prior_to as i16 + 1;
@@ -1765,11 +1757,7 @@ mod cont_hist_symmetry_tests {
     fn null_sentinel_selects_no_plane() {
         init();
         let board = Board::from_fen("r1bqkb1r/pp3ppp/2n1pn2/2pp4/3P4/2P1PN2/PP1N1PPP/R1BQK2R w KQkq - 0 6");
-        let h = Box::new(History {
-            main: [[[[0; 64]; 64]; 2]; 2],
-            capture: [[[0; 7]; 64]; 13],
-            cont_hist: [[[[0; 64]; 13]; 64]; CONT_PLANES],
-        });
+        let h = History::boxed_zeroed();
         let mps = [0u8; 64];
         let mts = [0u8; 64];
         let mp = MovePicker::new(

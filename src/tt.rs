@@ -183,8 +183,11 @@ impl AlignedBuckets {
 
         // Tier 1: explicit hugetlb mapping. Guaranteed real huge pages
         // when the pool is configured; fails cleanly otherwise (fall through).
-        if let Some(ab) = Self::try_hugetlb(len, size) {
-            return Some(ab);
+        // Tier 1 only when the whole table fits in the free pool.
+        if crate::hugepage::pool_can_fit(size) {
+            if let Some(ab) = Self::try_hugetlb(len, size) {
+                return Some(ab);
+            }
         }
 
         // Tier 2/3: 2 MB-aligned heap allocation + THP hints.
@@ -368,11 +371,13 @@ impl TT {
                 );
             };
             let tier = if ab.is_hugetlb() { "explicit hugetlb (MAP_HUGETLB)" } else { "aligned heap + THP" };
+            let bytes = size * std::mem::size_of::<TTBucket>();
             println!(
-                "info string TT {} MB via {} ({} buckets)",
-                (size * std::mem::size_of::<TTBucket>()) >> 20,
+                "info string TT {} MB via {} ({} buckets); hugepages: TT -> {}",
+                bytes >> 20,
                 tier,
-                size
+                size,
+                crate::hugepage::describe(ab.ptr.as_ptr() as *const u8, bytes)
             );
             ab
         };
@@ -538,9 +543,9 @@ impl TT {
     }
 
     /// Prefetch the bucket for a hash (hint to CPU cache).
-    /// Only x86_64 issues a prefetch today; aarch64 has no TT prefetch yet
-    /// (a `PRFM` path would be a separate, measurable change). Locals are
-    /// scoped into the x86 block so ARM builds stay warning-clean.
+    /// x86_64 uses `_mm_prefetch`; aarch64 issues `PRFM` via inline asm
+    /// because the `_prefetch` intrinsic is still unstable. Locals are
+    /// scoped into the arch blocks so other builds stay warning-clean.
     #[inline]
     pub fn prefetch(&self, hash: u64) {
         #[cfg(target_arch = "x86_64")]
@@ -549,7 +554,13 @@ impl TT {
             let ptr = &self.buckets[idx] as *const TTBucket;
             std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let idx = self.bucket_index(hash);
+            let ptr = &self.buckets[idx] as *const TTBucket;
+            std::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) ptr, options(nostack, preserves_flags, readonly));
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let _ = hash;
     }
 
