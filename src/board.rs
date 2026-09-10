@@ -282,8 +282,17 @@ impl Board {
     ///
     /// Excluded (deliberately):
     ///   - KNN vs K (technically drawn FIDE-wise but extremely rare; opponent
-    ///     can blunder into mate). Engines that exclude this treat the position
-    ///     conservatively — eval/search will reach 0 anyway via NNUE/TB.
+    ///     can blunder into mate). Excluded so a cooperative mate stays
+    ///     reachable. NOTE (measured 2026-09-10 against Syzygy WDL, 4,480
+    ///     positions over 140 material classes): eval/search do NOT reach 0
+    ///     here — the raw net prices KNNvK at a median |static| of ~3 pawns
+    ///     (the single outlier among 13 always-drawn classes, the rest within
+    ///     0.11), and the search sits at ~1.15 pawns from 200k to 4M nodes
+    ///     without converging. It is a uniform bias inside the class, not a
+    ///     decision-changing one: from 60 tablebase-won KNNvKP positions our
+    ///     best move preserved the win 60/60 (we over-rate KNNvKP by more than
+    ///     KNNvK, so the ordering survives). Kept excluded; do not cite this
+    ///     comment as evidence the eval handles it.
     ///   - KBN vs K (winnable for the BN side; not a draw).
     ///
     /// Follows the same standard `draw_by_material` /
