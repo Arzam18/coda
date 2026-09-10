@@ -4972,11 +4972,13 @@ fn negamax(
                 // the cutoff when the child's (negated) value contradicts the
                 // cutoff direction — rejects stale/one-sided deep cutoffs.
                 // Cost: one board-only make/unmake + one probe, deep cutoffs
-                // only. Shallow cutoffs and the bounds-collapse path below stay
-                // unverified (matching SF's single-site scope).
+                // only. Reuse the result for bounds collapse too, so a rejected
+                // direct cutoff cannot immediately return through that fallback.
+                let child_disagrees = !tt_cut_is_pv && bound_matches && halfmove_ok
+                    && tt_cutoff_child_disagrees(info, board, tt_move, tt_score, beta, depth, ply);
                 if !tt_cut_is_pv && (cut_node || !score_above_beta) && bound_matches
                     && halfmove_ok
-                    && !tt_cutoff_child_disagrees(info, board, tt_move, tt_score, beta, depth, ply)
+                    && !child_disagrees
                 {
                     info.stats.tt_cutoffs += 1;
                     if tt_cross_gen {
@@ -5042,7 +5044,7 @@ fn negamax(
                 // threshold the node falls through with an inverted window
                 // (alpha >= beta) and searches + TT-stores a degenerate full-depth
                 // bound.
-                if halfmove_ok {
+                if halfmove_ok && !child_disagrees {
                     match tt_entry.flag {
                         TT_FLAG_LOWER => {
                             if beta - alpha_orig == 1 && tt_score > alpha {
@@ -8081,6 +8083,28 @@ pub(crate) fn test_net_path() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disagreeing_child_does_not_fall_back_to_narrow_cutoff() {
+        crate::init();
+        let Some(net) = test_net_path() else { return; };
+        let mut info = SearchInfo::new(16);
+        info.load_nnue(&net).unwrap();
+        info.silent = true;
+        info.root_depth = 8;
+        let mut board = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let hash = board.hash;
+        let mv = make_move(12, 28, FLAG_DOUBLE_PUSH);
+        assert!(board.make_move(mv));
+        info.tt.store(board.hash, 8, 100, TT_FLAG_EXACT, NO_MOVE, 0, false);
+        board.unmake_move();
+        info.tt.store(hash, 8, 100, TT_FLAG_LOWER, mv, 0, false);
+        assert!(tt_cutoff_child_disagrees(&info, &mut board, mv, 100, 0, 7, 1));
+        assert_eq!(board.hash, hash);
+        let _ = negamax(&mut board, &mut info, -1, 0, 7, 1, true);
+        assert!(info.nodes > 1, "rejected bound must not return via TT narrowing");
+        assert_eq!(board.hash, hash);
+    }
 
     #[test]
     fn competitive_se_relaxes_only_boundary_fail_highs() {
