@@ -4752,7 +4752,7 @@ fn negamax(
     // causes a cutoff, so the search doesn't waste time in solved endgames.
     // Only at non-root (ply > 0) and non-excluded (not in singular verification).
     //
-    // tb_floor / tb_ceiling: an in-window TB hit is ground truth, and which
+    // tb_floor / tb_ceiling: a non-cutting TB hit is ground truth, and which
     // side of the value it pins depends on the sign. A definite WIN is a lower
     // bound — the true value can still be higher (a mate inside the table) —
     // so it raises alpha and floors the result. A definite LOSS is an upper
@@ -4806,31 +4806,21 @@ fn negamax(
                         wdl  // ambiguous (±1) or draw (0): use as-is
                     };
 
-                    // Exact draw (wdl==0) and ambiguous cursed-win/blessed-loss
-                    // (wdl==±1) are non-mate game-theoretic values — return
-                    // directly even when in-window. Otherwise the in-window case
-                    // below only raises alpha and keeps searching, letting
-                    // NNUE/qsearch produce a non-TB score in a solved subtree:
-                    // a fortress draw read as +150 steers the root off a real
-                    // win, and a cursed win read as winning gets overpressed into
-                    // the 50-move draw. Definite Win/Loss (|wdl|>1) fall through
-                    // to the bound logic: rule-50 can make a TB win unrealizable,
-                    // so they're only trusted as a lower/upper bound (SF pattern).
+                    // Draw and ambiguous cursed-win/blessed-loss keep their
+                    // exact near-draw treatment. A decisive WDL result only
+                    // bounds the score: a win may hide a faster mate, and a
+                    // loss may hide being mated sooner. Neither establishes
+                    // the opposite bound merely by lying outside the window.
                     if (-1..=1).contains(&wdl) { return tb_score; }
 
-                    if tb_score >= beta { return tb_score; }
-                    if tb_score <= alpha { return tb_score; }
-                    // Definite Win/Loss in window: tighten bounds AND remember
-                    // the TB ground truth so the final TT store / return doesn't
-                    // poison future probes with a sub-TB UPPER bound. (The
-                    // ambiguous wdl ∈ {-1, 0, +1} cases now return directly
-                    // above via f5d9809; this branch covers definite wdl ±2
-                    // landing in a wide window.) Without the floor, if the
-                    // local search returns best_score < tb_score the final
-                    // flag computation stuffs UPPER at sub-TB best_score —
-                    // contradicting TB ground truth on every future probe.
+                    if wdl > 1 && tb_score >= beta { return tb_score; }
+                    if wdl < -1 && tb_score <= alpha { return tb_score; }
+                    // Keep searching when the bound cannot close the window,
+                    // even if a win lies below alpha or a loss above beta.
+                    // Preserve the TB floor/ceiling for the final return and TT
+                    // store, without weakening an already stronger alpha.
                     if tb_score > 0 {
-                        alpha = tb_score;
+                        alpha = alpha.max(tb_score);
                         tb_floor = Some(tb_score);
                     } else {
                         // A TB loss must NOT raise alpha: alpha claims the value
@@ -6893,7 +6883,7 @@ fn negamax(
         return 0;
     }
 
-    // TB floor: a PV in-window TB hit established `tb_score` as ground
+    // TB floor: a non-cutting winning TB hit established `tb_score` as ground
     // truth. If the local search couldn't beat it, return / store the TB
     // value instead of the sub-TB local result. Without this the next
     // block stores UPPER below TB truth and poisons future probes.
@@ -6905,9 +6895,8 @@ fn negamax(
     // TB ceiling: the mirror of the floor for a proven loss. The local search
     // may come back with a less-bad score (see the note at the probe); clamp it
     // so neither the return value nor the TT store claims better than the table
-    // allows. `tb_score` was in-window when it was recorded, so the clamped
-    // value stays below beta and the flag computation below cannot turn it into
-    // a LOWER bound.
+    // allows. The ceiling can be above beta: in that case a LOWER bound is
+    // justified only by the search's fail-high, not by the WDL loss alone.
     if let Some(ceiling) = tb_ceiling {
         if best_score > ceiling {
             best_score = ceiling;
@@ -8083,6 +8072,144 @@ pub(crate) fn test_net_path() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Supply WDL through the real cache, and raw eval through the TT. These
+    // tests need neither tablebase files nor an NNUE net. Any unexpected
+    // evaluation path still panics rather than silently skipping the test.
+    fn tb_bound_test_info(board: &Board, wdl: i32, tt_move: Move) -> SearchInfo {
+        let mut info = SearchInfo::new(1);
+        info.silent = true;
+        info.syzygy = Some(std::sync::Arc::new(
+            crate::tb::SyzygyTB::with_test_wdl(board, wdl),
+        ));
+        info.tt.store(board.hash, 0, -INFINITY, TT_FLAG_UPPER, tt_move, 0, false);
+        info
+    }
+
+    // Controlled child values isolate the parent's bound/window bookkeeping
+    // from move ordering and evaluation. Use full-depth exact TT entries so
+    // every searched child answers at once, including checking moves.
+    fn seed_tb_test_children(board: &mut Board, info: &SearchInfo, score: i32, ply: i32) {
+        for &mv in generate_legal_moves(board).as_slice() {
+            assert!(board.make_move(mv));
+            info.tt.store(board.hash, ROOT_DEPTH_MAX, score_to_tt(-score, ply + 1),
+                          TT_FLAG_EXACT, NO_MOVE, 0, false);
+            board.unmake_move();
+        }
+    }
+
+    #[test]
+    fn tb_win_below_alpha_searches_the_faster_mate() {
+        crate::init();
+        let mut board = Board::from_fen("6kN/8/6QK/8/8/8/8/8 b - - 0 1");
+        let capture = make_move(square(6, 7), square(7, 7), FLAG_NONE);
+        assert!(board.make_move(capture)); // Kxh8 enters the three-piece table.
+        assert_eq!(board.to_fen(), "7k/8/6QK/8/8/8/8/8 w - - 0 2");
+        let ply = 1;
+        let mate = make_move(square(6, 5), square(6, 6), FLAG_NONE); // Qg7#
+        let mut info = tb_bound_test_info(&board, 20000, mate);
+        assert_eq!(info.syzygy.as_ref().unwrap().max_pieces(), 3);
+        // Midpoint of Coda's TB/mate anchors: the reported review window
+        // [28900, 28901], above the TB floor 28799 but below mate 28998.
+        let alpha = (TB_WIN + MATE_SCORE) / 2;
+        let hash = board.hash;
+        let score = negamax(&mut board, &mut info, alpha, alpha + 1, 4, ply, false);
+        assert_eq!(info.tb_hits, 1);
+        assert!(info.nodes > 1, "a win below alpha is not a fail-low proof");
+        assert_eq!(score, MATE_SCORE - ply - 1);
+        assert_eq!(board.hash, hash);
+        let entry = info.tt.probe(hash);
+        assert!(entry.hit);
+        assert_eq!(entry.flag, TT_FLAG_LOWER);
+        assert_eq!(entry.best_move, mate);
+        assert_eq!(score_from_tt(entry.score, ply, board.halfmove), score);
+    }
+
+    #[test]
+    fn tb_loss_above_beta_searches_the_sooner_mate() {
+        crate::init();
+        let mut board = Board::from_fen("7k/6Q1/7K/8/8/8/8/8 b - - 0 1");
+        let mut info = tb_bound_test_info(&board, -20000, NO_MOVE);
+        let ply = 1;
+        let beta = -(TB_WIN + MATE_SCORE) / 2;
+        let score = negamax(&mut board, &mut info, beta - 1, beta, 4, ply, false);
+        assert_eq!(info.tb_hits, 1);
+        assert_eq!(score, -MATE_SCORE + ply,
+                   "a WDL loss above beta cannot refute being already checkmated");
+    }
+
+    #[test]
+    fn tb_win_does_not_lower_an_already_stronger_alpha() {
+        crate::init();
+        let mut board = Board::from_fen("7k/8/8/8/8/8/6QK/8 w - - 0 1");
+        let ply = 1;
+        let mut info = tb_bound_test_info(&board, 20000, NO_MOVE);
+        // All children answer between the TB floor and caller's alpha. They
+        // must fail low, not become exact merely because alpha was lowered.
+        let child_value = TB_WIN;
+        let alpha = child_value + 1;
+        seed_tb_test_children(&mut board, &info, child_value, ply);
+        let score = negamax(&mut board, &mut info, alpha, alpha + 1, 4, ply, false);
+        assert_eq!(info.tb_hits, 1);
+        assert_eq!(score, child_value);
+        assert_eq!(info.pv_len[ply as usize], 0, "no move beat the incoming alpha");
+        let entry = info.tt.probe(board.hash);
+        assert!(entry.hit);
+        assert_eq!(entry.flag, TT_FLAG_UPPER, "the original window must survive the TB win");
+        assert_eq!(score_from_tt(entry.score, ply, board.halfmove), score);
+    }
+
+    #[test]
+    fn tb_non_cutting_bounds_clamp_the_final_tt_score() {
+        crate::init();
+        let ply = 1;
+        for (stm, wdl, alpha, expected, flag) in [
+            ("w", 20000, TB_WIN, TB_WIN - ply, TT_FLAG_UPPER),
+            ("b", -20000, -TB_WIN, -TB_WIN + ply, TT_FLAG_LOWER),
+        ] {
+            let mut board = Board::from_fen(&format!("7k/8/8/8/8/8/6QK/8 {stm} - - 0 1"));
+            let mut info = tb_bound_test_info(&board, wdl, NO_MOVE);
+            seed_tb_test_children(&mut board, &info, 0, ply);
+            let score = negamax(&mut board, &mut info, alpha, alpha + 1, 4, ply, false);
+            assert_eq!(info.tb_hits, 1);
+            assert!(info.nodes > 1, "the WDL bound alone cannot cut this window");
+            assert_eq!(score, expected);
+            let entry = info.tt.probe(board.hash);
+            assert!(entry.hit);
+            assert_eq!(entry.flag, flag);
+            assert_eq!(score_from_tt(entry.score, ply, board.halfmove), expected);
+        }
+    }
+
+    #[test]
+    fn tb_decisive_cutoffs_require_the_matching_direction() {
+        crate::init();
+        let ply = 1;
+        for (wdl, alpha, beta, expected) in [
+            (20000, TB_WIN - ply - 1, TB_WIN - ply, TB_WIN - ply),
+            (-20000, -TB_WIN + ply, -TB_WIN + ply + 1, -TB_WIN + ply),
+        ] {
+            let mut board = Board::from_fen("7k/8/8/8/8/8/6QK/8 w - - 0 1");
+            let mut info = tb_bound_test_info(&board, wdl, NO_MOVE);
+            assert_eq!(negamax(&mut board, &mut info, alpha, beta, 4, ply, false), expected);
+            assert_eq!(info.tb_hits, 1);
+            assert_eq!(info.nodes, 1, "a matching bound should cut immediately");
+        }
+    }
+
+    #[test]
+    fn tb_draw_and_ambiguous_results_remain_exact() {
+        crate::init();
+        for wdl in [-1, 0, 1] {
+            for (alpha, beta) in [(wdl - 2, wdl - 1), (wdl - 1, wdl + 1), (wdl + 1, wdl + 2)] {
+                let mut board = Board::from_fen("7k/8/8/8/8/8/6QK/8 w - - 0 1");
+                let mut info = tb_bound_test_info(&board, wdl, NO_MOVE);
+                assert_eq!(negamax(&mut board, &mut info, alpha, beta, 4, 1, false), wdl);
+                assert_eq!(info.tb_hits, 1);
+                assert_eq!(info.nodes, 1);
+            }
+        }
+    }
 
     #[test]
     fn disagreeing_child_does_not_fall_back_to_narrow_cutoff() {
