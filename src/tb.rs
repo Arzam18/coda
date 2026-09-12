@@ -91,6 +91,21 @@ impl SyzygyTB {
         Ok(SyzygyTB { tb, max_pieces, cache })
     }
 
+    /// Seed one WDL cache entry without loading external tables. Search tests
+    /// exercise the normal piece-count, halfmove and cache-hit path; all other
+    /// positions miss because the underlying tablebase is empty.
+    #[cfg(test)]
+    pub(crate) fn with_test_wdl(board: &Board, wdl: i32) -> Self {
+        let cache = TbCache::new(1);
+        cache.store(board.hash, board.halfmove, wdl);
+        assert_eq!(cache.probe(board.hash, board.halfmove), Some(wdl));
+        Self {
+            tb: Tablebase::new(),
+            max_pieces: crate::bitboard::popcount(board.occupied()) as usize,
+            cache,
+        }
+    }
+
     /// Maximum number of pieces supported.
     pub fn max_pieces(&self) -> usize {
         self.max_pieces
