@@ -437,6 +437,19 @@ tunables!(
     (DEXT_MARGIN_CORR, 13, 0, 64, 3.0, true),
     (DEXT_MARGIN_BASE, 37, -50, 150, 6.0, true),
     (DEXT_CAP, 9, 4, 32, 2.0, true),
+    // How large a TT score has to be before the 50-move clock is allowed to
+    // veto a cutoff on it. See `tt_halfmove_ok`.
+    //
+    // UNITS. Coda's INTERNAL score scale, not the cp a GUI prints:
+    // `format_uci_score` scales display by REPORT_SCALE_PCT (default 39),
+    // measured at 924 displayed for 2370 internal, so internal ~= 2.56x
+    // displayed. A quarter pawn — the smallest gap at which a stored score is
+    // asserting a plan rather than a shade of equality — is 25 displayed,
+    // hence 64 internal. The range spans "always veto" (0, today's behaviour)
+    // to 640, the internal value already used for a decided root elsewhere in
+    // this file. Non-core: it wants a focused tune, not a slot in a broad
+    // sweep.
+    (TT_HM_GUARD_MARGIN, 64, 0, 640, 30.0, false),
     // Root-decidedness gate on POSITIVE singular extensions. When the root score
     // says the game is already decided, the singular test stops discriminating:
     // every alternative falls below `tt_score - depth`, so nearly every node
@@ -652,6 +665,37 @@ pub static QS_SEE_THRESHOLD: AtomicI32 = AtomicI32::new(-26);
 pub static CAP_HIST_BASE: AtomicI32 = AtomicI32::new(42);
 pub static LMR_COMPLEXITY_DIV: AtomicI32 = AtomicI32::new(152);
 pub static TT_CUTOFF_HALFMOVE_MAX: AtomicI32 = AtomicI32::new(89);
+
+/// Should a TT-derived score be allowed to end the search at this node, given
+/// the 50-move clock?
+///
+/// The clock guard is a graph-history workaround: the Zobrist hash has no
+/// halfmove field, so a bound computed where the 50-move draw was far away can
+/// be reused where it is close, and the plan behind that bound may no longer
+/// fit. That is a real risk for a score that asserts something — a won pawn, a
+/// bind, a mate distance — and no risk at all for a score that says the
+/// position is level, because the clock cannot cut short a plan that isn't
+/// there. So veto on the score's magnitude rather than on the clock alone.
+///
+/// The clock-only form is not free, and its cost is concentrated in exactly the
+/// positions we are worst at. `board.halfmove` increments as the search
+/// descends, so at a root clock of 65 or more the deep part of the tree is
+/// already past `TT_CUTOFF_HALFMOVE_MAX` — and in a shuffling endgame, where
+/// nothing captures and no pawn moves, that is most of the tree. It then runs
+/// with every return-from-TT path disabled: measured at 3M nodes on a KBP-vs-K
+/// fortress, 9-18k distinct positions revisited 160-320 times each at a 99.5%
+/// TT probe hit rate, none of which may be used, with depth frozen at 7-12
+/// while 16x the node budget bought nothing. The frozen population is entirely
+/// near-zero scores, which is the population this margin frees.
+///
+/// Decisive scores stay guarded at any sane margin, and `score_from_tt` has
+/// already downgraded those whose distance exceeds the remaining
+/// `100 - halfmove` budget, so they are checked twice rather than not at all.
+#[inline]
+fn tt_halfmove_ok(tt_score: i32, halfmove: u16) -> bool {
+    tt_score.abs() < tp(&TT_HM_GUARD_MARGIN)
+        || (halfmove as i32) < tp(&TT_CUTOFF_HALFMOVE_MAX)
+}
 
 /// Post-ponderhit budget credit: PERCENT of elapsed ponder time deducted from
 /// the fresh post-hit think budget.
@@ -4929,7 +4973,7 @@ fn negamax(
             // near-miss + QS) on TT_CUTOFF_HALFMOVE_MAX. Window-narrowing is still
             // applied — it only biases the search, while returning a stale
             // tt_score is unsafe.
-            let halfmove_ok = (board.halfmove as i32) < tp(&TT_CUTOFF_HALFMOVE_MAX);
+            let halfmove_ok = tt_halfmove_ok(tt_score, board.halfmove);
             // Require +1 ply of TT depth for a fail-high (LOWER) cutoff, as
             // SF/Obsidian/PlentyChess do: fail-lows accept at tt_depth>=depth
             // but fail-highs need tt_depth>=depth+1. A symmetric `>= depth` is
@@ -7208,8 +7252,9 @@ fn quiescence_with_depth(
         // (SF: ttValue is value_from_tt output everywhere).
         let tt_score = score_from_tt(tt_entry.score, ply, board.halfmove);
 
-        // P2: skip QS TT cutoff near 50mr — stale bound unsafe
-        let halfmove_ok = (board.halfmove as i32) < tp(&TT_CUTOFF_HALFMOVE_MAX);
+        // P2: skip QS TT cutoff near 50mr — a stale bound with a plan behind it
+        // is unsafe; see `tt_halfmove_ok`.
+        let halfmove_ok = tt_halfmove_ok(tt_score, board.halfmove);
         let qs_is_pv = beta - alpha > 1;
         match tt_entry.flag {
             TT_FLAG_EXACT => {
@@ -7397,7 +7442,7 @@ fn quiescence_with_depth(
     // without this, an inflated near-50mr TT lower bound replaces
     // stand_pat and triggers the `best_score >= beta` return below —
     // bypassing the gate that exists for exactly this case.
-    if tt_hit && (board.halfmove as i32) < tp(&TT_CUTOFF_HALFMOVE_MAX) {
+    if tt_hit && tt_halfmove_ok(score_from_tt(tt_entry.score, ply, board.halfmove), board.halfmove) {
         // 50mr downgrade applies here too. A downgraded mate becomes a
         // TB-band value and is still filtered by !is_decisive below; a
         // downgraded TB score becomes the highest non-decisive value and
