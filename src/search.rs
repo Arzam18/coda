@@ -427,8 +427,12 @@ tunables!(
     // every singular hit and the tree explodes. BASE shifts the non-PV
     // baseline to a positive threshold.
     //
-    // CORR modulator reduces threshold when correction history has been
-    // correcting — extend less on uncertain evals.
+    // CORR modulator LOWERS the margin as |correction| grows, which makes
+    // `singular_score < singular_beta - dext_margin` easier to satisfy:
+    // where the static eval is known to be unreliable, the singular TT move
+    // is double-extended MORE readily. (Comment corrected 2026-09-13; the
+    // code has always had this direction, and the SPSA range excludes the
+    // other sign.)
     //
     // TRIPLE extension is intentionally NOT part of this shape — it has been
     // tested for Coda's regime and the signal was not there.
@@ -2236,7 +2240,8 @@ fn cont_corr_value(info: &SearchInfo, ply: usize) -> i64 {
 
 /// Compute the correction value alone (the centipawn delta corrhist would apply
 /// to raw eval). Used by SE-margin formulas to gate extension confidence on
-/// |correction| — extend less on uncertain (drifting) evals.
+/// |correction| — a larger correction lowers the double-extension margin,
+/// so uncertain (drifting) evals extend MORE readily, not less.
 fn correction_value(info: &SearchInfo, board: &Board, ply: usize) -> i32 {
     let stm = board.side_to_move as usize;
     let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
@@ -6049,8 +6054,8 @@ fn negamax(
                     // SF-pattern additive extensions with PV/quiet/
                     // correction-aware margins. PV nodes get LARGER margin
                     // (suppressed); quiet TT moves get SMALLER margin (easier);
-                    // large |corrhist| REDUCES threshold (eval is uncertain →
-                    // extend less). DEXT_CAP propagation gates the additive
+                    // large |corrhist| REDUCES the margin (eval is uncertain →
+                    // double-extend MORE readily). DEXT_CAP propagation gates the additive
                     // count so cumulative extensions stay safe.
                     //
                     // Yin/Yang frame: aggressive extensions on tactical hits
