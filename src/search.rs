@@ -920,6 +920,56 @@ const SAT_MAT_FULL: i32 = 900;
 const SAT_TIEBREAK_W: i32 = 40;
 
 const CORR_HIST_SIZE: usize = 16384;
+
+/// The four correction-history tables. One instance is shared by every
+/// search thread through an `Arc` (see `refresh_helper_common`), so all
+/// threads train and read the same tables instead of each helper working
+/// on a private copy of main's whose updates were thrown away at the end
+/// of the search.
+///
+/// Memory ordering: every entry is an independent counter that is read as a
+/// whole value and written as a whole clamped value; no entry publishes any
+/// other state, so `Relaxed` is the correct ordering on every target,
+/// aarch64 included. Two threads updating one entry at once can lose a
+/// gravity step; they can never produce an out-of-range value.
+pub struct CorrTables {
+    /// Pawn correction history: [stm][pawn_hash % size]
+    pawn: Box<[[std::sync::atomic::AtomicI32; CORR_HIST_SIZE]; 2]>,
+    /// Non-pawn correction history: [stm][color][nonpawn_hash % size]
+    np: Box<[[[std::sync::atomic::AtomicI32; CORR_HIST_SIZE]; 2]; 2]>,
+    /// Paired continuation correction: [prev_piece][prev_to][cur_piece][cur_to],
+    /// go_piece 1-12 (slot 0 unused). Read/updated at ply-2 and ply-4 offsets.
+    cont: Box<[[[[std::sync::atomic::AtomicI32; 64]; 13]; 64]; 13]>,
+    /// Transition correction history: [stm][(hash(ply-1) ^ hash(ply)) % size]
+    trans: Box<[[std::sync::atomic::AtomicI32; CORR_HIST_SIZE]; 2]>,
+}
+
+impl CorrTables {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(CorrTables {
+            pawn: alloc_zeroed_box(),
+            np: alloc_zeroed_box(),
+            cont: alloc_zeroed_box(),
+            trans: alloc_zeroed_box(),
+        })
+    }
+
+    /// Zero every table (ucinewgame). Shared, so one call clears for all threads.
+    fn clear(&self) {
+        for row in self.pawn.iter() { for e in row.iter() { e.store(0, Ordering::Relaxed); } }
+        for mat in self.np.iter() { for row in mat.iter() { for e in row.iter() { e.store(0, Ordering::Relaxed); } } }
+        for a in self.cont.iter() { for b in a.iter() { for c in b.iter() { for e in c.iter() { e.store(0, Ordering::Relaxed); } } } }
+        for row in self.trans.iter() { for e in row.iter() { e.store(0, Ordering::Relaxed); } }
+    }
+
+    #[cfg(test)]
+    fn assert_clear_for_test(&self) {
+        for row in self.pawn.iter() { for e in row.iter() { assert_eq!(e.load(Ordering::Relaxed), 0, "pawn correction history was not cleared"); } }
+        for mat in self.np.iter() { for row in mat.iter() { for e in row.iter() { assert_eq!(e.load(Ordering::Relaxed), 0, "non-pawn correction history was not cleared"); } } }
+        for a in self.cont.iter() { for b in a.iter() { for c in b.iter() { for e in c.iter() { assert_eq!(e.load(Ordering::Relaxed), 0, "continuation correction history was not cleared"); } } } }
+        for row in self.trans.iter() { for e in row.iter() { assert_eq!(e.load(Ordering::Relaxed), 0, "transition correction history was not cleared"); } }
+    }
+}
 const CORR_HIST_LIMIT: i32 = 1024;    // Consensus (SF, Obsidian)
 
 
@@ -1357,15 +1407,8 @@ pub struct SearchInfo {
     moved_to_stack: [u8; MAX_PLY + 1],
     /// Pawn history: [pawn_hash & (PAWN_HIST_SIZE - 1)][piece 1-12][to_square] (slot 0 unused)
     pawn_hist: Box<[[[i16; 64]; 13]; PAWN_HIST_SIZE]>,
-    /// Pawn correction history: [stm][pawn_hash % size]
-    pawn_corr: Box<[[i32; CORR_HIST_SIZE]; 2]>,
-    /// Non-pawn correction history: [stm][color][nonpawn_hash % size]
-    np_corr: Box<[[[i32; CORR_HIST_SIZE]; 2]; 2]>,
-    /// Paired continuation correction: [prev_piece][prev_to][cur_piece][cur_to],
-    /// go_piece 1-12 (slot 0 unused). Read/updated at ply-2 and ply-4 offsets.
-    cont_corr: Box<[[[[i32; 64]; 13]; 64]; 13]>,
-    /// Transition correction history: [stm][(hash(ply-1) ^ hash(ply)) % size]
-    trans_corr: Box<[[i32; CORR_HIST_SIZE]; 2]>,
+    /// Correction-history tables, shared by all threads of a search.
+    corr: std::sync::Arc<CorrTables>,
     pub nnue_net: Option<std::sync::Arc<crate::nnue::NNUENet>>,
     pub nnue_acc: Option<crate::nnue::NNUEAccumulator>,
     pub threat_stack: crate::threat_accum::ThreatStack,
@@ -1463,10 +1506,7 @@ impl SearchInfo {
             multipv: 1,
             root_ban: Vec::new(),
             pawn_hist: alloc_zeroed_box(),
-            pawn_corr: alloc_zeroed_box(),
-            np_corr: alloc_zeroed_box(),
-            cont_corr: alloc_zeroed_box(),
-            trans_corr: alloc_zeroed_box(),
+            corr: CorrTables::new(),
             nnue_net: None,
             nnue_acc: None,
             threat_stack: crate::threat_accum::ThreatStack::new(768), // max v9 accum size
@@ -1691,10 +1731,7 @@ impl SearchInfo {
     }
 
     pub fn clear_correction_history(&mut self) {
-        for row in self.pawn_corr.iter_mut() { row.fill(0); }
-        for mat in self.np_corr.iter_mut() { for row in mat.iter_mut() { row.fill(0); } }
-        for a in self.cont_corr.iter_mut() { for b in a.iter_mut() { for c in b.iter_mut() { c.fill(0); } } }
-        for row in self.trans_corr.iter_mut() { row.fill(0); }
+        self.corr.clear();
     }
 
     pub fn clear_pawn_hist(&mut self) {
@@ -1715,10 +1752,10 @@ impl SearchInfo {
         self.history.capture[1][4][2] = -45;
         self.history.cont_hist[1][4][2][5] = 67;
         self.pawn_hist[3][1][7] = 89;
-        self.pawn_corr[WHITE as usize][5] = 101;
-        self.np_corr[BLACK as usize][WHITE as usize][6] = -202;
-        self.cont_corr[1][8][2][9] = 303;
-        self.trans_corr[BLACK as usize][10] = -404;
+        self.corr.pawn[WHITE as usize][5].store(101, Ordering::Relaxed);
+        self.corr.np[BLACK as usize][WHITE as usize][6].store(-202, Ordering::Relaxed);
+        self.corr.cont[1][8][2][9].store(303, Ordering::Relaxed);
+        self.corr.trans[BLACK as usize][10].store(-404, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -1755,32 +1792,7 @@ impl SearchInfo {
                 }
             }
         }
-        for a in self.pawn_corr.iter() {
-            for &v in a.iter() {
-                assert_eq!(v, 0, "pawn correction history was not cleared");
-            }
-        }
-        for a in self.np_corr.iter() {
-            for b in a.iter() {
-                for &v in b.iter() {
-                    assert_eq!(v, 0, "non-pawn correction history was not cleared");
-                }
-            }
-        }
-        for a in self.cont_corr.iter() {
-            for b in a.iter() {
-                for c in b.iter() {
-                    for &v in c.iter() {
-                        assert_eq!(v, 0, "continuation correction history was not cleared");
-                    }
-                }
-            }
-        }
-        for a in self.trans_corr.iter() {
-            for &v in a.iter() {
-                assert_eq!(v, 0, "transition correction history was not cleared");
-            }
-        }
+        self.corr.assert_clear_for_test();
     }
 
     /// Evaluate using NNUE. A net is required to run — shipped/bench builds
@@ -2231,7 +2243,7 @@ fn cont_corr_value(info: &SearchInfo, ply: usize) -> i64 {
             let pp = info.moved_piece_stack[ply - off] as usize;
             let pt = info.moved_to_stack[ply - off] as usize;
             if pp != 0 && pp < crate::movepicker::CONT_PLANES && pt < 64 {
-                sum += info.cont_corr[pp][pt][cur_p][cur_t] as i64;
+                sum += info.corr.cont[pp][pt][cur_p][cur_t].load(Ordering::Relaxed) as i64;
             }
         }
     }
@@ -2245,17 +2257,17 @@ fn cont_corr_value(info: &SearchInfo, ply: usize) -> i64 {
 fn correction_value(info: &SearchInfo, board: &Board, ply: usize) -> i32 {
     let stm = board.side_to_move as usize;
     let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
-    let pawn_corr = info.pawn_corr[stm][pawn_idx] as i64;
+    let pawn_corr = info.corr.pawn[stm][pawn_idx].load(Ordering::Relaxed) as i64;
     let white_np_idx = (board.non_pawn_key[WHITE as usize] as usize) & (CORR_HIST_SIZE - 1);
-    let white_np_corr = info.np_corr[stm][WHITE as usize][white_np_idx] as i64;
+    let white_np_corr = info.corr.np[stm][WHITE as usize][white_np_idx].load(Ordering::Relaxed) as i64;
     let black_np_idx = (board.non_pawn_key[BLACK as usize] as usize) & (CORR_HIST_SIZE - 1);
-    let black_np_corr = info.np_corr[stm][BLACK as usize][black_np_idx] as i64;
+    let black_np_corr = info.corr.np[stm][BLACK as usize][black_np_idx].load(Ordering::Relaxed) as i64;
     let cont_corr = cont_corr_value(info, ply);
     let trans_corr = if !board.undo_stack.is_empty() {
         let last = &board.undo_stack[board.undo_stack.len() - 1];
         if last.mv != NO_MOVE {
             let trans_idx = ((board.hash ^ last.hash) as usize) & (CORR_HIST_SIZE - 1);
-            info.trans_corr[stm][trans_idx] as i64
+            info.corr.trans[stm][trans_idx].load(Ordering::Relaxed) as i64
         } else { 0 }
     } else { 0 };
     let total_corr = (pawn_corr * tp(&CORR_W_PAWN) as i64 + white_np_corr * tp(&CORR_W_NP) as i64 + black_np_corr * tp(&CORR_W_NP) as i64
@@ -2282,14 +2294,17 @@ fn corrected_eval(info: &SearchInfo, board: &Board, raw_eval: i32, ply: usize) -
 }
 
 /// Update correction history entry with gravity.
-fn update_corr_entry(entry: &mut i32, scaled_err: i32, cap_div_10x: i32) {
+fn update_corr_entry(entry: &std::sync::atomic::AtomicI32, scaled_err: i32, cap_div_10x: i32) {
     // Proportional gravity (consensus: every top engine uses this)
     // Self-limiting: values near the limit get pulled back harder
     // cap_div_10x is stored × 10 (fixed-point); cap = LIMIT * 10 / cap_div_10x.
     let cap = CORR_HIST_LIMIT * 10 / cap_div_10x.max(1);
     let bonus = scaled_err.clamp(-cap, cap);
-    *entry += bonus - *entry * bonus.abs() / CORR_HIST_LIMIT;
-    *entry = (*entry).clamp(-CORR_HIST_LIMIT, CORR_HIST_LIMIT);
+    // Whole-value read-modify-write; a concurrent writer loses a step, never
+    // the clamp (see CorrTables).
+    let old = entry.load(Ordering::Relaxed);
+    let new = (old + bonus - old * bonus.abs() / CORR_HIST_LIMIT).clamp(-CORR_HIST_LIMIT, CORR_HIST_LIMIT);
+    entry.store(new, Ordering::Relaxed);
 }
 
 /// Update all correction history tables.
@@ -2316,13 +2331,13 @@ fn update_correction_history(info: &mut SearchInfo, board: &Board, search_score:
 
     // Pawn correction
     let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
-    update_corr_entry(&mut info.pawn_corr[stm][pawn_idx], scaled_err, cap_div);
+    update_corr_entry(&info.corr.pawn[stm][pawn_idx], scaled_err, cap_div);
 
     // Non-pawn corrections (per color)
     let white_np_idx = (board.non_pawn_key[WHITE as usize] as usize) & (CORR_HIST_SIZE - 1);
-    update_corr_entry(&mut info.np_corr[stm][WHITE as usize][white_np_idx], scaled_err, cap_div);
+    update_corr_entry(&info.corr.np[stm][WHITE as usize][white_np_idx], scaled_err, cap_div);
     let black_np_idx = (board.non_pawn_key[BLACK as usize] as usize) & (CORR_HIST_SIZE - 1);
-    update_corr_entry(&mut info.np_corr[stm][BLACK as usize][black_np_idx], scaled_err, cap_div);
+    update_corr_entry(&info.corr.np[stm][BLACK as usize][black_np_idx], scaled_err, cap_div);
 
     // Continuation correction — paired 2-ply/4-ply (H1). Index by the LAST move
     // (ply-1); update the ply-2 and ply-4 subtables. Reads moved_piece_stack
@@ -2336,7 +2351,7 @@ fn update_correction_history(info: &mut SearchInfo, board: &Board, search_score:
                     let pp = info.moved_piece_stack[ply - off] as usize;
                     let pt = info.moved_to_stack[ply - off] as usize;
                     if pp != 0 && pp < crate::movepicker::CONT_PLANES && pt < 64 {
-                        update_corr_entry(&mut info.cont_corr[pp][pt][cur_p][cur_t], scaled_err, cap_div);
+                        update_corr_entry(&info.corr.cont[pp][pt][cur_p][cur_t], scaled_err, cap_div);
                     }
                 }
             }
@@ -2347,7 +2362,7 @@ fn update_correction_history(info: &mut SearchInfo, board: &Board, search_score:
         let last = &board.undo_stack[board.undo_stack.len() - 1];
         if last.mv != NO_MOVE {
             let trans_idx = ((board.hash ^ last.hash) as usize) & (CORR_HIST_SIZE - 1);
-            update_corr_entry(&mut info.trans_corr[stm][trans_idx], scaled_err, cap_div);
+            update_corr_entry(&info.corr.trans[stm][trans_idx], scaled_err, cap_div);
         }
     }
 }
@@ -2601,11 +2616,10 @@ fn refresh_helper_common(helper: &mut SearchInfo, main: &SearchInfo) {
     helper.syzygy = main.syzygy.clone();
     helper.tb_probe_depth = main.tb_probe_depth;
 
-    // Correction tables — copied for eval consistency (see fn-doc). ~3.14 MiB.
-    helper.pawn_corr.copy_from_slice(&main.pawn_corr[..]);
-    helper.np_corr.copy_from_slice(&main.np_corr[..]);
-    helper.cont_corr.copy_from_slice(&main.cont_corr[..]);
-    helper.trans_corr.copy_from_slice(&main.trans_corr[..]);
+    // Correction tables — SHARED with main (one Arc), so every thread trains
+    // and reads the same tables. Replaces the per-go ~3.14 MiB copy whose
+    // helper-side updates were discarded after each search.
+    helper.corr = main.corr.clone();
 
     // pawn_hist is position-specific (indexed by pawn hash); a helper's
     // self-accumulated table carries toxic stale ordering across positions
@@ -4917,15 +4931,15 @@ fn negamax(
         let stm = board.side_to_move as usize;
         unsafe {
             let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.pawn_corr[stm][pawn_idx] as *const i32 as *const i8, _MM_HINT_T0);
+            _mm_prefetch(&info.corr.pawn[stm][pawn_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
             let wnp_idx = (board.non_pawn_key[WHITE as usize] as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.np_corr[stm][WHITE as usize][wnp_idx] as *const i32 as *const i8, _MM_HINT_T0);
+            _mm_prefetch(&info.corr.np[stm][WHITE as usize][wnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
             let bnp_idx = (board.non_pawn_key[BLACK as usize] as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.np_corr[stm][BLACK as usize][bnp_idx] as *const i32 as *const i8, _MM_HINT_T0);
+            _mm_prefetch(&info.corr.np[stm][BLACK as usize][bnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
             if let Some(last) = board.undo_stack.last() {
                 if last.mv != NO_MOVE {
                     let trans_idx = ((board.hash ^ last.hash) as usize) & (CORR_HIST_SIZE - 1);
-                    _mm_prefetch(&info.trans_corr[stm][trans_idx] as *const i32 as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(&info.corr.trans[stm][trans_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
                 }
             }
             // cont_corr rows: same index derivation as cont_corr_value.
@@ -4938,7 +4952,7 @@ fn negamax(
                             let pp = info.moved_piece_stack[ply_u - off] as usize;
                             let pt = info.moved_to_stack[ply_u - off] as usize;
                             if pp != 0 && pp < crate::movepicker::CONT_PLANES && pt < 64 {
-                                _mm_prefetch(&info.cont_corr[pp][pt][cur_p][cur_t] as *const i32 as *const i8, _MM_HINT_T0);
+                                _mm_prefetch(&info.corr.cont[pp][pt][cur_p][cur_t] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
                             }
                         }
                     }
@@ -5328,12 +5342,13 @@ fn negamax(
 
     // Hindsight extension (a common cross-engine pattern — Stockfish,
     // Alexandria, Halogen, Stormphrax): mirror of the
-    // reduction. When parent reduced aggressively (>=3) but the combined
+    // reduction. When parent reduced by at least 2 plies but the combined
     // eval shows position has worsened (eval_sum <= 0), extend +1 ply to
     // find the threat we missed. Non-PV only (PV already searched fully).
+    // Threshold 2 (was 3): #3557 +1.0 H1 at 177k games, 2026-09-13.
     if !in_check && ply >= 1 && ply_u >= 1
         && !is_pv
-        && prior_reduction >= 3
+        && prior_reduction >= 2
         && info.static_evals[ply_u - 1] > -(MATE_IN_MAX_PLY)
         && static_eval > -INFINITY
         && FEAT_HINDSIGHT.load(Ordering::Relaxed)
@@ -5438,16 +5453,16 @@ fn negamax(
                         let grain = tp(&CORR_HIST_GRAIN_T) as i64;
                         let scale = (div * grain).max(1);
                         let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
-                        let c1 = info.pawn_corr[stm][pawn_idx] as i64 * tp(&CORR_W_PAWN) as i64 / scale;
+                        let c1 = info.corr.pawn[stm][pawn_idx].load(Ordering::Relaxed) as i64 * tp(&CORR_W_PAWN) as i64 / scale;
                         let wnp = (board.non_pawn_key[WHITE as usize] as usize) & (CORR_HIST_SIZE - 1);
-                        let c2 = info.np_corr[stm][WHITE as usize][wnp] as i64 * tp(&CORR_W_NP) as i64 / scale;
+                        let c2 = info.corr.np[stm][WHITE as usize][wnp].load(Ordering::Relaxed) as i64 * tp(&CORR_W_NP) as i64 / scale;
                         let bnp = (board.non_pawn_key[BLACK as usize] as usize) & (CORR_HIST_SIZE - 1);
-                        let c3 = info.np_corr[stm][BLACK as usize][bnp] as i64 * tp(&CORR_W_NP) as i64 / scale;
+                        let c3 = info.corr.np[stm][BLACK as usize][bnp].load(Ordering::Relaxed) as i64 * tp(&CORR_W_NP) as i64 / scale;
                         let c4 = cont_corr_value(info, ply_u) * tp(&CORR_W_CONT) as i64 / scale;
                         let c5 = if let Some(last) = board.undo_stack.last() {
                             if last.mv != NO_MOVE {
                                 let ti = ((board.hash ^ last.hash) as usize) & (CORR_HIST_SIZE - 1);
-                                info.trans_corr[stm][ti] as i64 * tp(&CORR_W_TRANS) as i64 / scale
+                                info.corr.trans[stm][ti].load(Ordering::Relaxed) as i64 * tp(&CORR_W_TRANS) as i64 / scale
                             } else { 0 }
                         } else { 0 };
                         let mx = c1.max(c2).max(c3).max(c4).max(c5);
@@ -8570,25 +8585,32 @@ mod tests {
     /// (c) apply proportional gravity (saturates at the bound),
     /// (d) be symmetric for positive vs negative errors (equal magnitude
     ///     updates produce equal magnitude changes from 0).
+    /// Test shim: the tables are atomic; the unit tests reason about plain values.
+    fn upd_test(e: &mut i32, scaled_err: i32, cap_div_10x: i32) {
+        let a = std::sync::atomic::AtomicI32::new(*e);
+        update_corr_entry(&a, scaled_err, cap_div_10x);
+        *e = a.load(Ordering::Relaxed);
+    }
+
     #[test]
     fn corr_entry_update_basics() {
         // (d) Symmetry from zero.
         let mut pos = 0i32;
         let mut neg = 0i32;
-        update_corr_entry(&mut pos, 20, 4);   // scaled_err=+20 (err 4 × w 5)
-        update_corr_entry(&mut neg, -20, 4);  // scaled_err=-20
+        upd_test(&mut pos, 20, 4);   // scaled_err=+20 (err 4 × w 5)
+        upd_test(&mut neg, -20, 4);  // scaled_err=-20
         assert_eq!(pos, -neg, "symmetric updates from zero: pos={}, neg={}", pos, neg);
         assert!(pos > 0, "positive err must raise entry: got {}", pos);
 
         // (a) Directional.
         let mut e = 0i32;
-        update_corr_entry(&mut e, 6, 4);
+        upd_test(&mut e, 6, 4);
         assert!(e > 0, "err > 0, weight > 0 → entry must rise, got {}", e);
 
         // (b) Bounded at ±CORR_HIST_LIMIT.
         let mut e = 0i32;
         for _ in 0..10000 {
-            update_corr_entry(&mut e, 1_000_000, 1); // saturate hard
+            upd_test(&mut e, 1_000_000, 1); // saturate hard
         }
         assert!(e <= CORR_HIST_LIMIT, "entry must stay ≤ LIMIT, got {}", e);
         assert!(e >= -CORR_HIST_LIMIT, "entry must stay ≥ -LIMIT, got {}", e);
@@ -8597,7 +8619,7 @@ mod tests {
         //     don't grow without bound.
         let mut e = CORR_HIST_LIMIT / 2;
         let before = e;
-        update_corr_entry(&mut e, 1, 4);
+        upd_test(&mut e, 1, 4);
         let delta = e - before;
         // Small update near saturation should be small.
         assert!(delta.abs() < 4, "near-saturation delta should be tiny, got {}", delta);
@@ -8609,11 +8631,11 @@ mod tests {
     #[test]
     fn corr_entry_zero_err_noop() {
         let mut e = 500i32;
-        update_corr_entry(&mut e, 0, 4);
+        upd_test(&mut e, 0, 4);
         assert_eq!(e, 500, "zero err must not change entry");
 
         let mut e = -500i32;
-        update_corr_entry(&mut e, 0, 4);
+        upd_test(&mut e, 0, 4);
         assert_eq!(e, -500, "zero err must not change negative entry either");
     }
 
@@ -8667,11 +8689,11 @@ mod tests {
         // The slot indexed by the test position's hash must be non-zero
         // in every per-position table. cont_corr is excluded — needs a
         // last-move undo entry, which the test position doesn't have.
-        assert!(info.pawn_corr[stm][pawn_idx] != 0,
+        assert!(info.corr.pawn[stm][pawn_idx].load(Ordering::Relaxed) != 0,
             "pawn_corr slot must be written");
-        assert!(info.np_corr[stm][WHITE as usize][white_np_idx] != 0,
+        assert!(info.corr.np[stm][WHITE as usize][white_np_idx].load(Ordering::Relaxed) != 0,
             "white np_corr slot must be written");
-        assert!(info.np_corr[stm][BLACK as usize][black_np_idx] != 0,
+        assert!(info.corr.np[stm][BLACK as usize][black_np_idx].load(Ordering::Relaxed) != 0,
             "black np_corr slot must be written");
 
         // Apply repeatedly to escape integer-division flooring at
