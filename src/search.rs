@@ -7518,7 +7518,20 @@ fn quiescence_with_depth(
     // (raw_stand_pat) — correct-on-read discipline is unchanged.
     let scaled_stand_pat = apply_halfmove_scale(raw_stand_pat, board.halfmove);
     let stand_pat = if FEAT_CORRECTION.load(Ordering::Relaxed) {
-        corrected_eval(info, board, scaled_stand_pat, (ply as usize).min(MAX_PLY))
+        // Clamp to MAX_PLY-1, matching `qs_safe_ply` above. The two clamps used
+        // to disagree: `qs_safe_ply` (MAX_PLY-1) is what WRITES
+        // moved_piece_stack, while this read was clamped to MAX_PLY and
+        // `corrected_eval` indexes [ply-1] — so past the limit the write landed
+        // at 159 and the read resolved to 159, making the continuation
+        // correction read the move played at THIS node instead of the parent's.
+        // Neither clamp is correct past MAX_PLY (the stack cannot represent the
+        // true ancestry there), but a stale read beats a self-referential one.
+        //
+        // Not reachable in 44.4M measured stand-pats (deepest ply 78 of 160,
+        // Thor 846ae37), so this is untestable by SPRT — but the clamp's own
+        // history records the unclamped version panicking and throwing a won
+        // game in live play, so the condition has occurred.
+        corrected_eval(info, board, scaled_stand_pat, (ply as usize).min(MAX_PLY - 1))
     } else {
         scaled_stand_pat
     };
