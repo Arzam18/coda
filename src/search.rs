@@ -312,6 +312,20 @@ tunables!(
     // Minimum depth at which singular extension is attempted. Too low and
     // singular_depth is itself too shallow to judge singularity reliably.
     (SE_DEPTH_10X, 40, 40, 200, 20.0, true),
+    // Root-depth-aware uplift on the singular-extension depth gate, the same
+    // shape as LMP_ROOT_* and as the RFP_ROOT_* correction those both follow.
+    // SE_DEPTH_10X now holds the deep-search value: the LTC core tune left it
+    // at 4.0 (a9cf975d) while an STC walk started from that point pulled it to
+    // 5.3, i.e. shallow searches want singular verification to start LATER.
+    // Mechanism: the verification re-search is a fixed cost per firing, and a
+    // short search has fewer plies to amortise it over.
+    //
+    // KNEE = 17, our measured deep-search median root depth (same measurement
+    // as LMP_ROOT_KNEE: 14 at 100ms/move, 17 at 1s, 22 at 4s), so the uplift
+    // is zero at LTC and main is unchanged there. COEF = 4 = the STC walk's
+    // preferred +13 (in tenths of a ply) over the measured 3-ply gap.
+    (SE_ROOT_KNEE, 17, 10, 24, 1.5, true),
+    (SE_ROOT_COEF, 4, 0, 15, 1.5, true),
     (ASP_DELTA, 11, 5, 30, 1.5, false),
     (ASP_SCORE_DIV, 12000, 8000, 50000, 2100.0, false),
     // Late move pruning: quiets searched before the cutoff, on the shape
@@ -332,6 +346,21 @@ tunables!(
     // implementation. Tested anyway at Adam's request (2026-08-17) since the
     // predictor here differs from the post-hoc selector that was measured.
     (LMP_MARGIN_THRESH, 53, 50, 500, 35.0, true),
+    // Root-depth-aware uplift on the LMP predictive margin, same shape as the
+    // RFP_ROOT_* correction above with the sign flipped: that one demands MORE
+    // confidence as the search gets deeper, this one demands more as it gets
+    // SHALLOWER. LMP_MARGIN_THRESH now holds the deep-search value (the LTC
+    // core tune moved it 77 -> 53, a9cf975d); an STC walk started from that
+    // point pulled it back to 76, so the knob is genuinely clock-dependent and
+    // one constant cannot serve both.
+    //
+    // Constants from our own measurement (warm TT, one middlegame line, this
+    // binary): median root depth 14 at 100 ms/move, 17 at 1 s/move, 22 at 4 s.
+    // KNEE = 17, the measured deep-search median, so the uplift is zero at LTC
+    // and above and main is unchanged there. COEF = 8 = the STC walk's
+    // preferred +23 divided by the measured 3-ply gap between the two medians.
+    (LMP_ROOT_KNEE, 17, 10, 24, 1.5, true),
+    (LMP_ROOT_COEF, 8, 0, 20, 1.5, true),
     (LMP_MARGIN_PCT, 58, 40, 100, 6.0, true),
     // Root-depth-aware LMR relaxation (single-set, self-adapts STC<->LTC):
     // reduce LESS as the OVERALL search depth grows past LMR_ROOT_THRESH
@@ -1187,6 +1216,8 @@ pub struct SearchInfo {
     pub rfp_audit_active: bool,
     pub tt: std::sync::Arc<TT>,  // shared across Lazy SMP threads
     pub history: Box<History>,
+    /// Continuation history, shared by all threads of a search.
+    pub cont: std::sync::Arc<crate::movepicker::ContHist>,
     pub stop: std::sync::Arc<AtomicBool>,  // shared stop flag
     /// EXTERNAL stop flag: set ONLY by the UCI
     /// thread on `stop`/`quit`/abandon (uci.rs shares its external_stop
@@ -1446,6 +1477,7 @@ impl SearchInfo {
             stats_tt_static_eval_hits: 0,
             tt,
             history: alloc_zeroed_box(),
+            cont: crate::movepicker::ContHist::shared_zeroed(),
             stop: std::sync::Arc::new(AtomicBool::new(false)),
             external_stop: std::sync::Arc::new(AtomicBool::new(false)),
             start_time: Instant::now(),
@@ -1742,6 +1774,7 @@ impl SearchInfo {
 
     pub fn clear_persistent_histories(&mut self) {
         self.history.clear();
+        self.cont.clear();
         self.clear_pawn_hist();
         self.clear_correction_history();
     }
@@ -1750,7 +1783,7 @@ impl SearchInfo {
     pub fn dirty_persistent_histories_for_test(&mut self) {
         self.history.main[1][0][2][3] = 123;
         self.history.capture[1][4][2] = -45;
-        self.history.cont_hist[1][4][2][5] = 67;
+        self.cont.t[1][4][2][5].store(67, Ordering::Relaxed);
         self.pawn_hist[3][1][7] = 89;
         self.corr.pawn[WHITE as usize][5].store(101, Ordering::Relaxed);
         self.corr.np[BLACK as usize][WHITE as usize][6].store(-202, Ordering::Relaxed);
@@ -1776,15 +1809,7 @@ impl SearchInfo {
                 }
             }
         }
-        for a in self.history.cont_hist.iter() {
-            for b in a.iter() {
-                for c in b.iter() {
-                    for &v in c.iter() {
-                        assert_eq!(v, 0, "continuation history was not cleared");
-                    }
-                }
-            }
-        }
+        self.cont.assert_clear_for_test();
         for a in self.pawn_hist.iter() {
             for b in a.iter() {
                 for &v in b.iter() {
@@ -2637,6 +2662,10 @@ fn refresh_helper_common(helper: &mut SearchInfo, main: &SearchInfo) {
 pub(crate) fn seed_helper_from_main(helper: &mut SearchInfo, main: &SearchInfo) {
     refresh_helper_common(helper, main);
     helper.history.copy_from(&main.history);
+    // Continuation history is SHARED with main (one Arc): move-pattern knowledge
+    // every thread can reuse, unlike main/capture history which is the
+    // Lazy-SMP diversity source (sharing all three lost 16 Elo, #3590).
+    helper.cont = main.cont.clone();
 }
 
 /// Per-`go` refresh of a reused pool worker (Stage 2 — SMP diversity). Unlike
@@ -2650,6 +2679,7 @@ pub(crate) fn seed_helper_from_main(helper: &mut SearchInfo, main: &SearchInfo) 
 pub(crate) fn refresh_helper_per_go(helper: &mut SearchInfo, main: &SearchInfo) {
     refresh_helper_common(helper, main);
     helper.history.age(4, 5);
+    // cont is shared; main ages it once per go, helpers must not age it again.
 }
 
 /// Per-`go` preparation of a helper `SearchInfo` for a search on `board`:
@@ -3464,6 +3494,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     // converges too slowly for persistence to matter, but with them each move
     // starts from a warm eval calibration.
     info.history.age(4, 5);
+    info.cont.age(4, 5);
     info.stats = PruneStats::default();
     // Age pawn history (×0.80, matching main/capture history aging)
     for entry in info.pawn_hist.iter_mut() {
@@ -3921,6 +3952,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
 
         prev_score = score;
         info.last_score = score;
+
         // Recomputed each completed iteration from that iteration's settled root
         // score; a mid-iteration abort leaves the previous iteration's verdict,
         // which is the conservative direction.
@@ -4044,6 +4076,24 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 global, nps, elapsed,
                 info.tt.hashfull(), info.tb_hits, pv_str
             );
+        }
+
+        // Nothing can beat a mate in one, and nothing avoids being mated in
+        // one, so once either is proved there is no better move left to find
+        // and the remaining think time is pure waste. Placed AFTER this
+        // iteration's `info` line so the GUI still receives the score and PV.
+        // Only under time management: an `infinite`/analysis search must keep
+        // reporting, and fixed-node or fixed-depth runs have their own
+        // contract. `score` is a completed iteration's settled value here.
+        //
+        // The failure this removes is losing a won game on the clock while the
+        // engine re-proves a mate it already holds — a deployment problem our
+        // SPRT harness cannot see, because adjudication ends those games first.
+        if !limits.infinite && info.time_limit > 0
+            && score.abs() >= MATE_IN_MAX_PLY
+            && MATE_SCORE - score.abs() <= 2
+        {
+            break;
         }
 
         // MultiPV secondary lines (analysis only). Save/restore the primary
@@ -5086,8 +5136,8 @@ fn negamax(
                                 && opp_to < 64 && our_to < 64
                             {
                                 let malus = -((155 * depth).min(385));
-                                History::update_cont_history(
-                                    &mut info.history.cont_hist[our_gp][our_to][opp_gp][opp_to],
+                                History::update_shared_cont(
+                                    &info.cont.t[our_gp][our_to][opp_gp][opp_to],
                                     malus,
                                 );
                             }
@@ -5681,7 +5731,7 @@ fn negamax(
         } else {
             NO_MOVE
         };
-        let mut pc_picker = QMovePicker::new(board, pc_tt_move, &info.history, pinned, checkers);
+        let mut pc_picker = QMovePicker::new(board, pc_tt_move, &info.history, &info.cont, pinned, checkers);
         loop {
             let mv = pc_picker.next(board);
             if mv == NO_MOVE { break; }
@@ -5814,9 +5864,9 @@ fn negamax(
     };
     let pawn_hist_ref = Some(&info.pawn_hist[ph_idx] as &[[i16; 64]; 13]);
     let mut picker = if in_check {
-        MovePicker::new_evasion(tt_move, safe_ply, checkers, pinned, &info.history, prev_move, pawn_hist_ref, enemy_attacks, &info.moved_piece_stack, &info.moved_to_stack)
+        MovePicker::new_evasion(tt_move, safe_ply, checkers, pinned, &info.history, &info.cont, prev_move, pawn_hist_ref, enemy_attacks, &info.moved_piece_stack, &info.moved_to_stack)
     } else {
-        MovePicker::new(board, tt_move, safe_ply, checkers, pinned, &info.history, prev_move, pawn_hist_ref, enemy_attacks, our_xray_blockers, &info.moved_piece_stack, &info.moved_to_stack)
+        MovePicker::new(board, tt_move, safe_ply, checkers, pinned, &info.history, &info.cont, prev_move, pawn_hist_ref, enemy_attacks, our_xray_blockers, &info.moved_piece_stack, &info.moved_to_stack)
     };
     picker.threat_sq = threat_sq;
 
@@ -5907,7 +5957,10 @@ fn negamax(
             // is the best in-node signal that this will fail low, so spend fewer
             // quiets on it. Guarded on static_eval being real (it is -INFINITY
             // in check, though !in_check above already excludes that).
-            if static_eval > -INFINITY && alpha - static_eval >= tp(&LMP_MARGIN_THRESH) {
+            // Shallow searches want a larger margin here — see LMP_ROOT_KNEE.
+            let lmp_margin = tp(&LMP_MARGIN_THRESH)
+                + (tp(&LMP_ROOT_KNEE) - info.root_depth).max(0) * tp(&LMP_ROOT_COEF);
+            if static_eval > -INFINITY && alpha - static_eval >= lmp_margin {
                 lmp_limit = (lmp_limit * tp(&LMP_MARGIN_PCT) / 100).max(1);
             }
             // The gives_direct_check carve sits inside the movecount test — only
@@ -6006,7 +6059,9 @@ fn negamax(
         if mv == tt_move
             && tt_move != NO_MOVE
             && ply > 0
+            // Shallow searches start singular verification later — see SE_ROOT_KNEE.
             && depth >= tp10(&SE_DEPTH_10X)
+                + (tp(&SE_ROOT_KNEE) - info.root_depth).max(0) * tp(&SE_ROOT_COEF) / 10
             // Deliberately NO !in_check gate. None of SF/Obsidian/Berserk/
             // Stormphrax gate SE on check, and gating it means a deep in-check
             // node's TT move (often the single forced evasion — maximally
@@ -6389,10 +6444,10 @@ fn negamax(
                 if moved_piece != NO_PIECE {
                     let gp = go_piece(moved_piece);
                     if prev_piece_for_cont != 0 {
-                        hist_score += info.history.cont_hist[prev_piece_for_cont][prev_to_for_cont as usize][gp][to as usize] as i32;
+                        hist_score += info.cont.t[prev_piece_for_cont][prev_to_for_cont as usize][gp][to as usize].load(std::sync::atomic::Ordering::Relaxed) as i32;
                     }
                     if prev2_piece_for_cont != 0 {
-                        hist_score += info.history.cont_hist[prev2_piece_for_cont][prev2_to_for_cont as usize][gp][to as usize] as i32 / 2;
+                        hist_score += info.cont.t[prev2_piece_for_cont][prev2_to_for_cont as usize][gp][to as usize].load(std::sync::atomic::Ordering::Relaxed) as i32 / 2;
                     }
                     // Pawn history: pawn-structure-aware move quality (SF/Alexandria pattern).
                     // Uses the node-level ph_idx (parent pawn hash) — this code runs
@@ -6637,10 +6692,10 @@ fn negamax(
                                     // as Berserk/Alexandria/Stormphrax do —
                                     // NOT a [bonus, b/2, b/2, b/2] taper.
                                     let ch_b = nudge_bonus;
-                                    let cur_cont = info.history.cont_hist[prior_piece][prior_to][gp_mv][to as usize] as i32;
+                                    let cur_cont = info.cont.t[prior_piece][prior_to][gp_mv][to as usize].load(std::sync::atomic::Ordering::Relaxed) as i32;
                                     let base = cur_cont + main_score_v / 2;
                                     History::update_cont_history_with_base(
-                                        &mut info.history.cont_hist[prior_piece][prior_to][gp_mv][to as usize],
+                                        &info.cont.t[prior_piece][prior_to][gp_mv][to as usize],
                                         base,
                                         ch_b,
                                     );
@@ -6802,10 +6857,10 @@ fn negamax(
                                     if prior_piece > 0 && prior_piece < crate::movepicker::CONT_PLANES && prior_to < 64 {
                                         // B1: uniform bonus (see LMR nudge site above).
                                         let ch_bonus = bonus;
-                                        let cur_cont = info.history.cont_hist[prior_piece][prior_to][gp_mv][to as usize] as i32;
+                                        let cur_cont = info.cont.t[prior_piece][prior_to][gp_mv][to as usize].load(std::sync::atomic::Ordering::Relaxed) as i32;
                                         let base = cur_cont + main_score_v / 2;
                                         History::update_cont_history_with_base(
-                                            &mut info.history.cont_hist[prior_piece][prior_to][gp_mv][to as usize],
+                                            &info.cont.t[prior_piece][prior_to][gp_mv][to as usize],
                                             base,
                                             ch_bonus,
                                         );
@@ -6848,10 +6903,10 @@ fn negamax(
                                             if prior_piece > 0 && prior_piece < crate::movepicker::CONT_PLANES && prior_to < 64 {
                                                 // B1: uniform penalty (see bonus site above).
                                                 let ch_pen = -malus;
-                                                let cur_cont = info.history.cont_hist[prior_piece][prior_to][gp_q][qt as usize] as i32;
+                                                let cur_cont = info.cont.t[prior_piece][prior_to][gp_q][qt as usize].load(std::sync::atomic::Ordering::Relaxed) as i32;
                                                 let base = cur_cont + q_main_score / 2;
                                                 History::update_cont_history_with_base(
-                                                    &mut info.history.cont_hist[prior_piece][prior_to][gp_q][qt as usize],
+                                                    &info.cont.t[prior_piece][prior_to][gp_q][qt as usize],
                                                     base,
                                                     ch_pen,
                                                 );
@@ -7052,8 +7107,8 @@ fn negamax(
                     && opp_to < 64 && our_to < 64
                 {
                     let bonus = history_bonus(depth) * tp(&FAIL_LOW_PREV_BONUS_PCT) / 100;
-                    History::update_cont_history(
-                        &mut info.history.cont_hist[our_gp][our_to][opp_gp][opp_to],
+                    History::update_shared_cont(
+                        &info.cont.t[our_gp][our_to][opp_gp][opp_to],
                         bonus,
                     );
                 }
@@ -7339,7 +7394,7 @@ fn quiescence_with_depth(
         // has thrown a won game in live play.
         let qs_safe_ply = (ply as usize).min(MAX_PLY - 1);
         let mut evasion_picker = MovePicker::new_evasion(
-            tt_move, qs_safe_ply, qs_checkers, qs_pinned, &info.history, qs_prev_move, qs_pawn_hist_ref,
+            tt_move, qs_safe_ply, qs_checkers, qs_pinned, &info.history, &info.cont, qs_prev_move, qs_pawn_hist_ref,
             qs_enemy_attacks,
             &info.moved_piece_stack, &info.moved_to_stack,
         );
@@ -7535,7 +7590,7 @@ fn quiescence_with_depth(
 
     // Use main MovePicker in quiescence mode.
     // This partitions captures into good (SEE>=0) and bad, and uses staged ordering.
-    let mut picker = MovePicker::new_quiescence(tt_move, &info.history, qs_checkers, qs_pinned);
+    let mut picker = MovePicker::new_quiescence(tt_move, &info.history, &info.cont, qs_checkers, qs_pinned);
     let mut best_move = NO_MOVE;
     let mut qs_move_count = 0i32;
     let qs_max_caps = tp(&QS_MAX_CAPTURES);

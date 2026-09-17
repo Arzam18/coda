@@ -24,6 +24,40 @@ const MAX_HISTORY: i32 = 16384;
 pub type Threats = u64;
 
 /// History tables shared across the search.
+/// Continuation history, SHARED by every search thread through one `Arc`
+/// (relaxed atomics: each entry is an independent counter read and written as
+/// a whole clamped value, so no publish ordering is involved and a concurrent
+/// update can lose a step, never the clamp). Kept separate from the per-thread
+/// tables below: main/capture history is what makes Lazy-SMP threads search
+/// different trees (sharing all three lost 16 Elo, #3590), whereas the
+/// continuation table is move-pattern knowledge that every thread can reuse.
+pub struct ContHist {
+    pub t: [[[[std::sync::atomic::AtomicI16; 64]; 13]; 64]; CONT_PLANES],
+}
+
+impl ContHist {
+    pub fn shared_zeroed() -> std::sync::Arc<ContHist> {
+        unsafe {
+            let layout = std::alloc::Layout::new::<ContHist>();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut ContHist;
+            if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
+            std::sync::Arc::from(Box::from_raw(ptr))
+        }
+    }
+    fn for_each(&self, f: impl Fn(&std::sync::atomic::AtomicI16)) {
+        for a in self.t.iter() { for b in a.iter() { for c in b.iter() { for v in c.iter() { f(v); } } } }
+    }
+    pub fn clear(&self) { self.for_each(|v| v.store(0, std::sync::atomic::Ordering::Relaxed)); }
+    /// Age every entry. Shared: main calls this once per go, helpers never do.
+    pub fn age(&self, factor: i32, divisor: i32) {
+        self.for_each(|v| v.store((v.load(std::sync::atomic::Ordering::Relaxed) as i32 * factor / divisor) as i16, std::sync::atomic::Ordering::Relaxed));
+    }
+    #[cfg(test)]
+    pub fn assert_clear_for_test(&self) {
+        self.for_each(|v| assert_eq!(v.load(std::sync::atomic::Ordering::Relaxed), 0, "continuation history was not cleared"));
+    }
+}
+
 pub struct History {
     /// Main history: [from_threatened][to_threatened][from][to]
     /// Threat-aware 4D indexing — separate history for moves escaping/entering threats.
@@ -38,9 +72,6 @@ pub struct History {
     /// captured_type uses 0-6 scheme (0=empty, 1=pawn, ..., 6=king).
     /// int16 values (i32 causes different gravity behavior).
     pub capture: [[[i16; 7]; 64]; 13],
-    /// Continuation history: [piece 1-12][to][piece 1-12][to]
-    /// piece uses 1-12 indexing (slot 0 unused).
-    pub cont_hist: [[[[i16; 64]; 13]; 64]; CONT_PLANES],
 }
 
 impl History {
@@ -83,7 +114,6 @@ impl History {
     pub fn clear(&mut self) {
         self.main = [[[[0; 64]; 64]; 2]; 2];
         self.capture = [[[0i16; 7]; 64]; 13];
-        self.cont_hist = [[[[0; 64]; 13]; 64]; CONT_PLANES];
     }
 
     /// Copy all table contents from `src`. Used to seed Lazy SMP
@@ -94,7 +124,6 @@ impl History {
     pub fn copy_from(&mut self, src: &History) {
         self.main = src.main;
         self.capture = src.capture;
-        self.cont_hist = src.cont_hist;
     }
 
     /// Age all history tables by multiplying by factor/divisor (e.g. 4/5 = 0.80).
@@ -110,13 +139,6 @@ impl History {
         for plane in self.capture.iter_mut() {
             for row in plane.iter_mut() {
                 for v in row.iter_mut() { *v = (*v as i32 * factor / divisor) as i16; }
-            }
-        }
-        for plane0 in self.cont_hist.iter_mut() {
-            for plane1 in plane0.iter_mut() {
-                for row in plane1.iter_mut() {
-                    for v in row.iter_mut() { *v = (*v as i32 * factor / divisor) as i16; }
-                }
             }
         }
     }
@@ -135,6 +157,7 @@ impl History {
 
     /// Update continuation history (i16 entries) with gravity.
     /// Uses same formula as update_history but with i16 values and MAX_HISTORY divisor.
+    /// Plain (per-thread) gravity update — used by capture history.
     pub fn update_cont_history(entry: &mut i16, bonus: i32) {
         let clamped = bonus.clamp(-MAX_HISTORY, MAX_HISTORY);
         let val = *entry as i32;
@@ -142,16 +165,24 @@ impl History {
         *entry = new_val.clamp(-32000, 32000) as i16;
     }
 
+    /// Same gravity update against a SHARED atomic entry (continuation history).
+    pub fn update_shared_cont(entry: &std::sync::atomic::AtomicI16, bonus: i32) {
+        let clamped = bonus.clamp(-MAX_HISTORY, MAX_HISTORY);
+        let val = entry.load(std::sync::atomic::Ordering::Relaxed) as i32;
+        let new_val = val + clamped - val * clamped.abs() / MAX_HISTORY;
+        entry.store(new_val.clamp(-32000, 32000) as i16, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Update cont-hist with gravity factor derived from a combined "base"
     /// score (typically cont_hist + main_hist / 2). A cont-hist blend
     /// technique from Stormphrax — gravity uses the move's combined signal strength
     /// instead of just the cell's own value, so cont-hist can converge
     /// even when main_hist already encodes the move's quality.
-    pub fn update_cont_history_with_base(entry: &mut i16, base: i32, bonus: i32) {
+    pub fn update_cont_history_with_base(entry: &std::sync::atomic::AtomicI16, base: i32, bonus: i32) {
         let clamped = bonus.clamp(-MAX_HISTORY, MAX_HISTORY);
-        let val = *entry as i32;
+        let val = entry.load(std::sync::atomic::Ordering::Relaxed) as i32;
         let new_val = val + clamped - base * clamped.abs() / MAX_HISTORY;
-        *entry = new_val.clamp(-32000, 32000) as i16;
+        entry.store(new_val.clamp(-32000, 32000) as i16, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -220,7 +251,7 @@ pub struct MovePicker {
     history: *const History,
     // Continuation history sub-table pointers at plies 1, 2, 4, 6 back.
     // cont_hist_subs[0] = ply-1 (3x weight), [1] = ply-2 (3x), [2] = ply-4 (1x), [3] = ply-6 (1x)
-    cont_hist_subs: [Option<*const [[i16; 64]; 13]>; 4],
+    cont_hist_subs: [Option<*const [[std::sync::atomic::AtomicI16; 64]; 13]>; 4],
     pawn_hist_ptr: Option<*const [[i16; 64]; 13]>,
     // Main moves list and scores.
     moves: MoveList,
@@ -275,6 +306,7 @@ impl MovePicker {
         checkers: Bitboard,
         pinned: Bitboard,
         history: &History,
+        cont: &ContHist,
         _prev_move: Move,
         pawn_hist: Option<&[[i16; 64]; 13]>,
         threats: Threats,
@@ -286,14 +318,14 @@ impl MovePicker {
         // Uses moved_piece_stack for correct piece lookup (avoids stale board.piece_at).
         // Upper-bound guard: callers (search + qsearch) should clamp ply but
         // we defend here too — indexing out of range panics the search thread.
-        let mut cont_hist_subs: [Option<*const [[i16; 64]; 13]>; 4] = [None; 4];
+        let mut cont_hist_subs: [Option<*const [[std::sync::atomic::AtomicI16; 64]; 13]>; 4] = [None; 4];
         let offsets = [1usize, 2, 4, 6];
         for (i, &off) in offsets.iter().enumerate() {
             if ply >= off && ply - off < moved_piece_stack.len() && ply - off < moved_to_stack.len() {
                 let prior_piece = moved_piece_stack[ply - off] as usize;
                 let prior_to = moved_to_stack[ply - off] as usize;
                 if prior_piece > 0 && prior_piece < CONT_PLANES && prior_to < 64 {
-                    cont_hist_subs[i] = Some(&history.cont_hist[prior_piece][prior_to] as *const [[i16; 64]; 13]);
+                    cont_hist_subs[i] = Some(&cont.t[prior_piece][prior_to] as *const [[std::sync::atomic::AtomicI16; 64]; 13]);
                 }
             }
         }
@@ -335,6 +367,7 @@ impl MovePicker {
     pub fn new_quiescence(
         tt_move: Move,
         history: &History,
+        _cont: &ContHist,
         // Passed in (QS already computes both per node) instead of
         // recomputed here — consistent with MovePicker::new / new_evasion.
         checkers: Bitboard,
@@ -377,6 +410,7 @@ impl MovePicker {
         checkers: Bitboard,
         pinned: Bitboard,
         history: &History,
+        cont: &ContHist,
         _prev_move: Move,
         pawn_hist: Option<&[[i16; 64]; 13]>,
         threats: Threats,
@@ -387,14 +421,14 @@ impl MovePicker {
         // Also guard the upper bound: qsearch can deepen past MAX_PLY via
         // evasion chains, and the caller's clamp might be missed — indexing
         // moved_piece_stack with ply >= len panics the search thread.
-        let mut cont_hist_subs: [Option<*const [[i16; 64]; 13]>; 4] = [None; 4];
+        let mut cont_hist_subs: [Option<*const [[std::sync::atomic::AtomicI16; 64]; 13]>; 4] = [None; 4];
         let offsets = [1usize, 2, 4, 6];
         for (i, &off) in offsets.iter().enumerate() {
             if ply >= off && ply - off < moved_piece_stack.len() && ply - off < moved_to_stack.len() {
                 let prior_piece = moved_piece_stack[ply - off] as usize;
                 let prior_to = moved_to_stack[ply - off] as usize;
                 if prior_piece > 0 && prior_piece < CONT_PLANES && prior_to < 64 {
-                    cont_hist_subs[i] = Some(&history.cont_hist[prior_piece][prior_to] as *const [[i16; 64]; 13]);
+                    cont_hist_subs[i] = Some(&cont.t[prior_piece][prior_to] as *const [[std::sync::atomic::AtomicI16; 64]; 13]);
                 }
             }
         }
@@ -683,7 +717,7 @@ impl MovePicker {
                 for (i, &w) in cont_weights.iter().enumerate() {
                     if let Some(sub_ptr) = self.cont_hist_subs[i] {
                         let sub = unsafe { &*sub_ptr };
-                        score += w * sub[gp][to as usize] as i32;
+                        score += w * sub[gp][to as usize].load(std::sync::atomic::Ordering::Relaxed) as i32;
                     }
                 }
             }
@@ -848,7 +882,7 @@ impl MovePicker {
                     for (i, &w) in cont_weights.iter().enumerate() {
                         if let Some(sub_ptr) = self.cont_hist_subs[i] {
                             let sub = unsafe { &*sub_ptr };
-                            s += w * sub[gp][to as usize] as i32;
+                            s += w * sub[gp][to as usize].load(std::sync::atomic::Ordering::Relaxed) as i32;
                         }
                     }
                 }
@@ -1222,6 +1256,7 @@ impl QMovePicker {
         board: &Board,
         tt_move: Move,
         history: &History,
+        _cont: &ContHist,
         // Passed in — the probcut block runs after the node-entry
         // pinned/checkers computation.
         pinned: Bitboard,
@@ -1708,10 +1743,10 @@ mod cont_hist_symmetry_tests {
     /// The declared plane count and the actual array extent must agree.
     #[test]
     fn cont_planes_matches_array_extent() {
-        let h = History::boxed_zeroed();
-        assert_eq!(h.cont_hist.len(), CONT_PLANES,
-            "CONT_PLANES ({}) disagrees with cont_hist's first dimension ({})",
-            CONT_PLANES, h.cont_hist.len());
+        let c = ContHist::shared_zeroed();
+        assert_eq!(c.t.len(), CONT_PLANES,
+            "CONT_PLANES ({}) disagrees with the continuation table's first dimension ({})",
+            CONT_PLANES, c.t.len());
     }
 
     /// EVERY valid plane must survive the round trip: a value written at
@@ -1726,10 +1761,11 @@ mod cont_hist_symmetry_tests {
         for plane in 1..CONT_PLANES {
             for &prior_to in &[0usize, 27, 63] {
                 let mut h = History::boxed_zeroed();
+                let c = ContHist::shared_zeroed();
                 // Sentinel unique per (plane, prior_to) so a mis-derived pointer
                 // reads the wrong number rather than coincidentally matching.
                 let sentinel = (plane as i16) * 100 + prior_to as i16 + 1;
-                h.cont_hist[plane][prior_to][3][17] = sentinel;
+                c.t[plane][prior_to][3][17].store(sentinel, std::sync::atomic::Ordering::Relaxed);
 
                 let mut mps = [0u8; 64];
                 let mut mts = [0u8; 64];
@@ -1737,14 +1773,14 @@ mod cont_hist_symmetry_tests {
                 mts[ply - 1] = prior_to as u8;
 
                 let mp = MovePicker::new(
-                    &board, NO_MOVE, ply, 0, 0, &h, NO_MOVE, None,
+                    &board, NO_MOVE, ply, 0, 0, &h, &c, NO_MOVE, None,
                     Default::default(), 0, &mps, &mts,
                 );
 
                 let sub = mp.cont_hist_subs[0].unwrap_or_else(|| panic!(
                     "plane {plane} (prior_to {prior_to}) produced NO cont-hist sub-table — \
                      a bound guard is still using a stale literal instead of CONT_PLANES"));
-                let got = unsafe { (*sub)[3][17] };
+                let got = unsafe { (*sub)[3][17].load(std::sync::atomic::Ordering::Relaxed) };
                 assert_eq!(got, sentinel,
                     "plane {plane} (prior_to {prior_to}) round-tripped to the WRONG slot");
             }
@@ -1758,10 +1794,11 @@ mod cont_hist_symmetry_tests {
         init();
         let board = Board::from_fen("r1bqkb1r/pp3ppp/2n1pn2/2pp4/3P4/2P1PN2/PP1N1PPP/R1BQK2R w KQkq - 0 6");
         let h = History::boxed_zeroed();
+        let c = ContHist::shared_zeroed();
         let mps = [0u8; 64];
         let mts = [0u8; 64];
         let mp = MovePicker::new(
-            &board, NO_MOVE, 7, 0, 0, &h, NO_MOVE, None,
+            &board, NO_MOVE, 7, 0, 0, &h, &c, NO_MOVE, None,
             Default::default(), 0, &mps, &mts,
         );
         assert!(mp.cont_hist_subs[0].is_none(), "null sentinel must not select a plane");

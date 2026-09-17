@@ -396,6 +396,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 }
                 info.tt.clear();
                 info.history.clear();
+                info.cont.clear();
                 info.clear_correction_history();
                 info.clear_pawn_hist(); // was missing — stale data leaked between games
                 info.tm_cross_prev_score = i32::MIN; // no prev move in a fresh game
