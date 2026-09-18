@@ -1,18 +1,20 @@
-name: Build Android
+name: Build ARM64
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ "*" ]
-  pull_request:
-    branches: [ "*" ]
+    inputs:
+      uci_date:
+        description: "Coda UCI version/date (example: 20260918)"
+        required: true
+        default: "20260918"
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-android:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout Repository
@@ -21,25 +23,60 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Set Coda UCI version
+        env:
+          UCI_DATE: ${{ inputs.uci_date }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          uci_date = os.environ["UCI_DATE"]
+
+          path = Path("build.rs")
+          text = path.read_text()
+
+          old = 'println!("cargo:rustc-env=CODA_VERSION={version}");'
+          new = f'println!("cargo:rustc-env=CODA_VERSION={uci_date}");'
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: Could not find CODA_VERSION stamping line in build.rs."
+              )
+
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+
+          print(f"Modified file: {path}")
+          print(f"Coda UCI version: {uci_date}")
+          PY
+
+          echo "Modified CODA_VERSION line:"
+          grep -n 'CODA_VERSION' build.rs
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
 
       - name: Ensure Target for Active Toolchain
-        run: rustup target add aarch64-linux-android
+        run: |
+          rustup target add aarch64-linux-android
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+        run: |
+          cargo install cargo-ndk
 
       - name: Download NNUE Net
         run: |
           if [ -f net.txt ]; then
             NET_URL=$(cat net.txt | tr -d '\r\n')
             NET_FILE=$(basename "$NET_URL")
+
             echo "Downloading NNUE net from $NET_URL..."
             curl -fsSL --retry 3 "$NET_URL" -o "$NET_FILE"
-            echo "CODA_EVALFILE=$(pwd)/$NET_FILE" >> $GITHUB_ENV
+
+            echo "CODA_EVALFILE=$(pwd)/$NET_FILE" >> "$GITHUB_ENV"
           else
             echo "Warning: net.txt not found!"
           fi
@@ -51,7 +88,7 @@ jobs:
             --features embedded-net \
             --bin coda \
             --config 'build.rustflags=[]'
-          
+
           mkdir -p dist/bin
           cp target/aarch64-linux-android/release/coda dist/bin/coda
 
@@ -60,8 +97,13 @@ jobs:
           ls -lh dist/bin/
           file dist/bin/*
 
+      - name: Verify UCI identification
+        run: |
+          echo "UCI identification:"
+          printf "uci\nquit\n" | ./dist/bin/coda
+
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
         with:
           name: coda-android-arm64
-          path: dist/bin/*
+          path: dist/bin/coda
