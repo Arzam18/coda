@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       uci_date:
-        description: "Coda UCI version/date (example: 20260918)"
+        description: "Coda UCI version/date (example: 20260919)"
         required: true
-        default: "20260918"
+        default: "20260919"
         type: string
 
 permissions:
