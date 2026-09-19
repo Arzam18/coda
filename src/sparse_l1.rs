@@ -359,7 +359,7 @@ pub fn x2_fusion_safe(sparse_weights: &[i8], num_neurons: usize) -> bool {
 /// two input chunks per iteration, summing their VPMADDUBSW products with
 /// one VPADDW *before* a single shared VPMADDWD — halving the madd count
 /// (4/6 reference engines: Berserk
-/// `m256_add_dpbusd_epi32_x2`, PlentyChess, Alexandria).
+/// PlentyChess, Alexandria).
 ///
 /// # Saturation precondition (why this kernel is gated)
 /// VPMADDUBSW saturates its i16 lane at ±32767, and the fusing VPADDW

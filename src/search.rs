@@ -202,19 +202,18 @@ tunables!(
     (TM_INC_COVER_REF, 20, 5, 60, 4.0, false),
     (TM_MULT_CEIL_MIN_10X, 15, 10, 40, 2.0, false),
     (TM_MULT_CEIL_MAX_10X, 130, 40, 140, 8.0, false),
-    // Cross-thread best-move-instability TM factor (concept from SF).
-    // factor = BASE/1000 + MULT/1000 * (Σ per-thread bmc)/n_threads, applied
-    // to the soft budget only at Threads>1. Defaults are SF's 1.088 / 2.315
-    // instability shape; will want a focused TM-cluster retune-on-branch since
-    // Coda's TM uses the standard opt/hard/max + factor-product shape.
-    // Fixed-point /1000 for the sub-integer precision these multiplicative
-    // constants need.
-    // BASE defaults to 1000 (=1.0), NOT SF's 1088: SF's base is balanced
-    // against SF's OWN factor product; on Coda's already-calibrated product a
-    // >1.0 base would add a blanket ~9% time to EVERY position (settled or not),
-    // contaminating the raw test. At 1.0 the factor is neutral when the pool
-    // agrees and only scales UP on genuine cross-thread churn — the retune can
-    // lift BASE if beneficial. MULT starts at SF's 2.315.
+    // Cross-thread best-move-instability TM factor (a common cross-engine
+    // idea). factor = BASE/1000 + MULT/1000 * (Σ per-thread bmc)/n_threads,
+    // applied to the soft budget only at Threads>1. Wants a focused TM-cluster
+    // retune-on-branch, since Coda's TM uses its own opt/hard/max +
+    // factor-product shape and these defaults have not yet been derived from
+    // our own measurements. Fixed-point /1000 for the sub-integer precision
+    // these multiplicative constants need.
+    // BASE defaults to 1000 (=1.0), i.e. neutral. A >1.0 base would add a
+    // blanket time bonus to EVERY position, settled or not, on top of Coda's
+    // already-calibrated factor product — that contaminates the raw test. At
+    // 1.0 the factor only scales UP on genuine cross-thread churn; a retune
+    // can lift BASE if our own data says it should.
     (TM_BMC_INSTAB_BASE, 1000, 900, 1500, 25.0, false),
     (TM_BMC_INSTAB_MULT, 2315, 500, 4000, 100.0, false),
     // Subtree factor = (BASE/100 - best_move_node_fraction) * 1.4, floor 0.55
@@ -514,9 +513,9 @@ tunables!(
     (SE_ROOT_DECIDED_CP, 716, 250, 5000, 150.0, true),
     (SE_ROOT_DECIDED_DEPTH, 9, 4, 32, 2.0, true),
     (QUIET_CHECK_BONUS, 14805, 2000, 30000, 1400.0, false),
-    // SEE gate on the quiet check bonus (SF movepick.cpp: check bonus only
-    // applies when see_ge(m, -75)). Without it Coda orders losing check-sacs
-    // into the first-searched slot. Margin on Coda's pawn=100 SEE scale:
+    // SEE gate on the quiet check bonus (a common cross-engine idea: only
+    // bonus a check that is not badly losing). Without it Coda orders losing
+    // check-sacs into the first-searched slot. Margin on Coda's pawn=100 scale:
     // a check that loses more than this by SEE gets no ordering bonus.
     (QUIET_CHECK_SEE_MARGIN, 78, 0, 300, 12.0, true),
     // Effective correction magnitude is sum(W) / (DIV * GRAIN_T), so this
@@ -612,10 +611,10 @@ tunables!(
     (PROBCUT_MIN_DEPTH_10X, 15, 10, 120, 15.0, false),     // ProbCut activation gate
     (PROBCUT_ROOT_MIN_DEPTH_10X, 23, 0, 80, 8.0, true),
     (SEE_CAP_DEPTH_10X, 99, 30, 150, 15.0, true),         // SEE capture prune depth cap
-    // Capture-SEE prune margin, SF-shaped (search.cpp): margin = depth*MULT +
-    // capt_hist*HIST/1024, prune if SEE < -margin. MULT is ~1.1 pawn/depth,
-    // toward SF's 0.84; HIST ≈ SF's 34/1024 rescaled for Coda's ±16384
-    // capt-hist range.
+    // Capture-SEE prune margin, a common cross-engine shape: margin =
+    // depth*MULT + capt_hist*HIST/1024, prune if SEE < -margin. MULT is
+    // ~1.1 pawn/depth; HIST is expressed against Coda's own ±16384 capt-hist
+    // range, so both are in our units and SPSA owns them.
     //
     // The capt-hist term is load-bearing, not decoration: it protects
     // historically-good captures (the ones that produce cutoffs) so the base
@@ -796,16 +795,19 @@ pub const MIN_PONDER_ELAPSED_FOR_INSTANT_MS: u64 = 10;
 pub const MIN_POST_PONDERHIT_MS: u64 = 50;
 
 /// Hard-frame extension per root fail-low event in the post-ponderhit frame,
-/// as a percent of the hard budget — the aspiration fail-low factor
-/// (1 + 0.34·min(2, fl), SF shape) applied to the post-hit deadlines.
+/// as a percent of the hard budget — Coda's aspiration fail-low factor
+/// applied to the post-hit deadlines (a capped, linear-in-event-count
+/// inflation; the cap and the percentage below are ours).
 ///
-/// Without it, a post-hit cap clips exactly the fail-low re-thinks: SF spends
-/// >1s post-hit on ~3.3% of moves where we spent none.
+/// Without it, a post-hit cap clips exactly the fail-low re-thinks: reference
+/// engines spend over a second post-hit on a small percentage of moves where
+/// we spent none, and that tail is where the extension earns its keep.
 ///
 /// Consts, DELIBERATELY NOT tunables: OB cannot ponder, so SPSA would detune
 /// them on noise; sweep in a local ponder gauntlet only.
 pub const PH_FL_HARD_EXT_PCT: u64 = 34;
-/// Max fail-low deadline extensions per post-hit search (SF's min(2, fl)).
+/// Max fail-low deadline extensions per post-hit search (the event count is
+/// capped so a storm of shallow misses cannot compound).
 pub const PH_FL_MAX_EXTENSIONS: u32 = 2;
 /// Minimum root depth for a during-post-hit fail-low to trigger a deadline
 /// extension. Without this floor, shallow aspiration-window misses (d4-8) —
@@ -1140,6 +1142,7 @@ pub struct PruneStats {
     pub width_sum_by_depth: [u64; 32],
     pub width_cnt_by_depth: [u64; 32],
     pub ts_lmr_research: u64,
+    pub ts_lmr_failhigh: u64,
     pub ts_asp_fail_low: u64,
     pub ts_asp_fail_high: u64,
 }
@@ -1314,11 +1317,12 @@ pub struct SearchInfo {
     /// FL-EXT v2: the INTENDED FULL soft budget (duration ms, from-go-ponder
     /// frame) this move would get on a plain `go`. Stored by the ponderhit
     /// handler with the deadline group; read by the fail-low extension to
-    /// inflate the optimum SF-style (soft x (1 + 0.34 x min(2, fl))).
+    /// inflate the optimum by the same capped fail-low factor the plain-`go`
+    /// path uses (soft x the factor, with the event count capped).
     pub ponderhit_isoft: std::sync::Arc<AtomicU64>,
     /// FL-EXT v3: MAIN thread's "deep root fail-low unresolved in the
     /// post-hit frame" state. While true, should_stop suspends the
-    /// mid-iteration soft band (hard + abs still bind) — SF semantics: a
+    /// mid-iteration soft band (hard + abs still bind): a
     /// root fail-low revokes the optimum stop entirely; only maximum time
     /// bounds the re-think (the >1s tail source; a soft multiple cannot
     /// reach it: STC intended-soft x1.68 ~ 340ms). Written ONLY by the main
@@ -2083,11 +2087,12 @@ impl SearchInfo {
 /// *point of use*, never before storing to TT — see the comment in
 /// `SearchInfo::eval`.
 ///
-/// Consensus form, shared by the entire reference set — SF `v - v*rule50/199`,
-/// Obsidian/Berserk `(200 - hm)/200`, PlentyChess `(293 - rule50)/293`
-/// — which all HALVE (not zero) the eval at the 50-move cliff. The previous
-/// `(100 - hm)/100` is a 2x outlier that nulls a won eval to 0.00 at the
-/// cliff, and that over-damping has been traced to real won-position draws.
+/// The damp HALVES rather than zeroes the eval at the 50-move cliff, which is
+/// the consensus choice across the engines we surveyed (idea only — the
+/// divisor here is Coda's own). Coda previously used a form that decayed to
+/// zero at the cliff; that nulls a won eval to 0.00 exactly where conversion
+/// technique matters most, and we traced real won-position draws to it. The
+/// halving form keeps a won position won while still discouraging shuffling.
 #[inline]
 fn apply_halfmove_scale(score: i32, halfmove: u16) -> i32 {
     // Leave sentinel scores untouched so downstream comparisons with
@@ -2346,7 +2351,8 @@ fn update_correction_history(info: &mut SearchInfo, board: &Board, search_score:
     // resulting bonus (at the gravity cap, in update_corr_entry). Pre-clamping
     // the error instead — e.g. to ±3cp — turns corrhist into a sign-only
     // integrator, with a max update of 21 against a cap near 341. No surveyed engine
-    // clamps the input error: SF err*depth*12/128, Obsidian err*depth/8, all clamped at the output only.
+    // clamps the input error — every surveyed engine scales the full error by
+    // depth and clamps only at the output.
     let err = search_score - corrected_baseline;
     let weight = (depth + 1).min(tp(&CORR_UPDATE_WEIGHT_MAX));
     let scaled_err = err * weight * 10 / tp(&CORR_ERR_DIV_10X).max(10);
@@ -5379,7 +5385,8 @@ fn negamax(
 
     // Hindsight reduction: when parent was LMR-reduced and both sides
     // think the position is quiet, reduce depth further.
-    // Gate on prior_reduction (Stockfish >= 2, Alexandria >= 1).
+    // Gate on prior_reduction: require the parent to have been cut by at
+    // least 2 plies, so a marginal 1-ply reduction cannot license a second one.
     let prior_reduction = if ply_u >= 1 { info.reductions[ply_u - 1] } else { 0 };
     if !in_check && ply >= 1 && depth >= tp10(&HINDSIGHT_MIN_DEPTH_10X) && ply_u >= 1
         && prior_reduction >= 2
@@ -5621,7 +5628,8 @@ fn negamax(
             if depth >= tp10(&NMP_VERIFY_DEPTH_10X) {
                 info.stats.nmp_verify += 1;
                 // Set ply barrier so NMP cannot fire again inside the verification
-                // subtree. All peer engines do this (Alexandria: nmpPlies = ply + (depth-R)*2/3).
+                // subtree. Every peer engine sets such a barrier; ours spans three
+                // quarters of the depth the verification search itself covers.
                 // Without this, NMP can verify itself, defeating zugzwang detection.
                 let old_nmp_min_ply = info.nmp_min_ply;
                 info.nmp_min_ply = ply + 3 * (depth - r) / 4;
@@ -5719,8 +5727,8 @@ fn negamax(
             probcut_beta
         };
         let pc_tt_see_threshold = (pc_tt_beta - static_eval).max(0);
-        // Improving-conditioned ProbCut depth (SF d6483505) —
-        // bundled near-miss; tuned with the LMP/ProbCut margin cluster.
+        // Improving-conditioned ProbCut depth: search one ply shallower when
+        // improving. Bundled near-miss; tuned with the LMP/ProbCut cluster.
         let pc_depth = depth - 4 - improving as i32;
         let pc_tt_move = if tt_move_noisy
             && is_pseudo_legal(board, tt_move)
@@ -6019,7 +6027,8 @@ fn negamax(
             let threats_adj = any_threat_count * tp(&FUT_THREATS_MARGIN);
             let mc_adj = (move_count * tp(&FUT_MC_PER_MOVE)).min(lmr_d * tp(&FUT_PER_DEPTH));
             let futility_value = static_eval + tp(&FUT_BASE) + lmr_d * tp(&FUT_PER_DEPTH) + hist_adj + threats_adj - mc_adj;
-            // Direct-check carve-out + strong-history exemption (Igel #410).
+            // Direct-check carve-out + strong-history exemption: a move that
+            // gives check, or one our own history rates highly, is not futile.
             if futility_value <= alpha && main_hist < tp(&FUT_HIST_EXEMPT) && !board.gives_direct_check(mv) {
                 trace_gate!(info, board.hash, ply, mv, "futility", depth, move_count);
                 info.stats.futility_prunes += 1;
@@ -6153,7 +6162,10 @@ fn negamax(
                     }
                 } else if tt_score_local >= beta {
                     // TT move fails high and alternatives competitive — strong reduce
-                    // Consensus: -3 non-PV (SF/Obsidian)
+                    // 3 plies at non-PV. A TT move failing high while the
+                    // alternatives stay competitive is the strongest evidence
+                    // we have that a node is NOT singular, so it takes the
+                    // largest negative step we apply anywhere.
                     singular_extension = competitive_se_reduction(-3, singular_score, singular_beta);
                     info.stats.negative_ext += 1;
                 } else if cut_node {
@@ -6335,10 +6347,11 @@ fn negamax(
 
                 // Reduce more at expected cut nodes. A flat +1 at every non-PV
                 // node — not distinguishing expected cut nodes (fail-high) from
-                // all-nodes — leaves Elo on the table; SF reduces ~+4 plies
-                // specifically at cutNode, +1 more with no TT move, and less at
-                // all-nodes. So: cut nodes get the tunable LMR_CUTNODE_BUMP
-                // (+1 if no TT move), all-nodes keep +1.
+                // all-nodes — leaves Elo on the table. The cross-engine idea is
+                // to reduce substantially harder at cut nodes, harder still when
+                // there is no TT move, and less at all-nodes. Coda's form: cut
+                // nodes get the tunable LMR_CUTNODE_BUMP (+1 if no TT move),
+                // all-nodes keep +1. The magnitudes are ours and SPSA owns them.
                 if !is_pv {
                     reduction += if cut_node {
                         tp(&LMR_CUTNODE_BUMP_CENTI) + ((tt_move == NO_MOVE) as i32) * LMR_SCALE
@@ -6439,7 +6452,9 @@ fn negamax(
                 // Continuous history adjustment: good history reduces less, bad more
                 // Uses main history + ply-1 + ply-2 continuation history (consensus).
                 // Ply-2 weighted at half to avoid over-scaling the total.
-                // SF weights main history 2× vs continuation history.
+                // Main history carries twice the weight of a single
+                // continuation ply, since it aggregates over every context
+                // rather than one specific predecessor.
                 let mut hist_score = info.history.main_score(from, to, enemy_attacks) * 2;
                 if moved_piece != NO_PIECE {
                     let gp = go_piece(moved_piece);
@@ -6463,7 +6478,8 @@ fn negamax(
 
                 // Complexity-aware LMR: reduce less when correction history
                 // magnitude is high (uncertain eval → search deeper).
-                // Matches Obsidian: R -= complexity / 120.
+                // Reduce by the corrhist magnitude over a tunable divisor
+                // (LMR_COMPLEXITY_DIV), so the size of the step is ours.
                 //
                 // Compare against `scaled_eval` (pre-correction, post-hm-scale)
                 // so "complexity" measures only the corrhist delta magnitude,
@@ -6632,6 +6648,7 @@ fn negamax(
             // reduction slot after the reduced search).
             info.reductions[ply_u] = 0;
 
+            if lmr_score > alpha { info.stats.ts_lmr_failhigh += 1; }
             if lmr_score > alpha && !info.stop.load(Ordering::Relaxed) {
                 // LMR failed high: doDeeper/doShallower before re-search.
                 //
@@ -6696,6 +6713,7 @@ fn negamax(
                                     let base = cur_cont + main_score_v / 2;
                                     History::update_cont_history_with_base(
                                         &info.cont.t[prior_piece][prior_to][gp_mv][to as usize],
+                                        cur_cont,
                                         base,
                                         ch_b,
                                     );
@@ -6861,6 +6879,7 @@ fn negamax(
                                         let base = cur_cont + main_score_v / 2;
                                         History::update_cont_history_with_base(
                                             &info.cont.t[prior_piece][prior_to][gp_mv][to as usize],
+                                            cur_cont,
                                             base,
                                             ch_bonus,
                                         );
@@ -6907,6 +6926,7 @@ fn negamax(
                                                 let base = cur_cont + q_main_score / 2;
                                                 History::update_cont_history_with_base(
                                                     &info.cont.t[prior_piece][prior_to][gp_q][qt as usize],
+                                                    cur_cont,
                                                     base,
                                                     ch_pen,
                                                 );
@@ -7658,8 +7678,8 @@ fn quiescence_with_depth(
         }
 
         // Skip bad captures (SEE below threshold)
-        // Negative threshold allows slightly losing captures (e.g. BxN)
-        // Obsidian uses -32
+        // Negative threshold allows slightly losing captures (e.g. BxN);
+        // the value is a Coda tunable on our pawn=100 SEE scale.
         if !see_ge(board, mv, tp(&QS_SEE_THRESHOLD)) {
             continue;
         }
@@ -7921,6 +7941,10 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         total_stats.tt_probes += info.stats.tt_probes;
         // These two were accumulated per search but never summed here, so the
         // bench readout could not show them (2026-09-06 audit).
+        total_stats.ts_lmr_research += info.stats.ts_lmr_research;
+        total_stats.ts_lmr_failhigh += info.stats.ts_lmr_failhigh;
+        // ts_lmr_research was collected but never merged, so it read 0 in every
+        // bench report that touched it.
         total_stats.ts_asp_fail_low += info.stats.ts_asp_fail_low;
         total_stats.ts_asp_fail_high += info.stats.ts_asp_fail_high;
         total_stats.tt_hits += info.stats.tt_hits;
@@ -8009,6 +8033,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
     // audit). Games say the narrow window is optimal regardless -- the
     // re-searches are cheap -- but the rate should stay visible.
     eprintln!("Asp fail-low:   {:>8}  fail-high: {}", s.ts_asp_fail_low, s.ts_asp_fail_high);
+    eprintln!("LMR fail-high:  {:>8}  ({:.1}% of LMR searches); deepened re-searches: {}",
+        s.ts_lmr_failhigh, 100.0 * s.ts_lmr_failhigh as f64 / s.lmr_searches.max(1) as f64, s.ts_lmr_research);
     eprintln!("NMP attempts:   {:>8}  cutoffs: {} ({:.0}%)", s.nmp_attempts, s.nmp_cutoffs,
         if s.nmp_attempts > 0 { s.nmp_cutoffs as f64 / s.nmp_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("RFP cutoffs:    {:>8}  ({:.1}% of nodes)", s.rfp_cutoffs, s.rfp_cutoffs as f64 / total_nodes as f64 * 100.0);

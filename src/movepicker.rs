@@ -178,10 +178,20 @@ impl History {
     /// technique from Stormphrax — gravity uses the move's combined signal strength
     /// instead of just the cell's own value, so cont-hist can converge
     /// even when main_hist already encodes the move's quality.
-    pub fn update_cont_history_with_base(entry: &std::sync::atomic::AtomicI16, base: i32, bonus: i32) {
+    ///
+    /// `cur` is the caller's ALREADY-LOADED value of `entry`. It is passed in
+    /// rather than re-loaded because the caller also needs it to build `base`,
+    /// and this table is shared across threads: two loads of one shared entry
+    /// can straddle another thread's store, which would compute the gravity
+    /// pull-back from one value and apply the increment to a different one.
+    /// Gravity is self-limiting only when the pull-back is proportional to the
+    /// value being written, so the two must be the same read. Before the tables
+    /// were shared both reads were per-thread and equal by construction; taking
+    /// the caller's value restores that by construction and drops one atomic
+    /// load from a hot path. Threads=1 is bit-identical either way.
+    pub fn update_cont_history_with_base(entry: &std::sync::atomic::AtomicI16, cur: i32, base: i32, bonus: i32) {
         let clamped = bonus.clamp(-MAX_HISTORY, MAX_HISTORY);
-        let val = entry.load(std::sync::atomic::Ordering::Relaxed) as i32;
-        let new_val = val + clamped - base * clamped.abs() / MAX_HISTORY;
+        let new_val = cur + clamped - base * clamped.abs() / MAX_HISTORY;
         entry.store(new_val.clamp(-32000, 32000) as i16, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -742,7 +752,7 @@ impl MovePicker {
                 score += escape_bonus_by_pt[pt.min(7) as usize];
             }
 
-            // Quiet check bonus: moves that give direct check (SF +16384).
+            // Quiet check bonus: moves that give direct check.
             // SEE-gated like SF: a check that loses material by more
             // than QUIET_CHECK_SEE_MARGIN is a losing sac — don't order it first.
             if piece != NO_PIECE
@@ -862,8 +872,9 @@ impl MovePicker {
                 //
                 // The (1<<20) base makes the capture band uncrossable: quiet
                 // history sums span ±80k, so a smaller offset lets a hot quiet
-                // outrank a fresh capture of the checker. SF uses 1<<28,
-                // Berserk 1e7. mvv+captHist still order within the band.
+                // outrank a fresh capture of the checker. The constant only
+                // has to dominate the mvv+captHist range, which still orders
+                // moves within the band.
                 (1 << 20) + mvv_lva(board, m) + capt_hist_score_static(board, history, m)
             } else if is_promotion(m) {
                 if flags == FLAG_PROMOTE_Q {

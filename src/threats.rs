@@ -592,7 +592,7 @@ struct ThreatTables {
 
 // Two feature spaces are built at startup and the loaded net selects one:
 //   king-attacker ON  = 66,864 features (legacy/current prod nets)
-//   king-attacker OFF = 60,144 features (matches SF SFNNv13 full_threats.h
+//   king-attacker OFF = 60,144 features (matches the current Stockfish net
 //                       and Hobbes 3.0, both of which exclude the king as a
 //                       threat ATTACKER; king-as-victim was never tracked)
 // The net header's num_threat_features IS the marker — no extra flag bit.

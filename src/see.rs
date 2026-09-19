@@ -57,7 +57,7 @@ pub fn see_ge(board: &Board, mv: Move, threshold: i32) -> bool {
     }
 
     // Iterative SEE — remove initial attacker from occupied.
-    // `to` is cleared too (SF: "xoring to is important for pinned piece logic"):
+    // `to` is cleared too, which the pinned-piece logic depends on:
     // when the captured piece IS a pinner, the pin dissolves and the formerly
     // pinned defender may recapture. Cleared with & ! (not ^) because `to` is
     // empty for EP and for quiet/non-capture promotions.

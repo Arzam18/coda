@@ -416,7 +416,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
             }
             "treestats" => {
                 // Tree-shape counter dump, same line format as the
-                // instrumented-SF build (~/chess/instr-stockfish). Counters
+                // instrumented reference build. Counters
                 // reset per `go` (Coda convention) — dump after each search.
                 // Join a finished search first: `go` moves the SearchInfo
                 // into the search thread; without this we'd dump the UCI
