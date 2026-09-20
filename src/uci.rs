@@ -247,7 +247,8 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
     let mut stop_flag = info.stop.clone(); // keep a handle to signal stop from UCI loop
     let mut ponderhit_flag = info.ponderhit_time.clone(); // shared ponderhit hard deadline
     let mut ponderhit_soft_flag = info.ponderhit_soft.clone(); // shared ponderhit soft deadline
-    let mut ponderhit_floor_flag = info.ponderhit_floor.clone(); // shared ponderhit min think
+    let mut ponderhit_floor_flag = info.ponderhit_floor.clone(); // shared post-hit think slice
+    let mut ponderhit_stock_flag = info.ponderhit_stockpile.clone(); // shared anti-stockpile floor
     let mut ponderhit_isoft_flag = info.ponderhit_isoft.clone(); // FL-EXT v2: intended full soft
     let mut ponderhit_abs_flag = info.ponderhit_abs.clone(); // shared in-flight forfeit guard
     let mut ponder_depth_flag = info.ponder_depth.clone(); // ponder search's completed depth
@@ -387,6 +388,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                         ponderhit_flag = info.ponderhit_time.clone();
                         ponderhit_soft_flag = info.ponderhit_soft.clone();
                         ponderhit_floor_flag = info.ponderhit_floor.clone();
+                        ponderhit_stock_flag = info.ponderhit_stockpile.clone();
                         ponderhit_isoft_flag = info.ponderhit_isoft.clone();
                         ponderhit_abs_flag = info.ponderhit_abs.clone();
                         ponder_depth_flag = info.ponder_depth.clone();
@@ -703,6 +705,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 ponderhit_flag.store(0, Ordering::Release);
                 ponderhit_soft_flag.store(0, Ordering::Relaxed);
                 ponderhit_floor_flag.store(0, Ordering::Relaxed);
+                ponderhit_stock_flag.store(0, Ordering::Relaxed);
                 ponderhit_isoft_flag.store(0, Ordering::Relaxed);
                 ponderhit_abs_flag.store(0, Ordering::Relaxed);
                 // Clear the instant-reply gate inputs (P1) so a stale depth /
@@ -713,8 +716,11 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 // only reads. Double-ponderhit guard: a ponderhit arriving
                 // before the new ponder search stores a real depth reads 0
                 // here → instant reply structurally blocked.
-                ponder_depth_flag.store(0, Ordering::Relaxed);
+                // Stability first, depth last (Release) — the same publish
+                // order the search thread uses, so depth stays the flag that
+                // validates the pair.
                 ponder_stab_flag.store(0, Ordering::Relaxed);
+                ponder_depth_flag.store(0, Ordering::Release);
                 root_fail_low_flag.store(false, Ordering::Relaxed);
                 // Clear the abandon-ponder suppress flag — this new search
                 // owns its bestmove emit. Set right before spawn so any value
@@ -742,6 +748,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 ponderhit_flag = search_info.ponderhit_time.clone();
                 ponderhit_soft_flag = search_info.ponderhit_soft.clone();
                 ponderhit_floor_flag = search_info.ponderhit_floor.clone();
+                ponderhit_stock_flag = search_info.ponderhit_stockpile.clone();
                 ponderhit_isoft_flag = search_info.ponderhit_isoft.clone();
                 ponderhit_abs_flag = search_info.ponderhit_abs.clone();
                 ponder_depth_flag = search_info.ponder_depth.clone();
@@ -861,6 +868,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                                 si.ponderhit_time.store(0, std::sync::atomic::Ordering::Release);
                                 si.ponderhit_soft.store(0, std::sync::atomic::Ordering::Relaxed);
                                 si.ponderhit_floor.store(0, std::sync::atomic::Ordering::Relaxed);
+                                si.ponderhit_stockpile.store(0, std::sync::atomic::Ordering::Relaxed);
                                 // (abs is re-armed via fresh_limits.abs_clock
                                 // below — the fresh search's own plain-field
                                 // guard takes over.)
@@ -1130,13 +1138,27 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                             crate::search::ponder_enabled());
 
                         // Instant-reply gate inputs (P1): the ponder search's
-                        // completed root depth and root fail-low state.
-                        // Relaxed loads — independent gate values, stale-
-                        // conservative by construction (see search.rs docs).
+                        // completed root depth, its best-move stability, and
+                        // root fail-low state.
+                        //
+                        // Depth and stability are a PAIR (the gate uses depth
+                        // for its floor and stability to index INSTANT_STAB_PCT),
+                        // published by the search thread as stability (Relaxed)
+                        // then depth (Release). So load depth FIRST with
+                        // Acquire and stability only after: the Acquire pairs
+                        // with that Release, so any depth we act on carries the
+                        // stability stored beside it. Reading them the other way
+                        // round can pair a fresh depth with a stale stability on
+                        // aarch64 — and the stale direction that matters is the
+                        // unsafe one, letting a just-destabilised root instant-
+                        // emit against the settled threshold.
+                        //
+                        // fail-low stays Relaxed: an independent bool gate with
+                        // no data dependency on the pair (see search.rs docs).
                         let ponder_depth =
-                            ponder_depth_flag.load(Ordering::Relaxed) as i32;
-                        let failing_low = root_fail_low_flag.load(Ordering::Relaxed);
+                            ponder_depth_flag.load(Ordering::Acquire) as i32;
                         let ponder_stab = ponder_stab_flag.load(Ordering::Relaxed);
+                        let failing_low = root_fail_low_flag.load(Ordering::Relaxed);
 
                         // Very low time (< 2s with no inc): instant stop.
                         if hard <= overhead && our_inc == 0 && our_time < 2000 {
@@ -1194,8 +1216,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                             // ponderhit_credit_pct() is 100 unless
                             // PonderhitCreditPct was explicitly set (local
                             // A/B only).
-                            let _ = floor;
-                            let (deadline, soft_deadline, store_floor, abs_deadline) = {
+                            let (deadline, soft_deadline, store_floor, store_stock, abs_deadline) = {
                                 let credited = elapsed
                                     .saturating_mul(crate::search::ponderhit_credit_pct())
                                     / 100;
@@ -1241,17 +1262,31 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                                 let reserve = overhead + FORFEIT_MARGIN_MS;
                                 let abs = elapsed
                                     + our_time.saturating_sub(reserve).max(1);
-                                (elapsed + hard_eff.max(10), elapsed + post_min, post_min, abs)
+                                // Anti-stockpile floor, kept SEPARATE from the
+                                // post-hit slice. `floor` is exactly what
+                                // compute_tm_budgets hands the plain-`go` path
+                                // — deliberately tiny, so the end-of-search
+                                // stockpile sleep is a no-op unless the ID loop
+                                // finished almost immediately. Publishing
+                                // `post_min` in its place (what the single
+                                // shared field used to do) made the ID loop's
+                                // soft_floor equal to its soft_limit, because
+                                // the soft deadline IS elapsed + post_min.
+                                // Capped at the slice so the floor can never
+                                // outlive the budget it floors.
+                                let stock = floor.min(post_min);
+                                (elapsed + hard_eff.max(10), elapsed + post_min, post_min,
+                                 stock, abs)
                             };
                             // Publish protocol (required by the ARM memory
                             // model): the deadline group is read by the
                             // search thread assuming mutual consistency, so
                             // it must be PUBLISHED atomically-enough: store
-                            // floor, soft and abs FIRST (Relaxed is fine —
-                            // they are inert until hard is seen), then hard
-                            // (ponderhit_flag) LAST with Release. Every
+                            // slice, stockpile, soft and abs FIRST (Relaxed is
+                            // fine — they are inert until hard is seen), then
+                            // hard (ponderhit_flag) LAST with Release. Every
                             // reader loads hard with Acquire first and only
-                            // then reads soft/floor/abs. With all-Relaxed and
+                            // then reads the rest. With all-Relaxed and
                             // hard stored first, an ARM reader could
                             // see soft > 0 with stale floor == 0 (stockpile
                             // floor erased → instant-emit class) or hard set
@@ -1259,6 +1294,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                             // targets the HARD deadline → overspends the
                             // full 46% window when ponder finished early).
                             ponderhit_floor_flag.store(store_floor, Ordering::Relaxed);
+                            ponderhit_stock_flag.store(store_stock, Ordering::Relaxed);
                             ponderhit_soft_flag.store(soft_deadline, Ordering::Relaxed);
                             ponderhit_isoft_flag.store(soft, Ordering::Relaxed);
                             ponderhit_abs_flag.store(abs_deadline, Ordering::Relaxed);
@@ -1303,6 +1339,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                         ponderhit_flag = info.ponderhit_time.clone();
                         ponderhit_soft_flag = info.ponderhit_soft.clone();
                         ponderhit_floor_flag = info.ponderhit_floor.clone();
+                        ponderhit_stock_flag = info.ponderhit_stockpile.clone();
                         ponderhit_isoft_flag = info.ponderhit_isoft.clone();
                         ponderhit_abs_flag = info.ponderhit_abs.clone();
                         ponder_depth_flag = info.ponder_depth.clone();

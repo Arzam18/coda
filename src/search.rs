@@ -825,6 +825,10 @@ pub const PH_FL_MAX_EXTENSIONS: u32 = 2;
 /// which are routine noise — burn the entire extension budget within
 /// milliseconds. Only a fail-low at a real search frontier signals genuine
 /// destabilization.
+///
+/// EXTENSION ONLY. This is an argument about spending the budget, so it does
+/// not gate the `ph_fl_active` soft-band suspension, which is a correctness
+/// guard (see `ph_fl_on_root_fail_low`).
 pub const PH_FL_MIN_DEPTH: i32 = 10;
 
 /// stopOnPonderhit-class instant-reply decision (SF stopOnPonderhit
@@ -1074,49 +1078,132 @@ impl SearchLimits {
     }
 }
 
-/// Pruning counters for diagnostics.
-#[derive(Default)]
-pub struct PruneStats {
-    pub tt_probes: u64,
-    pub tt_hits: u64,
-    pub tt_cross_gen_hits: u64,
-    pub tt_cross_gen_cutoffs: u64,
-    pub tt_cutoffs: u64,
-    pub tt_near_miss: u64,
-    pub nmp_attempts: u64,
-    pub nmp_cutoffs: u64,
-    pub nmp_verify: u64,
-    pub nmp_verify_fail: u64,
-    pub rfp_cutoffs: u64,
-    pub razor_cutoffs: u64,
-    pub lmp_prunes: u64,
-    pub futility_prunes: u64,
-    pub see_prunes: u64,
-    pub probcut_cutoffs: u64,
-    pub lmr_searches: u64,
-    pub singular_ext: u64,
-    pub double_ext: u64,
-    pub negative_ext: u64,
-    pub multicut: u64,
-    pub qnodes: u64,
-    pub beta_cutoffs: u64,
-    pub first_move_cutoffs: u64,
+/// Element-wise accumulation for one `PruneStats` field, so the merge below
+/// can be generated instead of hand-listed. Implemented for the scalar counter
+/// and, recursively, for arrays of counters, which covers every field shape the
+/// struct uses ([u64; N] and [[u64; N]; M]).
+trait StatField {
+    fn stat_add(&mut self, other: &Self);
+    /// Set every counter in the field to `v` (test support for the
+    /// every-field-merged guard).
+    #[cfg(test)]
+    fn stat_fill(&mut self, v: u64);
+    /// Sum of the field's counters, and how many there are.
+    #[cfg(test)]
+    fn stat_sum(&self) -> u64;
+    #[cfg(test)]
+    fn stat_cells(&self) -> usize;
+}
+
+impl StatField for u64 {
+    #[inline]
+    fn stat_add(&mut self, other: &Self) { *self += *other; }
+    #[cfg(test)]
+    fn stat_fill(&mut self, v: u64) { *self = v; }
+    #[cfg(test)]
+    fn stat_sum(&self) -> u64 { *self }
+    #[cfg(test)]
+    fn stat_cells(&self) -> usize { 1 }
+}
+
+impl<T: StatField, const N: usize> StatField for [T; N] {
+    #[inline]
+    fn stat_add(&mut self, other: &Self) {
+        for i in 0..N { self[i].stat_add(&other[i]); }
+    }
+    #[cfg(test)]
+    fn stat_fill(&mut self, v: u64) { for c in self.iter_mut() { c.stat_fill(v); } }
+    #[cfg(test)]
+    fn stat_sum(&self) -> u64 { self.iter().map(|c| c.stat_sum()).sum() }
+    #[cfg(test)]
+    fn stat_cells(&self) -> usize { self.iter().map(|c| c.stat_cells()).sum() }
+}
+
+/// Declares `PruneStats` and generates its merge from the same field list.
+///
+/// The bench aggregates 48 per-position `PruneStats` into one total, and that
+/// used to be a hand-written list of `total += info.stats.field` lines. A field
+/// missing from the list aggregated as 0 — indistinguishable from a code path
+/// that never ran, which is the worst possible failure mode for a diagnostic
+/// counter, and it had already happened once (ts_lmr_research read 0 in every
+/// bench report that touched it, 2026-09-06). Generating the struct and
+/// `merge_from` from one list makes that impossible: a counter can only exist
+/// by being declared here, and declaring it here merges it.
+macro_rules! prune_stats {
+    ($($name:ident : $ty:ty),* $(,)?) => {
+        /// Pruning counters for diagnostics.
+        #[derive(Default)]
+        pub struct PruneStats {
+            $(pub $name: $ty,)*
+        }
+
+        impl PruneStats {
+            /// Accumulate `other` into `self`, counter by counter. Plain
+            /// addition, as the hand-written bench merge used — this changes
+            /// how the totals are assembled, never what any counter means.
+            pub fn merge_from(&mut self, other: &PruneStats) {
+                $(self.$name.stat_add(&other.$name);)*
+            }
+
+            /// Every counter set to `v` — test support only.
+            #[cfg(test)]
+            fn filled_for_test(v: u64) -> PruneStats {
+                let mut s = PruneStats::default();
+                $(s.$name.stat_fill(v);)*
+                s
+            }
+
+            /// (field name, sum of its counters, how many counters it has) for
+            /// every field — test support only.
+            #[cfg(test)]
+            fn field_sums_for_test(&self) -> Vec<(&'static str, u64, usize)> {
+                vec![$((stringify!($name), self.$name.stat_sum(), self.$name.stat_cells()),)*]
+            }
+        }
+    };
+}
+
+prune_stats! {
+    tt_probes: u64,
+    tt_hits: u64,
+    tt_cross_gen_hits: u64,
+    tt_cross_gen_cutoffs: u64,
+    tt_cutoffs: u64,
+    tt_near_miss: u64,
+    nmp_attempts: u64,
+    nmp_cutoffs: u64,
+    nmp_verify: u64,
+    nmp_verify_fail: u64,
+    rfp_cutoffs: u64,
+    razor_cutoffs: u64,
+    lmp_prunes: u64,
+    futility_prunes: u64,
+    see_prunes: u64,
+    probcut_cutoffs: u64,
+    lmr_searches: u64,
+    singular_ext: u64,
+    double_ext: u64,
+    negative_ext: u64,
+    multicut: u64,
+    qnodes: u64,
+    beta_cutoffs: u64,
+    first_move_cutoffs: u64,
     // fh1 source split: [tt_move, noisy, quiet]
-    pub cut_by_source: [u64; 3],
-    pub first_cut_by_source: [u64; 3],
+    cut_by_source: [u64; 3],
+    first_cut_by_source: [u64; 3],
     // fh1 conditioned on TT-move presence: [no_tt, has_tt]
-    pub cut_by_ttpresence: [u64; 2],
-    pub first_cut_by_ttpresence: [u64; 2],
+    cut_by_ttpresence: [u64; 2],
+    first_cut_by_ttpresence: [u64; 2],
     // RFP-audit FP bucketed by corr-source spread (cp): [<8, 8-24, >=24]
-    pub rfp_audit_var_attempts: [u64; 3],
-    pub rfp_audit_var_fp: [u64; 3],
-    pub cut_quiet_rank1: u64,
-    pub cut_quiet_rank_sum: u64,
+    rfp_audit_var_attempts: [u64; 3],
+    rfp_audit_var_fp: [u64; 3],
+    cut_quiet_rank1: u64,
+    cut_quiet_rank_sum: u64,
     // Dual-net dispatch instrumentation: |material-proxy| buckets of 100
     // SEE units, index 11 = 1100+.
-    pub dualnet_evals: [u64; 12],
-    pub dualnet_abseval: [u64; 12],
-    pub dualnet_neareq: [u64; 12],
+    dualnet_evals: [u64; 12],
+    dualnet_abseval: [u64; 12],
+    dualnet_neareq: [u64; 12],
     // Fail-low node histogram, indexed
     // [depth band 0-2][margin band 0-3][quiet-count band 0-3]:
     // depth {<=4, 5-8, >=9}, margin {<50, 50-150, 150-300, >=300}cp,
@@ -1126,36 +1213,36 @@ pub struct PruneStats {
     // v10 net 2026-08-17: the tail at margin>=150 (the only safely prunable
     // part) is ~1% of all move-searches, so that idea is closed. Kept
     // because it is the standing measurement of fail-low node shape.
-    pub b_probe_nodes: [[u64; 16]; 3],
-    pub b_probe_quiets: [[u64; 16]; 3],
-    pub b_probe_late: [[u64; 16]; 3],
-    pub moves_searched: u64,
+    b_probe_nodes: [[u64; 16]; 3],
+    b_probe_quiets: [[u64; 16]; 3],
+    b_probe_late: [[u64; 16]; 3],
+    moves_searched: u64,
     // Move ordering quality: sum of move_count² at beta cutoff (lower = better ordering)
-    pub cutoff_movecount_sq_sum: u64,
-    pub cutoff_movecount_sum: u64,
+    cutoff_movecount_sq_sum: u64,
+    cutoff_movecount_sum: u64,
     // RFP false-positive audit (diagnostic, env RFP_AUDIT=1). At each RFP
     // cutoff, additionally run an NMP-style null-move verification (same R
     // formula as real NMP) and count cutoffs the null search REJECTS
     // (null_score < beta), bucketed by remaining depth. Answers "is RFP's
     // expanded habitat cutting nodes a dynamic threat check would refuse?"
     // Behavior-preserving: the RFP cutoff is returned regardless.
-    pub rfp_audit_attempts: [u64; 24],
-    pub rfp_audit_fp: [u64; 24],
+    rfp_audit_attempts: [u64; 24],
+    rfp_audit_fp: [u64; 24],
     // TREESTATS parity counters, for tree-shape comparison against an
     // instrumented SF build; dumped by the UCI `treestats` command in the same
     // line format that patch emits. Bucket 0 = qsearch;
     // interior nodes bucket by ENTRY depth min(31) — same convention both
     // sides so per-depth lines stay mutually consistent. Reset per `go`
     // (Coda's existing stats convention; harness dumps after each go).
-    pub nodes_by_depth: [u64; 32],
-    pub cuts_by_depth: [u64; 32],
-    pub first_cuts_by_depth: [u64; 32],
-    pub width_sum_by_depth: [u64; 32],
-    pub width_cnt_by_depth: [u64; 32],
-    pub ts_lmr_research: u64,
-    pub ts_lmr_failhigh: u64,
-    pub ts_asp_fail_low: u64,
-    pub ts_asp_fail_high: u64,
+    nodes_by_depth: [u64; 32],
+    cuts_by_depth: [u64; 32],
+    first_cuts_by_depth: [u64; 32],
+    width_sum_by_depth: [u64; 32],
+    width_cnt_by_depth: [u64; 32],
+    ts_lmr_research: u64,
+    ts_lmr_failhigh: u64,
+    ts_asp_fail_low: u64,
+    ts_asp_fail_high: u64,
 }
 
 /// Forced-move detection state (set by `detect_forced_move`).
@@ -1320,19 +1407,41 @@ pub struct SearchInfo {
     /// enable dynamic TM post-ponderhit (so stable positions don't burn the
     /// full hard deadline at deep iterations).
     pub ponderhit_soft: std::sync::Arc<AtomicU64>,
-    /// Ponderhit: minimum think time post-ponderhit (relative duration in
-    /// ms — typically ≈ increment-overhead). Floors the dynamically-scaled
-    /// soft so we still spend some time after a ponderhit even when the
-    /// position is rock-solid (prevents instant-emit).
+    /// Ponderhit: the length of the post-hit think SLICE (relative duration
+    /// in ms) — the whole budget the move gets once the hit lands, i.e.
+    /// intended soft minus the credited ponder, floored at
+    /// `MIN_POST_PONDERHIT_MS` and capped at hard. Read by `should_stop` as
+    /// the width of the mid-iteration soft band, and by the fail-low
+    /// extension for the same purpose.
+    ///
+    /// This is NOT the anti-stockpile floor — that is `ponderhit_stockpile`.
+    /// The two were one field, and because the soft deadline is
+    /// `elapsed + slice`, the arming block's `soft_floor = slice` made
+    /// soft_floor and soft_limit structurally equal for every ponder length;
+    /// a settled position (factor product below 1.0) then broke the ID loop
+    /// early and slept out the remainder, spending the same clock on strictly
+    /// less search.
     pub ponderhit_floor: std::sync::Arc<AtomicU64>,
+    /// Ponderhit: the ANTI-STOCKPILE floor (relative duration in ms) for the
+    /// post-hit search — `compute_tm_budgets`' small `soft_floor`, which the
+    /// ponderhit handler previously computed and discarded. Deliberately tiny
+    /// so the end-of-search stockpile sleep is a no-op unless the ID loop
+    /// finished almost instantly (the case the sleep exists for: instant
+    /// emits growing the clock instead of spending it).
+    ///
+    /// Published with the rest of the deadline group (Relaxed store before
+    /// the hard `ponderhit_time` Release store; readers Acquire hard first).
+    pub ponderhit_stockpile: std::sync::Arc<AtomicU64>,
     /// FL-EXT v2: the INTENDED FULL soft budget (duration ms, from-go-ponder
     /// frame) this move would get on a plain `go`. Stored by the ponderhit
     /// handler with the deadline group; read by the fail-low extension to
     /// inflate the optimum by the same capped fail-low factor the plain-`go`
     /// path uses (soft x the factor, with the event count capped).
     pub ponderhit_isoft: std::sync::Arc<AtomicU64>,
-    /// FL-EXT v3: MAIN thread's "deep root fail-low unresolved in the
-    /// post-hit frame" state. While true, should_stop suspends the
+    /// FL-EXT v3: MAIN thread's "root fail-low unresolved in the
+    /// post-hit frame" state (armed at any root depth, and independently of
+    /// the `ph_fl_extensions` deadline-inflation budget — it is a safety
+    /// guard, not a spend). While true, should_stop suspends the
     /// mid-iteration soft band (hard + abs still bind): a
     /// root fail-low revokes the optimum stop entirely; only maximum time
     /// bounds the re-think (the >1s tail source; a soft multiple cannot
@@ -1379,6 +1488,8 @@ pub struct SearchInfo {
     pub root_fail_low: std::sync::Arc<AtomicBool>,
     /// Completed search depth (shared atomic). Updated by search thread after
     /// each completed iteration. Read by UCI thread on ponderhit to scale budget.
+    /// Also the publish flag for the (depth, stability) pair: stored LAST with
+    /// Release, after `ponder_stability`, and loaded FIRST with Acquire.
     pub ponder_depth: std::sync::Arc<AtomicU64>,
     /// FL-EXT: count of fail-low deadline extensions granted in THIS post-hit
     /// search (main thread only writes; capped at PH_FL_MAX_EXTENSIONS).
@@ -1390,6 +1501,9 @@ pub struct SearchInfo {
     /// scales its elapsed-vs-soft threshold by the SAME stability table the
     /// dynamic TM uses (SF arms stopOnPonderhit against its instability-
     /// inflated optimum — an unstable-but-deep ponder must NOT instant-emit).
+    /// Published from the SAME iteration as `ponder_depth` and before it
+    /// (Relaxed store, Release store on depth) — the two are consumed as a
+    /// pair and a stability lagging its depth by one iteration is unsafe.
     pub ponder_stability: std::sync::Arc<AtomicU64>,
     pub sel_depth: i32,
     pub last_score: i32,
@@ -1520,6 +1634,7 @@ impl SearchInfo {
             ponderhit_time: std::sync::Arc::new(AtomicU64::new(0)),
             ponderhit_soft: std::sync::Arc::new(AtomicU64::new(0)),
             ponderhit_floor: std::sync::Arc::new(AtomicU64::new(0)),
+            ponderhit_stockpile: std::sync::Arc::new(AtomicU64::new(0)),
             ponderhit_isoft: std::sync::Arc::new(AtomicU64::new(0)),
             ph_fl_active: std::sync::Arc::new(AtomicBool::new(false)),
             tm_baseline: 0,
@@ -1777,6 +1892,84 @@ impl SearchInfo {
         false
     }
 
+    /// Post-ponderhit root fail-low bookkeeping. Main thread only (helpers
+    /// are silent, and their aspiration state must not clobber the shared
+    /// flag). Inert outside a post-hit frame, where `ponderhit_time` is 0.
+    ///
+    /// TWO INDEPENDENT MECHANISMS, deliberately no longer sharing a gate:
+    ///
+    /// 1. SAFETY — `ph_fl_active`. While the main thread's root fail-low is
+    ///    unresolved, `should_stop` suspends the mid-iteration soft band so
+    ///    the shared soft stopper cannot cut the root re-search exactly while
+    ///    the root conclusion is collapsing (a fail-low leaves `pv_len[0]`
+    ///    empty, so a cut there restores the stable PV and emits the
+    ///    PRE-collapse move). Hard and absolute deadlines keep binding, and
+    ///    the flag self-clears the moment the window resolves, so the cost of
+    ///    arming it is bounded by how long the re-search takes.
+    ///
+    /// 2. BUDGET — `ph_fl_extensions`, capped at PH_FL_MAX_EXTENSIONS. Each
+    ///    event inflates the post-hit deadlines in the from-go-ponder frame:
+    ///      allowed(from go ponder) = intended_soft x (1 + PH_FL_HARD_EXT_PCT n)
+    ///    The cap is what stops a storm of misses compounding the deadline,
+    ///    and PH_FL_MIN_DEPTH keeps routine shallow aspiration noise from
+    ///    burning that budget in milliseconds. Long ponders (elapsed already
+    ///    past the inflated optimum) correctly get nothing. Every push
+    ///    saturates at `ponderhit_abs` — the forfeit wall never moves.
+    ///
+    /// These were nested, so a spent budget silently revoked the safety for
+    /// the rest of the search, and the depth floor — an argument about budget,
+    /// not about correctness — withheld it below PH_FL_MIN_DEPTH. Meanwhile
+    /// `root_fail_low`, the UCI-side half of the very same veto, is published
+    /// unconditionally just above the call site. The two halves disagreed, and
+    /// only under a rare enough interleaving to stay invisible. The safety now
+    /// arms on its own terms, which is also what makes the two halves agree at
+    /// every depth and after any number of events; the budget still caps the
+    /// deadline extension exactly as before.
+    fn ph_fl_on_root_fail_low(&mut self) {
+        if self.silent {
+            return;
+        }
+        let ph_hard = self.ponderhit_time.load(Ordering::Acquire);
+        if ph_hard == 0 {
+            return; // not a post-ponderhit frame
+        }
+        // (1) SAFETY. Cleared in the aspiration loop's resolve branch; a
+        // mid-fail-low abort leaves it true harmlessly — the search is ending
+        // anyway and the next search resets it.
+        self.ph_fl_active.store(true, Ordering::Relaxed);
+
+        // (2) BUDGET.
+        if self.ph_fl_extensions >= PH_FL_MAX_EXTENSIONS
+            || self.root_depth < PH_FL_MIN_DEPTH
+        {
+            return;
+        }
+        let isoft = self.ponderhit_isoft.load(Ordering::Relaxed);
+        let abs = self.ponderhit_abs.load(Ordering::Relaxed);
+        let clamp_abs = |v: u64| if abs > 0 { v.min(abs) } else { v };
+        let n = (self.ph_fl_extensions + 1) as u64;
+        let inflated = isoft.saturating_mul(100 + PH_FL_HARD_EXT_PCT * n) / 100;
+        let cur_soft = self.ponderhit_soft.load(Ordering::Relaxed);
+        let new_soft = clamp_abs(inflated.max(cur_soft));
+        if new_soft > cur_soft {
+            self.ph_fl_extensions += 1;
+            let slice = self.ponderhit_floor.load(Ordering::Relaxed)
+                .max(MIN_POST_PONDERHIT_MS);
+            let new_hard = clamp_abs(ph_hard.max(new_soft.saturating_add(slice)));
+            self.tm_max_time = self.tm_max_time
+                .max(new_hard.saturating_sub(self.tm_baseline));
+            // A1 publish order: soft Relaxed first, hard (the publish flag)
+            // Release last.
+            self.ponderhit_soft.store(new_soft, Ordering::Relaxed);
+            self.ponderhit_time.store(new_hard, Ordering::Release);
+            if TM_DEBUG.load(Ordering::Relaxed) {
+                eprintln!(
+                    "PH_FL_EXT n={} depth={} isoft={}ms soft->{}ms hard->{}ms abs={}ms",
+                    self.ph_fl_extensions, self.root_depth, isoft, new_soft, new_hard, abs);
+            }
+        }
+    }
+
     pub fn clear_correction_history(&mut self) {
         self.corr.clear();
     }
@@ -1792,6 +1985,33 @@ impl SearchInfo {
         self.cont.clear();
         self.clear_pawn_hist();
         self.clear_correction_history();
+    }
+
+    /// Read and clear the cross-thread best-move-change slots, returning the
+    /// total. This is a ONE-ITERATION window: every completed root iteration
+    /// that changes a thread's best move adds one to that thread's slot, and
+    /// the consumer (`bmc_instability_factor`) divides by the thread count, so
+    /// "every thread changed once" — total == num_threads — is the intended
+    /// maximum. The drain therefore has to happen once per root iteration,
+    /// unconditionally; see the call site in `search`.
+    ///
+    /// `swap(AcqRel)` and not `Relaxed`: the writers publish with `Release`
+    /// (main's own slot and every helper's), so the drain needs the paired
+    /// `Acquire` to be guaranteed to observe them on a weakly-ordered target
+    /// such as aarch64, and the `Release` half so a helper's next `fetch_add`
+    /// cannot be reordered ahead of the zeroing it must follow.
+    ///
+    /// Not gated on `num_threads > 1`, because the write side is not: main
+    /// adds to slot 0 on every root best-move change whatever the thread
+    /// count, while the per-search reset runs only on the threads > 1 path.
+    /// An ungated drain is what keeps slot 0 from accumulating across a whole
+    /// single-threaded game.
+    pub fn take_bmc_window(&self) -> u32 {
+        let mut total: u32 = 0;
+        for slot in self.thread_bmc.iter().take(self.num_threads.max(1)) {
+            total = total.saturating_add(slot.swap(0, Ordering::AcqRel));
+        }
+        total
     }
 
     #[cfg(test)]
@@ -2578,6 +2798,7 @@ pub(crate) fn create_helper_info(main: &SearchInfo) -> SearchInfo {
     helper.ponderhit_time = main.ponderhit_time.clone();
     helper.ponderhit_soft = main.ponderhit_soft.clone();
     helper.ponderhit_floor = main.ponderhit_floor.clone();
+    helper.ponderhit_stockpile = main.ponderhit_stockpile.clone();
     helper.ponderhit_isoft = main.ponderhit_isoft.clone();
     helper.ph_fl_active = main.ph_fl_active.clone();
     // Share the in-flight post-ponderhit forfeit guard too (same rationale as
@@ -2650,6 +2871,7 @@ fn refresh_helper_common(helper: &mut SearchInfo, main: &SearchInfo) {
     helper.ponderhit_time = main.ponderhit_time.clone();
     helper.ponderhit_soft = main.ponderhit_soft.clone();
     helper.ponderhit_floor = main.ponderhit_floor.clone();
+    helper.ponderhit_stockpile = main.ponderhit_stockpile.clone();
     helper.ponderhit_isoft = main.ponderhit_isoft.clone();
     helper.ph_fl_active = main.ph_fl_active.clone();
     helper.ponderhit_abs = main.ponderhit_abs.clone(); // in-flight forfeit guard
@@ -2769,6 +2991,29 @@ pub(crate) fn nnue_net_identity(info: &SearchInfo) -> usize {
         .as_ref()
         .map(|n| std::sync::Arc::as_ptr(n) as *const () as usize)
         .unwrap_or(0)
+}
+
+/// Dynamic-TM factor 6: cross-thread best-move instability (Threads > 1 only).
+///
+/// `window` is one iteration's best-move changes summed over the pool (see
+/// `SearchInfo::take_bmc_window`), normalized by the thread count so the factor
+/// means "what fraction of the pool changed its mind this iteration", not "how
+/// many threads are running". Scales time UP when the pool is collectively
+/// still churning — main may have momentarily settled while helpers disagree,
+/// which its own stability table cannot see.
+///
+/// With the live knobs (TM_BMC_INSTAB_BASE 1000, TM_BMC_INSTAB_MULT 2315) the
+/// per-iteration range is 1.00 (nobody changed) to 1.00 + 2.315 = 3.32 (every
+/// thread changed). That ceiling is a property of the window being ONE
+/// iteration wide: a window that banks several iterations of changes has no
+/// bound and saturates the multiplier product against tm_max_time.
+fn bmc_instability_factor(window: u32, num_threads: usize) -> f64 {
+    if num_threads <= 1 {
+        return 1.0;
+    }
+    let base = tp(&TM_BMC_INSTAB_BASE) as f64 / 1000.0;
+    let mult = tp(&TM_BMC_INSTAB_MULT) as f64 / 1000.0;
+    base + mult * (window as f64) / (num_threads as f64)
 }
 
 /// Compute time-management budgets from clock state. Returns
@@ -3533,8 +3778,11 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     // a ponderhit racing this line reads 0/false, which conservatively
     // blocks the instant reply. Stale values from the PREVIOUS search must
     // never satisfy the gate (double-ponderhit guard).
-    info.ponder_depth.store(0, std::sync::atomic::Ordering::Relaxed);
+    // Same store order as the per-iteration publish below: stability first,
+    // depth (the consumer's Acquire flag) last, so the invalidating depth == 0
+    // can never be observed alongside a stability from a previous search.
     info.ponder_stability.store(0, std::sync::atomic::Ordering::Relaxed);
+    info.ponder_depth.store(0, std::sync::atomic::Ordering::Release);
     info.root_fail_low.store(false, std::sync::atomic::Ordering::Relaxed);
     if !info.silent {
         info.ph_fl_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -3594,9 +3842,39 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     // soft_limit setter also sets it) — it is one refactor away from being a
     // stale clamp.
     info.tm_max_time = 0;
+    // The clock-classification pair was previously left OUT of this reset and
+    // written only by the `our_time > 0` branch below, so on any other branch
+    // it described a search that had already finished. Reset with the rest of
+    // the group; the branches that need it set it.
+    info.tm_our_inc = 0;
+    info.tm_time_left = 0;
 
     if limits.infinite {
-        // Already zero above.
+        // No budget is in force: soft/hard/floor stay zero from the reset
+        // above, and every dynamic-TM consumer is gated on `soft_limit > 0`.
+        //
+        // But RECORD the clock classification when the GUI supplied a clock.
+        // `go ponder` carries the real wtime/btime/winc/binc — uci.rs only
+        // forces `infinite` on the copy it hands the search — and our clock
+        // does not tick while we ponder, so these are exactly the inputs the
+        // post-ponderhit arming block will later budget from. Leaving them at
+        // the reset defaults left `tm_no_inc` false at a genuinely
+        // no-increment TC, which sent the post-hit multiplier ceiling down the
+        // inc-cover branch with an increment of zero — a branch that exists to
+        // discriminate SMALL increments and was never sized for the absence of
+        // one. Classifying here fixes that without touching any budget.
+        //
+        // Inert for plain `go infinite` analysis (nothing ever sets
+        // soft_limit there) and for the bench, which supplies no clock at all.
+        if our_time > 0 {
+            info.tm_our_inc = our_inc;
+            info.tm_time_left = our_time.saturating_sub(info.move_overhead).max(1);
+            // Same predicate as the `our_time > 0` branch below — one
+            // definition of "no increment", evaluated from the clocks the GUI
+            // actually supplied rather than from whatever the previous search
+            // left behind.
+            info.tm_no_inc = our_inc == 0 && limits.movestogo == 0;
+        }
     } else if limits.movetime > 0 {
         info.time_limit = limits.movetime;
         // Respect caller-supplied minimum think time (ponderhit fresh-search uses
@@ -3749,7 +4027,15 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 let soft_remaining = ph_soft.saturating_sub(now).max(1);
                 let hard_remaining = if ph > now { ph - now } else { soft_remaining };
                 let hard_remaining = hard_remaining.max(soft_remaining);
-                let floor = info.ponderhit_floor.load(std::sync::atomic::Ordering::Relaxed)
+                // Anti-stockpile floor — NOT the post-hit slice. The slice
+                // (`ponderhit_floor`) is what `should_stop` bands against and
+                // is by construction the whole remaining budget, so using it
+                // here pinned soft_floor to soft_limit: every ID-loop break
+                // below 1.0× soft landed in the stockpile sleep instead of a
+                // deeper iteration. `ponderhit_stockpile` is
+                // `compute_tm_budgets`' own small floor, capped at the
+                // remaining budget so it can never exceed it.
+                let floor = info.ponderhit_stockpile.load(std::sync::atomic::Ordering::Relaxed)
                     .min(soft_remaining);
                 info.tm_baseline = now;
                 info.soft_limit = soft_remaining;
@@ -3811,57 +4097,11 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                     // below. Relaxed: independent bool gate, no dependent
                     // data (see field doc).
                     info.root_fail_low.store(true, std::sync::atomic::Ordering::Relaxed);
-                    // Fail-low extension, during-post-hit half: a root
-                    // fail-low at a REAL search frontier (depth floor below)
-                    // inflates the intended optimum SF-style and re-publishes
-                    // the post-hit soft deadline in the from-go-ponder frame:
-                    //   allowed(from go ponder) = intended_soft x (1 + 0.34 n)
-                    // Long ponders (elapsed already past the inflated
-                    // optimum) correctly get nothing -- SF stops promptly
-                    // there too; short-ponder deep fail-lows get the >1s
-                    // re-think tail (SF: 3.3% of post-hit moves; we had
-                    // 0.0%). Main thread only; at most PH_FL_MAX_EXTENSIONS
-                    // effective events (SF's min(2, fl)); every push
-                    // saturates at ponderhit_abs -- the forfeit wall never
-                    // moves.
-                    if !info.silent
-                        && info.ph_fl_extensions < PH_FL_MAX_EXTENSIONS
-                        && info.root_depth >= PH_FL_MIN_DEPTH
-                    {
-                        let ph_hard = info.ponderhit_time.load(std::sync::atomic::Ordering::Acquire);
-                        if ph_hard > 0 {
-                            // v3: suspend the soft band until this fail-low
-                            // resolves (cleared in the resolve branch below;
-                            // a mid-fail-low abort leaves it true harmlessly
-                            // — the search is ending anyway and the next
-                            // search resets it).
-                            info.ph_fl_active.store(true, std::sync::atomic::Ordering::Relaxed);
-                            let isoft = info.ponderhit_isoft.load(std::sync::atomic::Ordering::Relaxed);
-                            let abs = info.ponderhit_abs.load(std::sync::atomic::Ordering::Relaxed);
-                            let clamp_abs = |v: u64| if abs > 0 { v.min(abs) } else { v };
-                            let n = (info.ph_fl_extensions + 1) as u64;
-                            let inflated = isoft.saturating_mul(100 + PH_FL_HARD_EXT_PCT * n) / 100;
-                            let cur_soft = info.ponderhit_soft.load(std::sync::atomic::Ordering::Relaxed);
-                            let new_soft = clamp_abs(inflated.max(cur_soft));
-                            if new_soft > cur_soft {
-                                info.ph_fl_extensions += 1;
-                                let slice = info.ponderhit_floor.load(std::sync::atomic::Ordering::Relaxed)
-                                    .max(MIN_POST_PONDERHIT_MS);
-                                let new_hard = clamp_abs(ph_hard.max(new_soft.saturating_add(slice)));
-                                info.tm_max_time = info.tm_max_time
-                                    .max(new_hard.saturating_sub(info.tm_baseline));
-                                // A1 publish order: soft Relaxed first, hard
-                                // (the publish flag) Release last.
-                                info.ponderhit_soft.store(new_soft, std::sync::atomic::Ordering::Relaxed);
-                                info.ponderhit_time.store(new_hard, std::sync::atomic::Ordering::Release);
-                                if TM_DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
-                                    eprintln!(
-                                        "PH_FL_EXT n={} depth={} isoft={}ms soft->{}ms hard->{}ms abs={}ms",
-                                        info.ph_fl_extensions, info.root_depth, isoft, new_soft, new_hard, abs);
-                                }
-                            }
-                        }
-                    }
+                    // Search-side half of the same veto, plus the post-hit
+                    // deadline extension: see ph_fl_on_root_fail_low, which
+                    // keeps the soft-band suspension (safety) and the
+                    // deadline inflation (a capped budget) independent.
+                    info.ph_fl_on_root_fail_low();
                     // Fail low: contract beta aggressively toward alpha, widen alpha
                     beta = (3 * alpha + 5 * beta) / 8;
                     alpha = (result - delta).max(-INFINITY);
@@ -3976,8 +4216,74 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
         info.root_decided = depth >= tp(&SE_ROOT_DECIDED_DEPTH)
             && !is_decisive(score)
             && score.abs() >= tp(&SE_ROOT_DECIDED_CP);
-        info.ponder_depth.store(depth as u64, std::sync::atomic::Ordering::Relaxed);
+
+        // Track best-move stability and score trend on every iteration so
+        // that ponder iterations accumulate TM state — when ponderhit fires
+        // mid-deep-search, dynamic TM (below) can immediately see "best move
+        // has been stable for N iterations" and scale down accordingly. With
+        // tracking gated behind `soft_limit > 0`, ponderhit started cold
+        // (tm_best_stable = 0, stability_factor = 1.71) and the dynamic
+        // adjustment couldn't bite.
+        //
+        // This runs HERE, before the ponder pair is published below, because
+        // the instant-reply gate consumes (depth, stability) as a pair: it
+        // must see this iteration's stability, not the previous one's. Its
+        // inputs (`best_move`, `prev_score`) are both settled above and are
+        // not touched again anywhere in the rest of the loop body, and
+        // nothing between here and its old position reads the TM state it
+        // writes, so the move is behaviour-preserving — including the
+        // MultiPV>1 secondary-line searches, whose negamax calls never read
+        // tm_* state.
+        let score_drop = if depth >= 4 {
+            if info.tm_has_data {
+                if best_move == info.tm_prev_best {
+                    info.tm_best_stable += 1;
+                } else {
+                    info.tm_best_stable = 0;
+                    // Cumulative count of root best-move changes since
+                    // search start. Drives an upward multiplier on tactically
+                    // unstable positions (Stockfish's best-move-instability
+                    // multiplier pattern).
+                    info.tm_best_move_changes = info.tm_best_move_changes.saturating_add(1);
+                    // Publish main's change into its own slot (thread 0) of the
+                    // cross-thread bmc array (concept from SF). Read+reset in the TM block.
+                    info.thread_bmc[0].fetch_add(1, Ordering::Release);
+                }
+            }
+            let drop = if info.tm_has_data && !is_mate_score(prev_score) && !is_mate_score(info.tm_prev_score) {
+                info.tm_prev_score - prev_score
+            } else {
+                0
+            };
+            info.tm_prev_best = best_move;
+            info.tm_prev_score = prev_score;
+            info.tm_has_data = true;
+            drop
+        } else {
+            0
+        };
+
+        // Publish the instant-reply gate's (depth, stability) pair for this
+        // iteration. They are consumed TOGETHER by should_instant_reply —
+        // depth feeds the minimum-depth floor, stability indexes
+        // INSTANT_STAB_PCT — so a mismatched pair is not merely stale, it is
+        // unsafe in one direction: a root best-move CHANGE resets stability to
+        // 0, and pairing that iteration's depth with the pre-reset stability
+        // would score a ponderhit against the settled threshold and let a
+        // one-iteration-old move instant-emit, which is exactly what the gate
+        // exists to veto.
+        //
+        // Ordering follows the protocol the ponderhit deadline trio already
+        // uses in this file: the dependent field first (Relaxed), then the
+        // flag the consumer keys off LAST with Release. Depth is the flag —
+        // the gate rejects depth < MIN_PONDER_DEPTH_FOR_INSTANT, so a reader
+        // that has not yet observed a real depth never uses the stability
+        // beside it. The UCI thread loads depth with Acquire and reads
+        // stability only after; that pairs with this Release. Relaxed on both
+        // would leave the window unbounded on aarch64, where the store order
+        // is not otherwise guaranteed.
         info.ponder_stability.store(info.tm_best_stable.max(0) as u64, std::sync::atomic::Ordering::Relaxed);
+        info.ponder_depth.store(depth as u64, std::sync::atomic::Ordering::Release);
 
         // Snapshot the completed iteration's pv_table[0] so a future
         // mid-iteration interrupt can restore consistency between best_move
@@ -4099,16 +4405,34 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
         // one, so once either is proved there is no better move left to find
         // and the remaining think time is pure waste. Placed AFTER this
         // iteration's `info` line so the GUI still receives the score and PV.
-        // Only under time management: an `infinite`/analysis search must keep
-        // reporting, and fixed-node or fixed-depth runs have their own
-        // contract. `score` is a completed iteration's settled value here.
+        // Only when a clock is actually in force: an `infinite`/analysis search
+        // must keep reporting, and fixed-node or fixed-depth runs have their
+        // own contract. `score` is a completed iteration's settled value here.
+        //
+        // The gate asks "is a clock binding this search NOW", not "was this
+        // search started as infinite". Those are not the same question on the
+        // ponder path, which is the path this break exists for: `go ponder`
+        // sets `limits.infinite` and never clears it, and the post-ponderhit
+        // arming above publishes soft/hard/floor/baseline but deliberately not
+        // `time_limit` (the ponder deadlines live in the atomics so the UCI
+        // thread can publish them into a running search). A gate phrased around
+        // the `infinite` flag is therefore unreachable for the whole lifetime
+        // of a pondered move.
+        //
+        // `ponderhit_time` is the deadline trio's publish flag, so it is both
+        // the earliest and the only universal "our clock has started" signal —
+        // in particular the `go ponder movetime` hit publishes nothing else.
+        // Load it with Acquire like every other reader of that flag. Genuine
+        // analysis (`go infinite` with no hit) has both terms zero and stays
+        // protected.
         //
         // The failure this removes is losing a won game on the clock while the
         // engine re-proves a mate it already holds — a deployment problem our
         // SPRT harness cannot see, because adjudication ends those games first.
-        if !limits.infinite && info.time_limit > 0
-            && score.abs() >= MATE_IN_MAX_PLY
+        if score.abs() >= MATE_IN_MAX_PLY
             && MATE_SCORE - score.abs() <= 2
+            && (info.time_limit > 0
+                || info.ponderhit_time.load(std::sync::atomic::Ordering::Acquire) > 0)
         {
             break;
         }
@@ -4167,41 +4491,8 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
             info.pv_len[0] = saved_len;
         }
 
-        // Track best-move stability and score trend on every iteration so
-        // that ponder iterations accumulate TM state — when ponderhit fires
-        // mid-deep-search, dynamic TM (below) can immediately see "best move
-        // has been stable for N iterations" and scale down accordingly. With
-        // tracking gated behind `soft_limit > 0`, ponderhit started cold
-        // (tm_best_stable = 0, stability_factor = 1.71) and the dynamic
-        // adjustment couldn't bite.
-        let score_drop = if depth >= 4 {
-            if info.tm_has_data {
-                if best_move == info.tm_prev_best {
-                    info.tm_best_stable += 1;
-                } else {
-                    info.tm_best_stable = 0;
-                    // Cumulative count of root best-move changes since
-                    // search start. Drives an upward multiplier on tactically
-                    // unstable positions (Stockfish's best-move-instability
-                    // multiplier pattern).
-                    info.tm_best_move_changes = info.tm_best_move_changes.saturating_add(1);
-                    // Publish main's change into its own slot (thread 0) of the
-                    // cross-thread bmc array (concept from SF). Read+reset in the TM block.
-                    info.thread_bmc[0].fetch_add(1, Ordering::Release);
-                }
-            }
-            let drop = if info.tm_has_data && !is_mate_score(prev_score) && !is_mate_score(info.tm_prev_score) {
-                info.tm_prev_score - prev_score
-            } else {
-                0
-            };
-            info.tm_prev_best = best_move;
-            info.tm_prev_score = prev_score;
-            info.tm_has_data = true;
-            drop
-        } else {
-            0
-        };
+        // (Best-move stability and score trend are tracked earlier in this
+        // loop body, before the ponder pair is published — see there.)
 
         // Forced-move detection. Once-per-search verification
         // that the chosen best move is meaningfully better than all alternatives.
@@ -4241,6 +4532,17 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
         // 10+0.1, where `inc == overhead == 100ms` makes soft_floor 0 by
         // coincidence — that disabled the forced-move detector at STC for
         // about -3 Elo.
+        //
+        // Post-ponderhit reachability: `soft_floor` used to be armed to the
+        // whole post-hit slice, which made `floor_dominates` unconditionally
+        // true and kept the detector off the ponder path entirely — an
+        // accidental guard, not a designed one. Now that soft_floor is the
+        // small anti-stockpile value, the detector IS reachable after a
+        // ponderhit, and `tm_no_inc` is the gate that has to hold. That is why
+        // the infinite branch of start_search classifies the clock: on the
+        // ponder path `tm_no_inc` was forced false, so a no-increment TC would
+        // otherwise have run the detector for the first time on exactly the
+        // configuration the no-inc gate was added for.
         let floor_dominates = info.soft_floor * 3 >= info.soft_limit;
         let no_inc = info.tm_no_inc;
         if info.tm_forced_state == ForcedState::None
@@ -4283,6 +4585,32 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 };
             }
         }
+
+        // Drain the cross-thread best-move-change slots on EVERY completed
+        // iteration, before the dynamic-TM block below may or may not consume
+        // them. The slots are a one-iteration window (see take_bmc_window);
+        // draining inside the TM block instead made the window as wide as the
+        // gap between two iterations that both satisfy
+        // `soft_limit > 0 && depth >= 4 && !should_stop()`.
+        //
+        // That gap is the whole ponder. `go ponder` runs with soft_limit == 0
+        // (UCI marks the search infinite and no budget exists until
+        // ponderhit), so every ponder iteration's changes piled into one
+        // window and the FIRST post-ponderhit iteration read them as though a
+        // single iteration had produced them. With the live knobs the intended
+        // per-iteration maximum is 1.00 + 2.315 = 3.32; a 30-iteration ponder
+        // on 4 threads banking ~30 changes gives 1.00 + 2.315 * 30/4 = 18.4,
+        // which pins the factor product at the increment ceiling and then at
+        // tm_max_time — roughly one extra iteration of spend, at the frontier
+        // about a doubling of the first post-hit iteration. Depths 1-3 and
+        // stopped iterations bank the same way, just narrower.
+        //
+        // Unconditional rather than a one-shot drain at the post-ponderhit
+        // arming block: arming is one of several ways to skip the TM block,
+        // and this keeps the invariant "the slots hold changes since main's
+        // previous completed iteration" true on every path, including
+        // Threads == 1 where the write side is ungated too.
+        let bmc_window = info.take_bmc_window();
 
         // Dynamic TM: a multiplicative factor product applied to the soft
         // budget, clamped to max_time — there is no separate cap. A bounded
@@ -4426,24 +4754,10 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
             // Combined multiplier — the standard factors + score-trend + cross-thread.
             // Max product ~ 2.50 × 1.68 × 1.0 × 2.27 × 1.45 = 13.8×
             // Min product ~ 0.75 × 1.0  × 0.386 × 0.87 × 0.80 = 0.20×
-            // Factor 6: cross-thread best-move instability (concept from SF, Threads>1
-            // only). Sum this iteration's best-move changes across ALL threads,
-            // normalize by thread count, and scale time UP when the pool is
-            // collectively still churning — main may have momentarily settled
-            // while helpers disagree, which its own stability table can't see.
-            // Reset the per-thread slots after reading (per-iteration window).
-            let cross_thread_instability = if info.num_threads > 1 {
-                let n = info.num_threads;
-                let mut total: u32 = 0;
-                for slot in info.thread_bmc.iter().take(n) {
-                    total = total.saturating_add(slot.swap(0, Ordering::AcqRel));
-                }
-                let base = tp(&TM_BMC_INSTAB_BASE) as f64 / 1000.0;
-                let mult = tp(&TM_BMC_INSTAB_MULT) as f64 / 1000.0;
-                base + mult * (total as f64) / (n as f64)
-            } else {
-                1.0
-            };
+            // Factor 6: cross-thread best-move instability (concept from SF,
+            // Threads>1 only) — this iteration's pool-wide best-move changes,
+            // drained above. See `bmc_instability_factor`.
+            let cross_thread_instability = bmc_instability_factor(bmc_window, info.num_threads);
 
             let mut multiplier = stability_multiplier
                 * failed_low_multiplier
@@ -7957,67 +8271,11 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         let _mv = search(&mut board, &mut info, &limits);
         total_nodes += info.nodes;
 
-        // Accumulate stats across all positions
-        total_stats.tt_probes += info.stats.tt_probes;
-        // These two were accumulated per search but never summed here, so the
-        // bench readout could not show them (2026-09-06 audit).
-        total_stats.ts_lmr_research += info.stats.ts_lmr_research;
-        total_stats.ts_lmr_failhigh += info.stats.ts_lmr_failhigh;
-        // ts_lmr_research was collected but never merged, so it read 0 in every
-        // bench report that touched it.
-        total_stats.ts_asp_fail_low += info.stats.ts_asp_fail_low;
-        total_stats.ts_asp_fail_high += info.stats.ts_asp_fail_high;
-        total_stats.tt_hits += info.stats.tt_hits;
-        total_stats.tt_cross_gen_hits += info.stats.tt_cross_gen_hits;
-        total_stats.tt_cross_gen_cutoffs += info.stats.tt_cross_gen_cutoffs;
-        total_stats.tt_cutoffs += info.stats.tt_cutoffs;
-        total_stats.tt_near_miss += info.stats.tt_near_miss;
-        total_stats.nmp_attempts += info.stats.nmp_attempts;
-        total_stats.nmp_cutoffs += info.stats.nmp_cutoffs;
-        total_stats.rfp_cutoffs += info.stats.rfp_cutoffs;
-        total_stats.lmp_prunes += info.stats.lmp_prunes;
-        total_stats.futility_prunes += info.stats.futility_prunes;
-        total_stats.see_prunes += info.stats.see_prunes;
-        total_stats.probcut_cutoffs += info.stats.probcut_cutoffs;
-        total_stats.lmr_searches += info.stats.lmr_searches;
-        total_stats.singular_ext += info.stats.singular_ext;
-        total_stats.double_ext += info.stats.double_ext;
-        total_stats.negative_ext += info.stats.negative_ext;
-        total_stats.multicut += info.stats.multicut;
-        total_stats.qnodes += info.stats.qnodes;
-        total_stats.beta_cutoffs += info.stats.beta_cutoffs;
-        total_stats.first_move_cutoffs += info.stats.first_move_cutoffs;
-        for i in 0..3 {
-            total_stats.cut_by_source[i] += info.stats.cut_by_source[i];
-            total_stats.first_cut_by_source[i] += info.stats.first_cut_by_source[i];
-            total_stats.rfp_audit_var_attempts[i] += info.stats.rfp_audit_var_attempts[i];
-            total_stats.rfp_audit_var_fp[i] += info.stats.rfp_audit_var_fp[i];
-        }
-        for i in 0..2 {
-            total_stats.cut_by_ttpresence[i] += info.stats.cut_by_ttpresence[i];
-            total_stats.first_cut_by_ttpresence[i] += info.stats.first_cut_by_ttpresence[i];
-        }
-        total_stats.cut_quiet_rank1 += info.stats.cut_quiet_rank1;
-        total_stats.cut_quiet_rank_sum += info.stats.cut_quiet_rank_sum;
-        for i in 0..12 {
-            total_stats.dualnet_evals[i] += info.stats.dualnet_evals[i];
-            total_stats.dualnet_abseval[i] += info.stats.dualnet_abseval[i];
-            total_stats.dualnet_neareq[i] += info.stats.dualnet_neareq[i];
-        }
-        for d in 0..3 {
-            for i in 0..16 {
-                total_stats.b_probe_nodes[d][i] += info.stats.b_probe_nodes[d][i];
-                total_stats.b_probe_quiets[d][i] += info.stats.b_probe_quiets[d][i];
-                total_stats.b_probe_late[d][i] += info.stats.b_probe_late[d][i];
-            }
-        }
-        total_stats.moves_searched += info.stats.moves_searched;
-        total_stats.cutoff_movecount_sum += info.stats.cutoff_movecount_sum;
-        total_stats.cutoff_movecount_sq_sum += info.stats.cutoff_movecount_sq_sum;
-        for d in 0..24 {
-            total_stats.rfp_audit_attempts[d] += info.stats.rfp_audit_attempts[d];
-            total_stats.rfp_audit_fp[d] += info.stats.rfp_audit_fp[d];
-        }
+        // Accumulate stats across all positions. Generated from the field
+        // list of the `prune_stats!` declaration, so a counter added there is
+        // aggregated here by construction — the hand-written merge this
+        // replaced could silently total a live counter as 0.
+        total_stats.merge_from(&info.stats);
 
         // Accumulate EBF data across all positions
         let max_d = info.completed_depth as usize;
@@ -8425,6 +8683,98 @@ mod tests {
         assert_eq!(board.hash, hash);
     }
 
+    /// A `go ponder` search is infinite with no clock, so `soft_limit` stays 0
+    /// for its whole duration and the dynamic-TM block — which used to be the
+    /// only place the cross-thread best-move-change slots were drained — never
+    /// runs. The slots are a ONE-ITERATION window, so the root loop has to
+    /// drain them itself; otherwise the first post-ponderhit iteration inherits
+    /// every ponder iteration's churn as if it were its own.
+    ///
+    /// The limits below are that shape (infinite, no clock), and the slots are
+    /// pre-loaded as a long ponder would leave them.
+    #[test]
+    fn root_iterations_drain_the_cross_thread_bmc_window() {
+        crate::init();
+        let Some(net) = test_net_path() else {
+            eprintln!("Skipping root_iterations_drain_the_cross_thread_bmc_window: \
+                       no NNUE net found (set CODA_TEST_NET or fetch the net.txt net)");
+            return;
+        };
+        let mut info = SearchInfo::new(16);
+        info.load_nnue(&net).unwrap();
+        info.silent = true;
+        const THREADS: usize = 4;
+        const PONDER_ITERS: u32 = 30;
+        info.num_threads = THREADS;
+        // A 30-iteration ponder on 4 threads with every thread changing its
+        // best move every iteration — the worst case a ponder can bank.
+        for slot in info.thread_bmc.iter().take(THREADS) {
+            slot.store(PONDER_ITERS, Ordering::Relaxed);
+        }
+        let limits = SearchLimits {
+            depth: 6,
+            fixed_depth: true,
+            infinite: true,
+            ..SearchLimits::new()
+        };
+        assert_eq!(limits.movetime, 0, "the ponder shape has no clock");
+        let mut board = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let _ = search(&mut board, &mut info, &limits);
+        assert_eq!(info.soft_limit, 0, "this search must have no soft limit, or it is not the ponder path");
+        let left: u32 = info.thread_bmc.iter().take(THREADS)
+            .map(|s| s.load(Ordering::Acquire)).sum();
+        assert_eq!(left, 0,
+                   "root iterations must drain the cross-thread bmc window even with no soft limit; \
+                    {} changes were still banked for the first post-ponderhit iteration", left);
+    }
+
+    /// The instability factor is normalized by thread count, so "every thread
+    /// changed once" is one fixed ceiling at any `Threads` setting — and a
+    /// window that banks N iterations of that is N times as far above the idle
+    /// rail, with no bound of its own. That is the whole reason the drain has
+    /// to happen once per iteration.
+    #[test]
+    fn bmc_instability_ceiling_is_one_change_per_thread() {
+        let idle = bmc_instability_factor(0, 2);
+        let ceiling = bmc_instability_factor(2, 2);
+        assert!(ceiling > idle, "a churning pool must ask for more time, not less");
+        for n in [2usize, 4, 8, 16, 64] {
+            assert_eq!(bmc_instability_factor(0, n), idle, "idle rail must not depend on thread count");
+            assert!((bmc_instability_factor(n as u32, n) - ceiling).abs() < 1e-9,
+                    "one change per thread must be the same ceiling at Threads={}", n);
+            // 30 banked iterations of the ceiling window sit 30 increments
+            // above the idle rail — unbounded in the window width.
+            let banked = bmc_instability_factor(30 * n as u32, n);
+            assert!((banked - idle - 30.0 * (ceiling - idle)).abs() < 1e-9,
+                    "an undrained window scales linearly past the ceiling at Threads={}", n);
+            assert!(banked > 5.0 * ceiling, "30 banked iterations must be far past the per-iteration ceiling");
+        }
+        // Threads <= 1 has no cross-thread signal: the factor is inert, even
+        // though main writes its own slot at every thread count.
+        assert_eq!(bmc_instability_factor(30, 1), 1.0);
+        assert_eq!(bmc_instability_factor(30, 0), 1.0);
+    }
+
+    /// Every `PruneStats` counter must survive the bench merge. The generated
+    /// `merge_from` makes omission impossible — a counter exists only by being
+    /// in the `prune_stats!` field list, and being in that list is what merges
+    /// it — so this guards the per-shape `stat_add` implementations that
+    /// generation rests on: fill one set of counters with 1 and another with 2,
+    /// merge, and every single counter (not just every field) must read 3.
+    #[test]
+    fn bench_merge_covers_every_prune_stats_counter() {
+        let mut a = PruneStats::filled_for_test(1);
+        let b = PruneStats::filled_for_test(2);
+        a.merge_from(&b);
+        let fields = a.field_sums_for_test();
+        assert!(fields.len() > 40, "field list looks truncated: {} fields", fields.len());
+        for (name, sum, cells) in fields {
+            assert!(cells > 0, "field {} reports no counters", name);
+            assert_eq!(sum, 3 * cells as u64,
+                       "field {} did not merge every counter ({} over {} counters)", name, sum, cells);
+        }
+    }
+
     #[test]
     fn competitive_se_relaxes_only_boundary_fail_highs() {
         assert_eq!(competitive_se_reduction(-3, 20, 20), -2);
@@ -8698,6 +9048,182 @@ mod tests {
         }
     }
 
+    /// The ponderhit instant-reply gate consumes `ponder_depth` and
+    /// `ponder_stability` as a PAIR: depth feeds the minimum-depth floor and
+    /// stability indexes `INSTANT_STAB_PCT`. Both must therefore describe the
+    /// SAME completed iteration.
+    ///
+    /// They used not to: the pair was published before the iteration's
+    /// best-move stability was recomputed, so the stability shipped alongside
+    /// depth D was the one settled at D-1. The dangerous half is the root
+    /// best-move CHANGE: the counter resets to 0 only after the high pre-reset
+    /// value has already been published, so a ponderhit arriving right then was
+    /// scored against the settled 0.75x threshold instead of the unstable
+    /// 1.71x one, and could instant-emit a move that had survived exactly one
+    /// iteration.
+    #[test]
+    fn test_ponder_pair_published_from_same_iteration() {
+        use crate::board::Board;
+
+        crate::init();
+        let net_path = match super::test_net_path() {
+            Some(p) => p,
+            None => { eprintln!("Skipping ponder-pair test: no NNUE net found"); return; }
+        };
+        let mut info = SearchInfo::new(16);
+        info.silent = true;
+        if let Err(e) = info.load_nnue(&net_path) {
+            eprintln!("Skipping ponder-pair test: net load failed: {}", e);
+            return;
+        }
+
+        // Italian/Two Knights tabiya: the root best move genuinely changes
+        // across iterations here, which is the only case the lag can be
+        // observed in (a root that never changes keeps the counter monotone).
+        let mut board = Board::from_fen(
+            "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+
+        let limits = SearchLimits {
+            depth: 10, // >= MIN_PONDER_DEPTH_FOR_INSTANT, so the gate is live
+            fixed_depth: true,
+            movetime: 0,
+            wtime: 0, btime: 0, winc: 0, binc: 0,
+            movestogo: 0, nodes: 0, infinite: false,
+            movetime_floor: 0,
+            min_think_ms: 0,
+            abs_clock: 0,
+        };
+
+        search(&mut board, &mut info, &limits);
+
+        let published_depth = info.ponder_depth.load(Ordering::Acquire) as i32;
+        let published_stab = info.ponder_stability.load(Ordering::Relaxed) as i32;
+
+        assert_eq!(
+            published_depth, info.completed_depth,
+            "ponder_depth = {} but the last completed iteration was depth {} — \
+             the instant-reply gate would apply its minimum-depth floor to a \
+             depth the search never finished",
+            published_depth, info.completed_depth
+        );
+        assert_eq!(
+            published_stab, info.tm_best_stable.max(0),
+            "ponder_depth = {} was published with stability {}, but the \
+             stability settled at that depth is {} — the pair is consumed \
+             together, so a ponderhit here would index INSTANT_STAB_PCT with a \
+             previous iteration's stability and could instant-emit a root move \
+             that has survived only one iteration",
+            published_depth, published_stab, info.tm_best_stable.max(0)
+        );
+    }
+
+    /// Bound for the two mate-in-one break probes below. Any value comfortably
+    /// past the depth at which a mate in one is proved works; it only exists so
+    /// the negative control terminates.
+    const MATE_PROBE_MAX_DEPTH: i32 = 12;
+
+    /// Shared driver for the mate-in-one early-break tests.
+    ///
+    /// Both probes run the PONDER shape — `go ponder` sets `limits.infinite`
+    /// and nothing ever clears it, before or after the hit — and differ only in
+    /// whether a ponderhit has been published. `ponderhit_ms` is the hard
+    /// deadline to publish (0 = no hit at all, i.e. plain analysis). It is
+    /// stored with Release exactly as the UCI ponderhit handler stores it,
+    /// since it is the deadline trio's publish flag.
+    ///
+    /// Returns the deepest completed iteration, which is the observable: the
+    /// break leaves the loop at the mate-proving iteration, so `completed_depth`
+    /// distinguishes "fired" from "did not fire" without reference to any
+    /// wall clock.
+    fn mate_in_one_break_probe(net_path: &str, ponderhit_ms: u64) -> (i32, i32) {
+        use crate::board::Board;
+        let mut info = SearchInfo::new(16);
+        info.silent = true;
+        info.load_nnue(net_path).expect("net load");
+        // White to move; Ra1-a8 is mate in one. The black king's only flight
+        // squares are covered by its own pawns and by the rank the rook seizes.
+        let mut board = Board::from_fen("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1");
+        // A deadline far past anything this probe can take keeps the loop's own
+        // ponderhit deadline checks inert, so the ONLY thing that can end the
+        // search before MATE_PROBE_MAX_DEPTH is the break under test. Publishing
+        // only `hard` (soft/floor stay 0) is the `go ponder movetime` hit shape,
+        // which additionally keeps `soft_limit` at 0 — that in turn keeps the
+        // older stability-gated mate early-emit out of the picture, so a firing
+        // break can only be this one.
+        info.ponderhit_time.store(ponderhit_ms, std::sync::atomic::Ordering::Release);
+        let limits = SearchLimits {
+            depth: MATE_PROBE_MAX_DEPTH,
+            infinite: true,
+            ..SearchLimits::new()
+        };
+        let _ = search(&mut board, &mut info, &limits);
+        (info.completed_depth, info.last_score)
+    }
+
+    /// POSITIVE: the mate-in-one early break must FIRE after a ponderhit.
+    ///
+    /// The ponder path is the one this break exists for — the observed failure
+    /// was the engine spending its whole post-hit budget re-proving a mate in
+    /// one it already held. On that path `limits.infinite` stays true and
+    /// `info.time_limit` stays zero for the search's whole lifetime, so a gate
+    /// phrased around either of them is unreachable precisely where it is
+    /// needed. Assert the loop RETURNS at the mate-proving iteration.
+    ///
+    /// Note for anyone tempted to check this with bench instead: bench builds
+    /// `infinite: true` with no ponderhit, so it cannot observe this break in
+    /// either direction. An unchanged bench says nothing here.
+    #[test]
+    fn mate_in_one_break_fires_after_ponderhit() {
+        crate::init();
+        let net_path = match super::test_net_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping mate-in-one ponderhit break test: no NNUE net found");
+                return;
+            }
+        };
+        // 10 minutes in the search's own start_time frame: unreachable here.
+        let (depth, score) = mate_in_one_break_probe(&net_path, 600_000);
+        assert!(
+            score.abs() >= MATE_IN_MAX_PLY && MATE_SCORE - score.abs() <= 2,
+            "probe position must settle on a mate in one, got score {}", score);
+        assert!(
+            depth < MATE_PROBE_MAX_DEPTH,
+            "mate-in-one break did not fire after a ponderhit: ran to depth {} \
+             (the loop bound) instead of stopping at the mate-proving iteration. \
+             The post-ponderhit arming never sets info.time_limit and `go ponder` \
+             leaves limits.infinite set, so the gate must key off a published \
+             ponderhit deadline as well.",
+            depth);
+    }
+
+    /// NEGATIVE CONTROL: no clock, no ponderhit — the break must NOT fire.
+    ///
+    /// Same position, same loop bound, same `infinite` shape; the only
+    /// difference is that no ponderhit deadline was published. Genuine analysis
+    /// must keep deepening and reporting past a proved mate, so the search has
+    /// to complete every iteration it was asked for.
+    #[test]
+    fn mate_in_one_break_does_not_fire_without_a_clock() {
+        crate::init();
+        let net_path = match super::test_net_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping mate-in-one analysis control: no NNUE net found");
+                return;
+            }
+        };
+        let (depth, score) = mate_in_one_break_probe(&net_path, 0);
+        assert!(
+            score.abs() >= MATE_IN_MAX_PLY && MATE_SCORE - score.abs() <= 2,
+            "probe position must settle on a mate in one, got score {}", score);
+        assert_eq!(
+            depth, MATE_PROBE_MAX_DEPTH,
+            "mate-in-one break fired under analysis (no time_limit, no ponderhit): \
+             stopped at depth {} instead of completing all {} iterations",
+            depth, MATE_PROBE_MAX_DEPTH);
+    }
+
     /// Correction-history update primitive (`update_corr_entry`) must:
     /// (a) move the entry in the direction of `scaled_err`,
     /// (b) respect the bound ±CORR_HIST_LIMIT,
@@ -8959,6 +9485,184 @@ mod tests {
         assert_eq!(saved, -1, "shipping default must be the -1 sentinel");
     }
 
+    /// A quiet, clearly-not-forced middlegame with many legal moves and no
+    /// mate in sight — the ponder-arming tests need the ordinary ID-loop
+    /// path, not the single-legal-move shortcut (which zeroes the budget) or
+    /// the mate early-emit (which zeroes the floor).
+    const PONDER_ARMING_FEN: &str =
+        "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/3P1N2/PPP2PPP/RNBQK2R w KQkq - 0 1";
+
+    /// DEFECT B regression — the post-ponderhit path must classify the clock
+    /// from the clocks the GUI actually supplied.
+    ///
+    /// `go ponder` carries the real wtime/btime/winc/binc; uci.rs only forces
+    /// `infinite` on the copy it hands the search. The infinite branch used to
+    /// write none of the classification trio, so at a genuinely no-increment
+    /// TC `tm_no_inc` stayed false for the whole post-ponderhit search. That
+    /// sent the post-hit multiplier ceiling down the inc-cover branch with an
+    /// increment of zero — the discriminator for SMALL increments applied to
+    /// the absence of one — and it disarmed the no-inc skip on the
+    /// forced-move detector, which is the gate the interlock relies on now
+    /// that the arming floor no longer suppresses that detector by accident.
+    ///
+    /// No NNUE net is required (PeSTO fallback), so this test cannot skip.
+    #[test]
+    fn ponder_search_classifies_the_supplied_clock() {
+        use crate::board::Board;
+        crate::init();
+
+        let net_path = match super::test_net_path() {
+            Some(p) => p,
+            None => { eprintln!("Skipping ponder no-inc classification test: no NNUE net found"); return; }
+        };
+        let run = |wtime: u64, winc: u64, movestogo: u32| -> SearchInfo {
+            let mut info = SearchInfo::new(16);
+            info.silent = true;
+            info.load_nnue(&net_path).expect("net load must succeed");
+            // Dirty the trio the way a previous real `go` at an increment TC
+            // would leave it — the defect was invisible without this, because
+            // "never written" and "written false" look identical on a fresh
+            // SearchInfo.
+            info.tm_no_inc = false;
+            info.tm_our_inc = 12_345;
+            info.tm_time_left = 67_890;
+            let limits = SearchLimits {
+                depth: 4,
+                fixed_depth: true,
+                infinite: true, // uci.rs forces this for `go ponder`
+                wtime,
+                btime: wtime,
+                winc,
+                binc: winc,
+                movestogo,
+                ..SearchLimits::new()
+            };
+            let mut board = Board::from_fen(PONDER_ARMING_FEN);
+            let _ = search(&mut board, &mut info, &limits);
+            info
+        };
+
+        // 180+0 sudden death: the configuration the forced-move detector's
+        // no-inc skip exists for.
+        let no_inc = run(180_000, 0, 0);
+        assert!(no_inc.tm_no_inc,
+            "`go ponder` at a no-increment TC must classify as no-inc; \
+             tm_no_inc=false here leaves the post-hit multiplier on the \
+             inc-cover branch and disarms the forced-move detector's no-inc skip");
+        assert_eq!(no_inc.tm_our_inc, 0,
+            "stale increment from a previous search must not survive `go ponder`");
+        assert_eq!(no_inc.tm_time_left,
+                   180_000u64.saturating_sub(no_inc.move_overhead).max(1),
+            "time_left must come from the supplied clock, not the previous search");
+
+        // 60+1: an increment TC must NOT be classified no-inc.
+        let with_inc = run(60_000, 1_000, 0);
+        assert!(!with_inc.tm_no_inc, "an increment TC must not classify as no-inc");
+        assert_eq!(with_inc.tm_our_inc, 1_000);
+
+        // movestogo pacing is its own regime — the `our_time > 0` branch
+        // excludes it from no-inc, and this branch must agree.
+        let mtg = run(60_000, 0, 40);
+        assert!(!mtg.tm_no_inc,
+            "movestogo must not classify as no-inc — the two branches share the predicate");
+
+        // `go infinite` analysis supplies no clock: nothing to classify, and
+        // nothing may be invented.
+        let analysis = run(0, 0, 0);
+        assert!(!analysis.tm_no_inc);
+        assert_eq!(analysis.tm_our_inc, 0);
+        assert_eq!(analysis.tm_time_left, 0);
+    }
+
+    /// DEFECT A regression — on the armed post-ponderhit path `soft_floor`
+    /// must be the small anti-stockpile floor, NOT the whole post-hit slice.
+    ///
+    /// The ponderhit handler publishes the soft deadline as
+    /// `elapsed + slice`, so arming `soft_floor` from the same field made
+    /// `soft_floor == soft_limit` for every ponder length. Any ID-loop break
+    /// below 1.0x soft (a settled position: the stability factor is below 1
+    /// from two stable iterations on) then landed in the end-of-search
+    /// stockpile sleep instead of another iteration — identical clock spent,
+    /// strictly less search.
+    ///
+    /// No NNUE net is required (PeSTO fallback), so this test cannot skip.
+    #[test]
+    fn ponderhit_arming_floor_is_the_stockpile_floor_not_the_slice() {
+        use crate::board::Board;
+        crate::init();
+
+        // Reconstruct the handler's own arithmetic. 60+1 keeps this test off
+        // the no-inc leg, so a failure here is unambiguously the floor.
+        let our_time = 60_000u64;
+        let our_inc = 1_000u64;
+        let overhead = 100u64;
+        let (soft, hard, _max, stockpile) =
+            compute_tm_budgets(our_time, our_inc, 0, overhead, 20, true);
+        // A short ponder, charged in full: the slice is nearly the whole soft.
+        let elapsed = 200u64;
+        let slice = soft.saturating_sub(elapsed)
+            .max(MIN_POST_PONDERHIT_MS)
+            .min(hard.max(10));
+        assert!(slice > stockpile * 3,
+            "test premise: the post-hit slice ({}ms) must dominate the \
+             anti-stockpile floor ({}ms), else the defect is unobservable",
+            slice, stockpile);
+
+        let net_path = match super::test_net_path() {
+            Some(p) => p,
+            None => { eprintln!("Skipping ponderhit arming-floor test: no NNUE net found"); return; }
+        };
+        let mut info = SearchInfo::new(16);
+        info.silent = true;
+        info.load_nnue(&net_path).expect("net load must succeed");
+        info.move_overhead = overhead;
+        // Publish the deadline group exactly as the UCI thread does: every
+        // Relaxed store first, the hard deadline (the publish flag) Release
+        // last.
+        info.ponderhit_floor.store(slice, Ordering::Relaxed);
+        info.ponderhit_stockpile.store(stockpile, Ordering::Relaxed);
+        info.ponderhit_soft.store(elapsed + slice, Ordering::Relaxed);
+        info.ponderhit_isoft.store(soft, Ordering::Relaxed);
+        info.ponderhit_abs.store(elapsed + our_time, Ordering::Relaxed);
+        info.ponderhit_time.store(elapsed + hard, Ordering::Release);
+
+        let limits = SearchLimits {
+            depth: 6,
+            fixed_depth: true,
+            infinite: true, // uci.rs forces this for `go ponder`
+            wtime: our_time,
+            btime: our_time,
+            winc: our_inc,
+            binc: our_inc,
+            ..SearchLimits::new()
+        };
+        let mut board = Board::from_fen(PONDER_ARMING_FEN);
+        let _ = search(&mut board, &mut info, &limits);
+
+        assert!(info.soft_limit > 0,
+            "test premise: the post-ponderhit arming block must have run");
+        // The load-bearing relation. `floor_dominates` is
+        // `soft_floor * 3 >= soft_limit`; publishing the slice as the floor
+        // made it unconditionally true post-ponderhit, because the soft
+        // deadline IS elapsed + slice. (This test's `elapsed` is simulated, so
+        // the two land a few ms apart rather than exactly equal — the
+        // domination test is the faithful one, and `assert_ne!` below pins the
+        // literal identity the live path produces.)
+        assert!(info.soft_floor * 3 < info.soft_limit,
+            "soft_floor must not dominate the post-hit budget — that is the \
+             two-meanings defect (floor {}ms, limit {}ms)",
+            info.soft_floor, info.soft_limit);
+        assert_ne!(info.soft_floor, info.soft_limit,
+            "soft_floor must not BE the post-hit budget (floor {}ms, limit {}ms)",
+            info.soft_floor, info.soft_limit);
+        assert_eq!(info.soft_floor, stockpile,
+            "the armed floor must be compute_tm_budgets' anti-stockpile floor \
+             ({}ms), got {}ms", stockpile, info.soft_floor);
+        // The post-hit slice meaning must be preserved for should_stop.
+        assert_eq!(info.ponderhit_floor.load(Ordering::Relaxed), slice,
+            "ponderhit_floor must keep carrying the post-hit slice length");
+    }
+
     /// Regression guard for the PV-print legality check. The pv_table can carry
     /// a STALE sibling-line move — e.g. a king move from a square the king
     /// occupied in a different branch. Printing it verbatim emits an "Illegal
@@ -9001,5 +9705,160 @@ mod tests {
             !guard_passes,
             "stale g2f3 must be rejected when the king is on h2 (no piece on g2)"
         );
+    }
+
+    /// Build a post-ponderhit frame (deadline group published, in the
+    /// start_time frame) for the FL-EXT v3 suspension tests below.
+    /// `soft`/`hard`/`abs` are absolute ms since start_time; the post-hit
+    /// slice is `ponderhit_floor` floored at MIN_POST_PONDERHIT_MS.
+    fn post_ponderhit_info(soft: u64, hard: u64, abs: u64, isoft: u64) -> SearchInfo {
+        let mut info = SearchInfo::new(1);
+        // The FL-EXT bookkeeping is main-thread-only (helpers are silent),
+        // so the test has to present itself as the main thread.
+        info.silent = false;
+        info.ponderhit_soft.store(soft, Ordering::Relaxed);
+        info.ponderhit_isoft.store(isoft, Ordering::Relaxed);
+        info.ponderhit_floor.store(MIN_POST_PONDERHIT_MS, Ordering::Relaxed);
+        info.ponderhit_abs.store(abs, Ordering::Relaxed);
+        // A1 publish order: hard (the publish flag) last, with Release.
+        info.ponderhit_time.store(hard, Ordering::Release);
+        info
+    }
+
+    /// Virtual clock: rewind start_time so `should_stop` sees exactly
+    /// `elapsed_ms`. `nodes` is 0, which satisfies its 4096-node gate.
+    fn set_virtual_elapsed(info: &mut SearchInfo, elapsed_ms: u64) {
+        info.start_time = Instant::now() - std::time::Duration::from_millis(elapsed_ms);
+    }
+
+    /// FL-EXT v3 decoupling regression.
+    ///
+    /// `ph_fl_active` is a SAFETY flag — while a root fail-low is unresolved
+    /// it suspends the mid-iteration soft band in `should_stop` so the shared
+    /// soft stopper cannot cut the root re-search while the root conclusion is
+    /// collapsing (hard and absolute deadlines still bind).
+    /// `ph_fl_extensions` is a BUDGET, capped at PH_FL_MAX_EXTENSIONS, for
+    /// deadline INFLATION.
+    ///
+    /// They used to share one gate, so a spent budget silently revoked the
+    /// safety for the rest of the search — while `root_fail_low`, the UCI-side
+    /// half of the same veto, stayed set unconditionally. The two vetoes then
+    /// disagreed: the soft stopper cut the re-search and the engine emitted the
+    /// pre-collapse move with hard and absolute budget unspent.
+    #[test]
+    fn ph_fl_suspension_survives_exhausted_extension_budget() {
+        let (soft, hard, abs) = (200u64, 800u64, 5_000u64);
+        let slice = MIN_POST_PONDERHIT_MS;
+        // isoft large enough that the extension WOULD raise soft if the
+        // budget allowed it — so this test fails for the right reason.
+        let mut info = post_ponderhit_info(soft, hard, abs, 1_000);
+        info.root_depth = PH_FL_MIN_DEPTH;
+        info.ph_fl_extensions = PH_FL_MAX_EXTENSIONS; // budget exhausted
+        assert!(!info.ph_fl_active.load(Ordering::Relaxed));
+
+        info.ph_fl_on_root_fail_low();
+
+        // SAFETY: armed, independent of the spent budget.
+        assert!(
+            info.ph_fl_active.load(Ordering::Relaxed),
+            "a deep post-hit root fail-low must suspend the soft band even \
+             with the extension budget exhausted"
+        );
+        // BUDGET: still capped — no deadline moved.
+        assert_eq!(info.ph_fl_extensions, PH_FL_MAX_EXTENSIONS,
+            "the extension counter must stay at its cap");
+        assert_eq!(info.ponderhit_soft.load(Ordering::Relaxed), soft,
+            "an exhausted budget must not inflate the soft deadline");
+        assert_eq!(info.ponderhit_time.load(Ordering::Relaxed), hard,
+            "an exhausted budget must not inflate the hard deadline");
+
+        // The suspension must actually reach should_stop: past soft + slice,
+        // the mid-iteration band does not fire while the fail-low is live.
+        set_virtual_elapsed(&mut info, soft + slice + 10);
+        assert!(!info.should_stop(),
+            "soft band must stay suspended while the root fail-low is unresolved");
+
+        // ... but the hard deadline still binds (grace is 0 past hard).
+        set_virtual_elapsed(&mut info, hard + 10);
+        assert!(info.should_stop(), "hard deadline must still bind under suspension");
+    }
+
+    /// Premise guard for the test above: with the suspension NOT armed, the
+    /// soft band is exactly what cuts the re-search at `soft + slice`. That
+    /// is the consequence the fix prevents, and it pins that the suspension
+    /// is the only thing standing between the two outcomes.
+    #[test]
+    fn ph_fl_soft_band_cuts_the_research_without_the_suspension() {
+        let (soft, hard, abs) = (200u64, 800u64, 5_000u64);
+        let slice = MIN_POST_PONDERHIT_MS;
+        let mut info = post_ponderhit_info(soft, hard, abs, 1_000);
+        // Suspension deliberately NOT armed.
+        set_virtual_elapsed(&mut info, soft + slice + 10);
+        assert!(info.should_stop(),
+            "test premise: past soft + slice the band cuts when unsuspended");
+    }
+
+    /// The depth floor is an EXTENSION-budget rule (shallow aspiration misses
+    /// are routine noise and must not burn the inflation budget); it is not a
+    /// safety rule. A shallow post-hit fail-low gets the suspension but no
+    /// deadline inflation — matching `root_fail_low`, which is ungated by
+    /// depth, so the UCI-side and search-side vetoes agree at every depth.
+    #[test]
+    fn ph_fl_shallow_fail_low_suspends_but_does_not_extend() {
+        let (soft, hard, abs) = (200u64, 800u64, 5_000u64);
+        let mut info = post_ponderhit_info(soft, hard, abs, 1_000);
+        info.root_depth = PH_FL_MIN_DEPTH - 1; // below the extension floor
+        assert_eq!(info.ph_fl_extensions, 0, "budget is untouched");
+
+        info.ph_fl_on_root_fail_low();
+
+        assert!(info.ph_fl_active.load(Ordering::Relaxed),
+            "a shallow post-hit root fail-low must still suspend the soft band");
+        assert_eq!(info.ph_fl_extensions, 0,
+            "a shallow fail-low must not consume the extension budget");
+        assert_eq!(info.ponderhit_soft.load(Ordering::Relaxed), soft,
+            "a shallow fail-low must not inflate the soft deadline");
+        assert_eq!(info.ponderhit_time.load(Ordering::Relaxed), hard,
+            "a shallow fail-low must not inflate the hard deadline");
+    }
+
+    /// The extension itself is unchanged by the decoupling: a deep fail-low
+    /// with budget left still inflates soft to intended_soft x (1 + 0.34 n),
+    /// raises hard to soft + slice, and spends one unit of budget; and the
+    /// absolute forfeit wall clamps both.
+    #[test]
+    fn ph_fl_extension_still_inflates_and_still_caps() {
+        let (soft, hard, isoft) = (200u64, 300u64, 1_000u64);
+        let slice = MIN_POST_PONDERHIT_MS;
+        let mut info = post_ponderhit_info(soft, hard, 0, isoft);
+        info.root_depth = PH_FL_MIN_DEPTH;
+
+        info.ph_fl_on_root_fail_low();
+        assert_eq!(info.ph_fl_extensions, 1);
+        let want1 = isoft * (100 + PH_FL_HARD_EXT_PCT) / 100;
+        assert_eq!(info.ponderhit_soft.load(Ordering::Relaxed), want1);
+        assert_eq!(info.ponderhit_time.load(Ordering::Relaxed), want1 + slice);
+
+        // Second event: n = 2.
+        info.ph_fl_on_root_fail_low();
+        assert_eq!(info.ph_fl_extensions, PH_FL_MAX_EXTENSIONS);
+        let want2 = isoft * (100 + PH_FL_HARD_EXT_PCT * 2) / 100;
+        assert_eq!(info.ponderhit_soft.load(Ordering::Relaxed), want2);
+
+        // Third and later events: budget spent, deadlines frozen.
+        for _ in 0..3 {
+            info.ph_fl_on_root_fail_low();
+        }
+        assert_eq!(info.ph_fl_extensions, PH_FL_MAX_EXTENSIONS,
+            "a storm of fail-lows must not compound the deadline");
+        assert_eq!(info.ponderhit_soft.load(Ordering::Relaxed), want2);
+
+        // The absolute forfeit wall clamps the inflation.
+        let abs = want1 - 1;
+        let mut capped = post_ponderhit_info(soft, hard, abs, isoft);
+        capped.root_depth = PH_FL_MIN_DEPTH;
+        capped.ph_fl_on_root_fail_low();
+        assert_eq!(capped.ponderhit_soft.load(Ordering::Relaxed), abs);
+        assert_eq!(capped.ponderhit_time.load(Ordering::Relaxed), abs);
     }
 }
