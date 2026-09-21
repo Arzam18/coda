@@ -611,7 +611,7 @@ tunables!(
     // quality (a rook on an open board gets over-reduced as "late"), and SPSA
     // has previously drifted it below the safe band. The floor is set so the
     // effective value cannot fall under 5.
-    (LMR_ENDGAME_PIECES_10X, 46, 45, 90, 15.0, true),
+    (LMR_ENDGAME_PIECES_10X, 0, 0, 90, 15.0, true),
     // --- Pruning depth gates ---
     // These are sensitive to eval quality and want re-calibrating after a net
     // change, which is why they are tunable rather than hardcoded.
