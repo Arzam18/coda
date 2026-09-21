@@ -132,8 +132,8 @@ tunables!(
     // match; this SPRT is the fleet read.
     (NMP_VERIFY_DEPTH_10X, 68, 40, 200, 20.0, true),
     (RFP_DEPTH, 17, 2, 20, 2.0, true),
-    (RFP_MARGIN_IMP, 23, 0, 150, 6.0, true),
-    (RFP_MARGIN_NOIMP, 39, 0, 200, 7.5, true),
+    (RFP_MARGIN_IMP, 24, 0, 150, 6.0, true),
+    (RFP_MARGIN_NOIMP, 32, 0, 200, 7.5, true),
     // Root-depth-aware RFP relaxation (single-set, self-adapts STC<->LTC):
     // demand MORE static-eval confidence to RFP-cut as the OVERALL search
     // depth grows past RFP_ROOT_THRESH (diminishing-returns of depth — the
@@ -145,14 +145,14 @@ tunables!(
     // on 39% of moves overall — 0% in the opening but 92% through the late
     // middlegame. Cold-TT probes understate this badly.
     (RFP_ROOT_THRESH, 17, 6, 30, 1.5, true),
-    (RFP_ROOT_COEF, 17, 0, 150, 7.5, false),
+    (RFP_ROOT_COEF, 20, 0, 150, 7.5, false),
     // Additional depth-local RFP relaxation: current main already scales RFP
     // by overall root depth; this term raises the margin for high remaining
     // depth regardless of TC. Consensus engines either cap RFP around d9-11
     // or use a quadratic/deepening margin so static eval does not keep
     // cheaply pruning d12+ nodes.
-    (RFP_DEEP_KNEE_10X, 43, 40, 170, 20.0, true),
-    (RFP_DEEP_LINEAR, 50, 0, 200, 10.0, true),
+    (RFP_DEEP_KNEE_10X, 47, 40, 170, 20.0, true),
+    (RFP_DEEP_LINEAR, 45, 0, 200, 10.0, true),
     // Depth from which an RFP cut must be CONFIRMED by a null-window
     // quiescence search rather than taken on the static eval alone. Our RFP
     // already runs to depth 17, and at the deep end the static eval is the
@@ -163,12 +163,12 @@ tunables!(
     // a fail-HIGH. (Idea from Hobbes, who instead EXTENDS their shallower RFP
     // range upward under qsearch confirmation; our range is already deep, so
     // the population is at the top of the existing range, not beyond it.)
-    (RFP_QS_VERIFY_DEPTH, 6, 4, 18, 2.0, false),
+    (RFP_QS_VERIFY_DEPTH, 7, 4, 18, 2.0, false),
     // Razoring: drop straight to qsearch when static eval is far enough below
     // alpha that a full search is unlikely to recover it. Margin scales with
     // depth, gated to shallow depths only.
-    (RAZOR_MULT, 286, 100, 500, 20.0, false),
-    (RAZOR_DEPTH_10X, 33, 10, 80, 5.0, true),
+    (RAZOR_MULT, 294, 100, 500, 20.0, false),
+    (RAZOR_DEPTH_10X, 35, 10, 80, 5.0, true),
     // Futility margin: base + per-depth, compared against alpha at the
     // frontier. History adjusts the effective lmr_depth used here, so these
     // interact with the LMR history terms — retune the pair together.
