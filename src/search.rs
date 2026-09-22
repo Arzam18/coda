@@ -153,17 +153,6 @@ tunables!(
     // cheaply pruning d12+ nodes.
     (RFP_DEEP_KNEE_10X, 47, 40, 170, 20.0, true),
     (RFP_DEEP_LINEAR, 45, 0, 200, 10.0, true),
-    // Depth from which an RFP cut must be CONFIRMED by a null-window
-    // quiescence search rather than taken on the static eval alone. Our RFP
-    // already runs to depth 17, and at the deep end the static eval is the
-    // least trustworthy input it has — today we only answer that by escalating
-    // the margin (RFP_DEEP_*). This answers it with evidence instead, and it
-    // is the same device razoring already uses one block above: a qsearch that
-    // confirms a fail-LOW before dropping out. This is its mirror, confirming
-    // a fail-HIGH. (Idea from Hobbes, who instead EXTENDS their shallower RFP
-    // range upward under qsearch confirmation; our range is already deep, so
-    // the population is at the top of the existing range, not beyond it.)
-    (RFP_QS_VERIFY_DEPTH, 7, 4, 18, 2.0, false),
     // Razoring: drop straight to qsearch when static eval is far enough below
     // alpha that a full search is unlikely to recover it. Margin scales with
     // depth, gated to shallow depths only.
@@ -5806,16 +5795,10 @@ fn negamax(
             }
             // Widen margin when opponent pawns attack our pieces (Minic/Berserk pattern)
             if has_pawn_threats { margin += margin / 3; }
-            let mut rfp_ok = static_eval - margin >= beta;
-            // Deep RFP: confirm with a null-window qsearch before cutting.
-            if rfp_ok && depth >= tp(&RFP_QS_VERIFY_DEPTH) {
-                let v = quiescence(board, info, beta - 1, beta, ply);
-                if info.stop.load(Ordering::Relaxed) {
-                    return 0;
-                }
-                rfp_ok = v >= beta;
-            }
-            if rfp_ok && !tb_loss_rfp_guard {
+            // No qsearch confirmation of the cut: qsearch stands pat on this
+            // same corrected eval, already above beta, so it can never refute
+            // one (0 of 1.36M in warm-TT games). A real confirmation must search.
+            if static_eval - margin >= beta && !tb_loss_rfp_guard {
                 trace_node!(info, board.hash, ply, "rfp_cut", depth);
                 info.stats.rfp_cutoffs += 1;
                 // RFP_AUDIT (diagnostic): null-verify this static cutoff with
