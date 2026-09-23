@@ -20,7 +20,7 @@ use shakmaty::{Chess, FromSetup, CastlingMode, Position, Setup, Role,
                Color as ShColor, Square as ShSquare, Piece as ShPiece,
                Board as ShBoard, Bitboard as ShBitboard};
 use core::num::NonZeroU32;
-use shakmaty_syzygy::{Tablebase, AmbiguousWdl, Dtz, MaybeRounded};
+use shakmaty_syzygy::{Tablebase, AmbiguousWdl, Wdl, Dtz, MaybeRounded};
 
 use crate::board::Board;
 use crate::types::{PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING, WHITE, BLACK, NO_SQUARE};
@@ -160,14 +160,31 @@ impl SyzygyTB {
         }
 
         let chess = board_to_shakmaty(board)?;
-        match self.tb.probe_wdl(&chess) {
-            Ok(wdl) => {
-                let score = ambiguous_wdl_to_score(wdl);
-                self.cache.store(board.hash, board.halfmove, score);
-                Some(score)
+        // Two-tier probe. The clock-aware `probe_wdl` needs BOTH the WDL and
+        // the DTZ tables, and the DTZ half is much the more expensive; most
+        // interior probes do not need it:
+        //   Draw after zeroing       — the 50-move clock can only make a
+        //                              result MORE drawish, never less.
+        //   CursedWin / BlessedLoss  — already the +/-1 near-draw band, and a
+        //                              running clock cannot make it decisive.
+        //   Win / Loss at halfmove 0 — nothing has elapsed, so already exact.
+        // Only a decisive-after-zeroing result with a RUNNING clock can be
+        // turned by the 50-move rule, and only that case pays for DTZ.
+        let score = match self.tb.probe_wdl_after_zeroing(&chess) {
+            Ok(Wdl::Draw) => 0,
+            Ok(Wdl::CursedWin) => 1,
+            Ok(Wdl::BlessedLoss) => -1,
+            Ok(w @ (Wdl::Win | Wdl::Loss)) if board.halfmove == 0 => {
+                if w == Wdl::Win { 20000 } else { -20000 }
             }
-            Err(_) => None,
-        }
+            Ok(_) => match self.tb.probe_wdl(&chess) {
+                Ok(a) => ambiguous_wdl_to_score(a),
+                Err(_) => return None,
+            },
+            Err(_) => return None,
+        };
+        self.cache.store(board.hash, board.halfmove, score);
+        Some(score)
     }
 
     /// Probe DTZ at root to find the best tablebase move.
