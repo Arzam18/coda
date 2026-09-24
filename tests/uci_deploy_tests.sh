@@ -8,6 +8,7 @@
 #   c)  go infinite               -> NO bestmove until `stop`, then prompt
 #   d)  go ponder + ponderhit     -> bestmove respects the post-ponderhit budget
 #   e)  go ponder + stop          -> prompt bestmove
+#   f)  TB ponderhit              -> exactly one bestmove (needs SYZYGY_PATH)
 #
 # Usage: tests/uci_deploy_tests.sh [path-to-engine]   (default: ./coda)
 # Requires GNU date (%3N). Exits non-zero on any failure.
@@ -193,6 +194,33 @@ else
         pass "(e) go ponder + stop — bestmove ${dt}ms after stop"
     else
         fail "(e) go ponder + stop — bestmove took ${dt}ms after stop (> 1000)"
+    fi
+fi
+
+# ---------------------------------------------------------------- case f
+# go ponder + ponderhit at a tablebase root -> exactly ONE bestmove. The
+# ponderhit handler plays the TB move itself; the stopped ponder search must
+# not also emit, or the GUI reads the second line inside its next ponder.
+# Needs Syzygy files: set SYZYGY_PATH (skipped when unset or missing).
+SYZ="${SYZYGY_PATH:-}"
+if [ -z "$SYZ" ] || [ ! -d "$SYZ" ]; then
+    echo "SKIP: (f) TB ponderhit — set SYZYGY_PATH to a Syzygy directory to run"
+else
+    in_f() {
+        echo "uci"; echo "setoption name SyzygyPath value $SYZ"; echo "isready"
+        echo "position fen 8/8/8/4k3/8/8/3QK3/8 b - - 0 1"
+        echo "go ponder wtime 60000 btime 60000"
+        sleep 0.5
+        echo "ponderhit"
+        sleep 2
+        echo "quit"
+    }
+    run_case f in_f
+    n=$(awk '$2=="bestmove"' "$TMP/f.out" | wc -l)
+    if [ "$n" -eq 1 ]; then
+        pass "(f) TB ponderhit — exactly one bestmove"
+    else
+        fail "(f) TB ponderhit — $n bestmove lines (expected 1)"
     fi
 fi
 
