@@ -165,7 +165,7 @@ capture is actually possible.
 ### UCI options
 `Hash` (MB, default 64), `Threads` (default 1), `NNUEFile`, `OwnBook` (default
 true), `BookFile`, `MoveOverhead` (ms, default 100), `Ponder`, `SyzygyPath`,
-`TBHash` (WDL-cache MB, default 16), `SyzygyProbeDepth` (default 4). Debug/internal
+`TBHash` (WDL-cache MB, default 16), `SyzygyProbeDepth` (default 1). Debug/internal
 only: `HiddenActivation`, `LoadAnyway`, `TMDebug`, `PonderhitCreditPct`. All
 `tunables!` params are also exposed as spin options for SPSA (not for manual use).
 

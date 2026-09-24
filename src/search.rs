@@ -153,17 +153,6 @@ tunables!(
     // cheaply pruning d12+ nodes.
     (RFP_DEEP_KNEE_10X, 47, 40, 170, 20.0, true),
     (RFP_DEEP_LINEAR, 45, 0, 200, 10.0, true),
-    // Depth from which an RFP cut must be CONFIRMED by a null-window
-    // quiescence search rather than taken on the static eval alone. Our RFP
-    // already runs to depth 17, and at the deep end the static eval is the
-    // least trustworthy input it has — today we only answer that by escalating
-    // the margin (RFP_DEEP_*). This answers it with evidence instead, and it
-    // is the same device razoring already uses one block above: a qsearch that
-    // confirms a fail-LOW before dropping out. This is its mirror, confirming
-    // a fail-HIGH. (Idea from Hobbes, who instead EXTENDS their shallower RFP
-    // range upward under qsearch confirmation; our range is already deep, so
-    // the population is at the top of the existing range, not beyond it.)
-    (RFP_QS_VERIFY_DEPTH, 7, 4, 18, 2.0, false),
     // Razoring: drop straight to qsearch when static eval is far enough below
     // alpha that a full search is unlikely to recover it. Margin scales with
     // depth, gated to shallow depths only.
@@ -1199,11 +1188,6 @@ prune_stats! {
     rfp_audit_var_fp: [u64; 3],
     cut_quiet_rank1: u64,
     cut_quiet_rank_sum: u64,
-    // Dual-net dispatch instrumentation: |material-proxy| buckets of 100
-    // SEE units, index 11 = 1100+.
-    dualnet_evals: [u64; 12],
-    dualnet_abseval: [u64; 12],
-    dualnet_neareq: [u64; 12],
     // Fail-low node histogram, indexed
     // [depth band 0-2][margin band 0-3][quiet-count band 0-3]:
     // depth {<=4, 5-8, >=9}, margin {<50, 50-150, 150-300, >=300}cp,
@@ -1576,11 +1560,28 @@ pub struct SearchInfo {
     pub syzygy: Option<std::sync::Arc<crate::tb::SyzygyTB>>,
     /// Min depth at which to probe Syzygy WDL when at the maximum loaded
     /// piece count (SF `SyzygyProbeDepth`). Below the max piece count we
-    /// always probe regardless of depth. Default 4: our deploy set is
-    /// 5-man-everything, so max-men interior probes at depth<4 are frequent
-    /// and largely redundant (re-probed deeper up the tree). Local RR
-    /// (5-man, STC, no-adjudication) measured =4 vs =1 at +2.0 Elo, LOS
-    /// 92.2%, N=10000. UCI option `SyzygyProbeDepth`.
+    /// always probe regardless of depth. UCI option `SyzygyProbeDepth`.
+    ///
+    /// Default 1. The earlier default of 4 rested on a local RR (5-man, STC,
+    /// no-adjudication) measuring =4 over =1 at +2.0 Elo, LOS 92.2%, N=10000
+    /// — 1.4 sigma. Two SPRTs on TB-holding workers then split by clock:
+    ///   STC 10+0.1, N=154378: -0.08 +- 0.86, H0 — flat, not a regression.
+    ///   LTC 40+0.4, N= 75694: +1.54 +- 1.14, H1 — passed.
+    /// The STC leg measures the same regime as the old RR at 15x the sample
+    /// and finds nothing, so the two agree that the effect is invisible at a
+    /// fast clock; the LTC leg is the first measurement positioned to see it.
+    ///
+    /// Why the gate cost accuracy rather than merely time: the trigger is
+    /// REMAINING depth, so a deeper search creates proportionally MORE nodes
+    /// inside the gated region, and the error does not converge. Measured on
+    /// 1780 six-man tablebase-drawn positions with 5-man tables mounted, the
+    /// exact score was returned for 47.8% at =4 against 77.1% at =1.
+    ///
+    /// The cost is narrower than raw NPS suggests: the probe condition
+    /// short-circuits on piece count before consulting this gate, so outside
+    /// TB range the setting is inert. Inside it, table hits terminate
+    /// subtrees — the same positions reached median depth 31 at =1 against
+    /// 24 at =4, despite the lower node rate.
     pub tb_probe_depth: i32,
 }
 
@@ -1673,7 +1674,7 @@ impl SearchInfo {
             nnue_acc: None,
             threat_stack: crate::threat_accum::ThreatStack::new(768), // max v9 accum size
             syzygy: None,
-            tb_probe_depth: 4,
+            tb_probe_depth: 1,
             rfp_audit_active: false,
         }
     }
@@ -2277,23 +2278,6 @@ impl SearchInfo {
                 let span = SAT_MAT_FULL - SAT_MAT_KNEE;
                 let ramp = excess.min(span);
                 final_score += mat * SAT_TIEBREAK_W * ramp / (100 * span);
-            }
-        }
-
-        // Dual-net dispatch instrumentation (both paths still call the big
-        // net). Proxy = SIGNED piece-material balance in SEE
-        // units — the candidate dispatch signal: position-intrinsic,
-        // changes only on captures/promotions. Per |proxy| bucket we count
-        // evals, sum |internal eval|, and count near-equal evals
-        // (|eval| < 100 internal) — giving, from one bench run, the
-        // small-net qualification rate at ANY threshold plus the
-        // false-positive rate the re-eval guard would face there.
-        {
-            let bucket = ((signed_material.abs() / 100) as usize).min(11);
-            self.stats.dualnet_evals[bucket] += 1;
-            self.stats.dualnet_abseval[bucket] += final_score.unsigned_abs() as u64;
-            if final_score.abs() < 100 {
-                self.stats.dualnet_neareq[bucket] += 1;
             }
         }
 
@@ -5811,16 +5795,10 @@ fn negamax(
             }
             // Widen margin when opponent pawns attack our pieces (Minic/Berserk pattern)
             if has_pawn_threats { margin += margin / 3; }
-            let mut rfp_ok = static_eval - margin >= beta;
-            // Deep RFP: confirm with a null-window qsearch before cutting.
-            if rfp_ok && depth >= tp(&RFP_QS_VERIFY_DEPTH) {
-                let v = quiescence(board, info, beta - 1, beta, ply);
-                if info.stop.load(Ordering::Relaxed) {
-                    return 0;
-                }
-                rfp_ok = v >= beta;
-            }
-            if rfp_ok && !tb_loss_rfp_guard {
+            // No qsearch confirmation of the cut: qsearch stands pat on this
+            // same corrected eval, already above beta, so it can never refute
+            // one (0 of 1.36M in warm-TT games). A real confirmation must search.
+            if static_eval - margin >= beta && !tb_loss_rfp_guard {
                 trace_node!(info, board.hash, ply, "rfp_cut", depth);
                 info.stats.rfp_cutoffs += 1;
                 // RFP_AUDIT (diagnostic): null-verify this static cutoff with
@@ -8364,25 +8342,6 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         }
         eprintln!("Move ordering:  avg cutoff pos {:.2}, avg pos² {:.1}, first-move {:.1}%",
             avg_pos, avg_sq, first_pct);
-        {
-            let total: u64 = s.dualnet_evals.iter().sum();
-            if total > 0 {
-                eprintln!("--- Dual-net dispatch candidate (proxy = |material| in SEE units) ---");
-                let mut cum = 0u64;
-                for i in (0..12).rev() {
-                    cum += s.dualnet_evals[i];
-                    let n = s.dualnet_evals[i];
-                    if n == 0 { continue; }
-                    let lo = i * 100;
-                    let label = if i == 11 { "1100+ ".to_string() } else { format!("{:>4}-{:<4}", lo, lo + 99) };
-                    eprintln!("proxy {}: {:>8} evals ({:5.2}%)  qualify-if-thresh<=this: {:5.1}%  mean|eval|={:>5}  near-eq {:4.1}%",
-                        label, n, 100.0 * n as f64 / total as f64,
-                        100.0 * cum as f64 / total as f64,
-                        s.dualnet_abseval[i] / n.max(1),
-                        100.0 * s.dualnet_neareq[i] as f64 / n.max(1) as f64);
-                }
-            }
-        }
         {
             let bn: u64 = s.b_probe_nodes.iter().flatten().sum();
             if bn > 0 && s.moves_searched > 0 {
