@@ -1086,7 +1086,14 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                             // a drawn TB endgame; the TB draw move is
                             // safer.
                             if tb_valid {
-                                // Stop search and play TB move
+                                // Stop search and play TB move. Suppress the
+                                // ponder thread's own emit, as the `go` and
+                                // `ucinewgame` abandon paths do: the external
+                                // stop wakes its wait loop, and without this it
+                                // prints a bestmove ahead of ours. The GUI plays
+                                // the first and reads the second as a premature
+                                // bestmove inside its next `go ponder`.
+                                suppress_bestmove.store(true, Ordering::Relaxed);
                                 external_stop.store(true, Ordering::SeqCst);
                                 stop_flag.store(true, Ordering::SeqCst);
                                 if let Some(handle) = search_handle.take() {
