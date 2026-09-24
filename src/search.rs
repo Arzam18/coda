@@ -169,7 +169,10 @@ tunables!(
     // SPSA-tunable -- so SPSA has been optimising a formula with one frozen
     // input. Exposing it costs nothing and is behaviour-identical at 12000.
     (FUT_HIST_EXEMPT, 12628, 2000, 16384, 900.0, true),
-    (FUT_LMR_DEPTH, 15, 6, 24, 2.0, true),
+    // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
+    // One SPSA step either way changes under 0.04% of futility prunes, so
+    // in core SPSA it would only add gradient noise. Kept at its value.
+    (FUT_LMR_DEPTH, 15, 6, 24, 2.0, false),
     // Move-count term: later quiets get a tighter futility margin. Default
     // FUT_PER_DEPTH / 8 — one depth-ply of margin per eight moves; capped at
     // the depth term so the margin never drops below FUT_BASE. Futility is
@@ -331,7 +334,10 @@ tunables!(
     // `(BASE + d²·DEPTH) / (2 - improving)`. BASE dominates at shallow depth
     // and sets how many quiets survive at d=1.
     (LMP_BASE_10X, 55, 10, 150, 20.0, true),
-    (LMP_DEPTH_10X, 127, 40, 200, 20.0, true),
+    // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
+    // One step down changes 0.02% of LMP prunes and one step up none: the
+    // move-count limit already outgrows the move list at these depths.
+    (LMP_DEPTH_10X, 127, 40, 200, 20.0, false),
     // Margin-aware LMP. Coda's LMP limit keys on depth and improving only; the
     // fail-low histogram (b_probe_*) shows late-quiet work concentrating at
     // nodes that end up failing low, but its margin is only knowable AFTER the
@@ -468,7 +474,10 @@ tunables!(
     (DEXT_MARGIN_QUIET, 17, 0, 100, 4.0, false),
     (DEXT_MARGIN_CORR, 16, 0, 64, 3.0, true),
     (DEXT_MARGIN_BASE, 28, -50, 150, 6.0, true),
-    (DEXT_CAP, 11, 4, 32, 2.0, true),
+    // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
+    // The cap binds on 0.02-0.15% of double-extension decisions. It is a
+    // safety valve against extension runaway; keep the value, don't tune it.
+    (DEXT_CAP, 11, 4, 32, 2.0, false),
     // How large a TT score has to be before the 50-move clock is allowed to
     // veto a cutoff on it. See `tt_halfmove_ok`.
     //
@@ -517,7 +526,11 @@ tunables!(
     // bonus a check that is not badly losing). Without it Coda orders losing
     // check-sacs into the first-searched slot. Margin on Coda's pawn=100 scale:
     // a check that loses more than this by SEE gets no ordering bonus.
-    (QUIET_CHECK_SEE_MARGIN, 78, 0, 300, 12.0, true),
+    // Non-core: a plateau knob (dead-knob audit 2026-09-24). SEE outcomes
+    // are sums of piece values, so every margin in 0..=99 behaves
+    // identically (bench-verified at 0, 50, 78 and 99); SPSA steps inside
+    // the plateau are pure noise. Change it only in whole-pawn steps.
+    (QUIET_CHECK_SEE_MARGIN, 78, 0, 300, 12.0, false),
     // Effective correction magnitude is sum(W) / (DIV * GRAIN_T), so this
     // divisor trades off directly against the CORR_W_* weights — the pair is
     // degenerate and must be read together, never one in isolation. The floor
@@ -592,15 +605,6 @@ tunables!(
     // avoid contributing loose-knob false gradients to the sweep.
     (PAWN_HIST_MULT_10X, 14, 0, 80, 10.0, false),
     (KNIGHT_FORK_BONUS, 8722, 0, 20000, 1000.0, false),
-    // LMR endgame gate: skip LMR entirely when popcount(occupied) <= this.
-    // Fixes endgame-conversion blunders where LMR over-reduces the
-    // king-restriction moves that complete a mate.
-    //
-    // DELIBERATELY NARROW RANGE: this is correctness-load-bearing on live-play
-    // quality (a rook on an open board gets over-reduced as "late"), and SPSA
-    // has previously drifted it below the safe band. The floor is set so the
-    // effective value cannot fall under 5.
-    (LMR_ENDGAME_PIECES_10X, 0, 0, 90, 15.0, true),
     // --- Pruning depth gates ---
     // These are sensitive to eval quality and want re-calibrating after a net
     // change, which is why they are tunable rather than hardcoded.
@@ -6631,11 +6635,6 @@ fn negamax(
 
         // Late Move Reductions (LMR) + Principal Variation Search (PVS)
         let mut reduction = 0i32;
-        // Endgame gate: skip LMR in low-piece-count positions where
-        // mate-completing king-restriction moves would be over-reduced.
-        let endgame_threshold = tp10(&LMR_ENDGAME_PIECES_10X) as u32;
-        let is_endgame_skip = endgame_threshold > 0
-            && crate::bitboard::popcount(board.occupied()) <= endgame_threshold;
         // Explicit `move_count > 1 && mv != tt_move` guards (defensive,
         // bench-neutral). Currently safe via LMR_TABLE zero-init at
         // depth<3 / move<3, but if the table is ever populated differently
@@ -6644,7 +6643,7 @@ fn negamax(
         // line-numbered: the pointer that was here had rotted by ~2400 lines.
         // NOTE: `!in_check` is deliberately ABSENT — see the check-relief
         // change below, which lets late evasions be reduced.
-        if !is_cap && !is_promo && !is_endgame_skip
+        if !is_cap && !is_promo
             && move_count > 1 && mv != tt_move
             && FEAT_LMR.load(Ordering::Relaxed) {
             let d = (depth as usize).min(63);
@@ -6835,7 +6834,7 @@ fn negamax(
         }
 
         // LMR for captures: use separate capture LMR table with capture history adjustments
-        if is_cap && !is_promo && move_count > 1 && mv != tt_move && !is_endgame_skip && FEAT_LMR.load(Ordering::Relaxed) {
+        if is_cap && !is_promo && move_count > 1 && mv != tt_move && FEAT_LMR.load(Ordering::Relaxed) {
             // Only reduce at non-PV nodes (zero window search)
             if beta - alpha == 1 {
                 let d = (depth as usize).min(63);
