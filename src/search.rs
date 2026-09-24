@@ -158,6 +158,19 @@ tunables!(
     // depth, gated to shallow depths only.
     (RAZOR_MULT, 294, 100, 500, 20.0, false),
     (RAZOR_DEPTH_10X, 35, 10, 80, 5.0, true),
+    // Razoring is disabled once |alpha| exceeds this, so it only fires in
+    // positions that are still in the balance. The MAX IS DELIBERATELY FAR
+    // BELOW TB_WIN (28800): the tablebase floor/ceiling can only be set when
+    // |alpha| is up at TB range, so keeping this bound low is what makes
+    // razoring and a proven TB result mutually exclusive, and therefore what
+    // lets razoring skip the TB guard that RFP needs. Do not raise the max
+    // into TB range without re-deriving that argument.
+    (RAZOR_ALPHA_MAX, 2000, 500, 8000, 150.0, false),
+    // Weak-winning-confirmation guard: when alpha already represents an
+    // advantage this large, decline a razor cut whose qsearch result only
+    // grazes alpha by less than the margin below, and search it instead.
+    (RAZOR_WEAK_ALPHA, 200, 0, 1000, 20.0, false),
+    (RAZOR_WEAK_MARGIN, 32, 0, 150, 5.0, false),
     // Futility margin: base + per-depth, compared against alpha at the
     // frontier. History adjusts the effective lmr_depth used here, so these
     // interact with the LMR history terms — retune the pair together.
@@ -881,6 +894,7 @@ pub static FEAT_NMP: AtomicBool = AtomicBool::new(true);
 /// Off by default, controlled by UCI option `TMDebug`.
 pub static TM_DEBUG: AtomicBool = AtomicBool::new(false);
 pub static FEAT_RFP: AtomicBool = AtomicBool::new(true);
+pub static FEAT_RAZOR: AtomicBool = AtomicBool::new(true);
 pub static FEAT_PROBCUT: AtomicBool = AtomicBool::new(true);
 pub static FEAT_LMR: AtomicBool = AtomicBool::new(true);
 pub static FEAT_LMP: AtomicBool = AtomicBool::new(true);
@@ -916,6 +930,7 @@ pub static RFP_AUDIT: AtomicBool = AtomicBool::new(false);
 /// Disable all features (pure negamax + eval)
 pub fn disable_all_features() {
     FEAT_NMP.store(false, Ordering::Relaxed); FEAT_RFP.store(false, Ordering::Relaxed);
+    FEAT_RAZOR.store(false, Ordering::Relaxed);
     FEAT_PROBCUT.store(false, Ordering::Relaxed); FEAT_LMR.store(false, Ordering::Relaxed); FEAT_LMP.store(false, Ordering::Relaxed);
     FEAT_FUTILITY.store(false, Ordering::Relaxed); FEAT_SEE_PRUNE.store(false, Ordering::Relaxed);
     FEAT_BAD_NOISY.store(false, Ordering::Relaxed); FEAT_EXTENSIONS.store(false, Ordering::Relaxed); FEAT_FH_BLEND.store(false, Ordering::Relaxed);
@@ -1164,6 +1179,7 @@ prune_stats! {
     nmp_verify: u64,
     nmp_verify_fail: u64,
     rfp_cutoffs: u64,
+    razor_attempts: u64,
     razor_cutoffs: u64,
     lmp_prunes: u64,
     futility_prunes: u64,
@@ -2708,6 +2724,7 @@ pub(crate) fn init_feature_flags() {
             disable_all_features();
             if std::env::var("ENABLE_NMP").is_ok() { FEAT_NMP.store(true, Ordering::Relaxed); }
             if std::env::var("ENABLE_RFP").is_ok() { FEAT_RFP.store(true, Ordering::Relaxed); }
+            if std::env::var("ENABLE_RAZOR").is_ok() { FEAT_RAZOR.store(true, Ordering::Relaxed); }
             if std::env::var("ENABLE_PROBCUT").is_ok() { FEAT_PROBCUT.store(true, Ordering::Relaxed); }
             if std::env::var("ENABLE_LMR").is_ok() { FEAT_LMR.store(true, Ordering::Relaxed); }
             if std::env::var("ENABLE_LMP").is_ok() { FEAT_LMP.store(true, Ordering::Relaxed); }
@@ -5756,16 +5773,19 @@ fn negamax(
         // Runs before RFP (consensus order: razor -> RFP -> NMP).
         if !is_pv
             && ply > 0
+            && FEAT_RAZOR.load(Ordering::Relaxed)
             && depth <= tp10(&RAZOR_DEPTH_10X)
-            && alpha.abs() < 2000
+            && alpha.abs() < tp(&RAZOR_ALPHA_MAX)
             && info.excluded_move[ply_u] == NO_MOVE
             && static_eval + tp(&RAZOR_MULT) * depth <= alpha
         {
+            info.stats.razor_attempts += 1;
             let v = quiescence(board, info, alpha, alpha + 1, ply);
             // When alpha already represents a substantial advantage, a QS
             // result that only grazes it is weak evidence that no quiet move
             // can preserve that advantage. Search those marginal cases.
-            let weak_winning_confirmation = alpha > 200 && v > alpha - 32;
+            let weak_winning_confirmation =
+                alpha > tp(&RAZOR_WEAK_ALPHA) && v > alpha - tp(&RAZOR_WEAK_MARGIN);
             if v <= alpha && !weak_winning_confirmation {
                 info.stats.razor_cutoffs += 1;
                 return v;
@@ -8294,6 +8314,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
     eprintln!("NMP attempts:   {:>8}  cutoffs: {} ({:.0}%)", s.nmp_attempts, s.nmp_cutoffs,
         if s.nmp_attempts > 0 { s.nmp_cutoffs as f64 / s.nmp_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("RFP cutoffs:    {:>8}  ({:.1}% of nodes)", s.rfp_cutoffs, s.rfp_cutoffs as f64 / total_nodes as f64 * 100.0);
+    eprintln!("Razor attempts: {:>8}  cutoffs: {} ({:.0}%)", s.razor_attempts, s.razor_cutoffs,
+              if s.razor_attempts > 0 { s.razor_cutoffs as f64 / s.razor_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("LMP prunes:     {:>8}", s.lmp_prunes);
     eprintln!("Futility prunes:{:>8}", s.futility_prunes);
     eprintln!("SEE prunes:     {:>8}", s.see_prunes);
@@ -8390,6 +8412,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
     eprintln!("NMP cutoffs:    {:>6.1}/Kn  ({:.0}% of attempts)", s.nmp_cutoffs as f64 / kn,
         if s.nmp_attempts > 0 { s.nmp_cutoffs as f64 / s.nmp_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("RFP cutoffs:    {:>6.1}/Kn", s.rfp_cutoffs as f64 / kn);
+    eprintln!("Razor cutoffs:  {:>6.1}/Kn  ({:.0}% of attempts)", s.razor_cutoffs as f64 / kn,
+              if s.razor_attempts > 0 { s.razor_cutoffs as f64 / s.razor_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("LMP prunes:     {:>6.1}/Kn", s.lmp_prunes as f64 / kn);
     eprintln!("Futility:       {:>6.1}/Kn", s.futility_prunes as f64 / kn);
     eprintln!("SEE prune:      {:>6.1}/Kn", s.see_prunes as f64 / kn);
