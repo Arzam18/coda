@@ -271,14 +271,14 @@ impl<T: Default + Copy> AlignedVec<T> {
     /// processes holding byte-identical data, freeing the private copy.
     /// Returns whether the array is now shared; on any failure the private
     /// copy is kept unchanged. The array must not be written afterwards.
-    pub fn share(&mut self, tag: &str) -> bool {
-        if self.shared.is_some() || self.len == 0 {
-            return self.shared.is_some();
+    pub fn share(&mut self, tag: &str) -> Result<(), String> {
+        if self.shared.is_some() {
+            return Ok(());
         }
         let bytes = unsafe {
             std::slice::from_raw_parts(self.ptr as *const u8, self.len * std::mem::size_of::<T>())
         };
-        let Some(region) = crate::shared_weights::share(bytes, tag) else { return false };
+        let region = crate::shared_weights::share(bytes, tag)?;
         let shared = Self {
             ptr: region.as_ptr() as *mut T,
             len: self.len,
@@ -289,7 +289,7 @@ impl<T: Default + Copy> AlignedVec<T> {
         };
         // Dropping the old value frees the private copy.
         drop(std::mem::replace(self, shared));
-        true
+        Ok(())
     }
 
     pub fn is_shared(&self) -> bool {
@@ -3034,14 +3034,18 @@ impl NNUENet {
     /// load is complete, so the shared bytes are the final ones, and leaves a
     /// private copy in place wherever sharing is off or fails.
     fn share_weights(&mut self) {
-        if !crate::shared_weights::enabled() {
-            return;
-        }
-        let psq = self.input_weights.share("psq");
-        let thr = self.threat_weights.len() > 0 && self.threat_weights.share("thr");
-        println!("info string shared weights: PSQ {} MB {}, threat {} MB {}",
-            (self.input_weights.len() * 2) >> 20, if psq { "shared" } else { "private" },
-            self.threat_weights.len() >> 20, if thr { "shared" } else { "private" });
+        let describe = |r: Result<(), String>| match r {
+            Ok(()) => "shared".to_string(),
+            Err(e) => format!("private ({})", e),
+        };
+        let psq = describe(self.input_weights.share("psq"));
+        let thr = if self.threat_weights.is_empty() { "none".to_string() } else { describe(self.threat_weights.share("thr")) };
+        // Reported unconditionally, so a host where sharing silently fails
+        // (a small container /dev/shm, a sandbox) is visible in the log.
+        println!("info string shared weights: PSQ {} MB {}, threat {} MB {}; shmem THP {}",
+            (self.input_weights.len() * 2) >> 20, psq,
+            self.threat_weights.len() >> 20, thr,
+            crate::shared_weights::shmem_thp_policy());
     }
 
     /// Load a v5/v6/v7 .nnue file.

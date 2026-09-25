@@ -63,24 +63,44 @@ impl SharedRegion {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-/// Deterministic content hash used only to NAME the object. Correctness never
-/// rests on it: attach compares the full bytes.
+/// Deterministic content hash used only to NAME the object, over a sparse
+/// sample (one 64-byte line in every 64): hashing all ~92 MB would cost every
+/// engine launch tens of milliseconds. Correctness never rests on the name —
+/// attach compares every byte — so a sample collision only means falling back
+/// to a private copy.
 fn content_hash(bytes: &[u8]) -> u64 {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    h.write(bytes);
+    h.write_usize(bytes.len());
+    for line in bytes.chunks(64).step_by(64) {
+        h.write(line);
+    }
     h.finish()
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PREFIX: &str = "coda-w1-";
 
+/// The host's huge-page policy for shared memory (the bracketed value of
+/// /sys/kernel/mm/transparent_hugepage/shmem_enabled). With "never" a shared
+/// copy lives on 4 KB pages, where a private copy can have 2 MB ones.
+pub fn shmem_thp_policy() -> String {
+    std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/shmem_enabled")
+        .ok()
+        .and_then(|s| s.split('[').nth(1).and_then(|t| t.split(']').next()).map(str::to_string))
+        .unwrap_or_else(|| "n/a".into())
+}
+
 /// Try to back `bytes` with a shared read-only mapping holding identical
 /// content. `tag` separates the different arrays of one net in the name.
-/// Returns None whenever sharing is unavailable or anything fails.
-pub fn share(bytes: &[u8], tag: &str) -> Option<SharedRegion> {
-    if bytes.is_empty() || !enabled() {
-        return None;
+/// On failure returns the reason, so the caller can report why it fell back
+/// to a private copy instead of failing silently.
+pub fn share(bytes: &[u8], tag: &str) -> Result<SharedRegion, String> {
+    if bytes.is_empty() {
+        return Err("empty array".into());
+    }
+    if !enabled() {
+        return Err("disabled".into());
     }
     #[cfg(target_os = "linux")]
     {
@@ -91,16 +111,18 @@ pub fn share(bytes: &[u8], tag: &str) -> Option<SharedRegion> {
             content_hash(bytes),
             bytes.len()
         );
-        let path = std::ffi::CString::new(name).ok()?;
-        if let Some(r) = linux::attach(&path, bytes) {
-            return Some(r);
-        }
-        return linux::publish_then_attach(&path, bytes);
+        let path = std::ffi::CString::new(name).map_err(|_| "bad name".to_string())?;
+        return match linux::attach(&path, bytes) {
+            Ok(r) => Ok(r),
+            // Not published yet: become the publisher.
+            Err(e) if e.starts_with("open: No such file") => linux::publish_then_attach(&path, bytes),
+            Err(e) => Err(e),
+        };
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = tag;
-        None
+        Err("not supported on this platform".into())
     }
 }
 
@@ -108,6 +130,45 @@ pub fn share(bytes: &[u8], tag: &str) -> Option<SharedRegion> {
 mod linux {
     use super::{SharedRegion, PREFIX};
     use std::ffi::{CStr, CString};
+
+    const MADV_COLLAPSE: libc::c_int = 25;
+    const HUGE: usize = 2 * 1024 * 1024;
+
+    /// Map `len` bytes of `fd` read-only at a 2 MB-aligned address, so the
+    /// kernel can back the mapping with huge pages.
+    fn map_aligned(fd: libc::c_int, len: usize) -> Result<*mut libc::c_void, String> {
+        unsafe {
+            // Reserve address space with room to align, then map over it.
+            let span = len + HUGE;
+            let r = libc::mmap(std::ptr::null_mut(), span, libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
+            if r == libc::MAP_FAILED {
+                return Err(errno("mmap reserve"));
+            }
+            let base = r as usize;
+            let aligned = (base + HUGE - 1) & !(HUGE - 1);
+            let p = libc::mmap(aligned as *mut libc::c_void, len, libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_FIXED, fd, 0);
+            if p == libc::MAP_FAILED {
+                let e = errno("mmap");
+                libc::munmap(r, span);
+                return Err(e);
+            }
+            // Release the unused head and tail of the reservation.
+            if aligned > base {
+                libc::munmap(r, aligned - base);
+            }
+            let end = (aligned + len + 4095) & !4095;
+            if base + span > end {
+                libc::munmap(end as *mut libc::c_void, base + span - end);
+            }
+            Ok(p)
+        }
+    }
+
+    fn errno(what: &str) -> String {
+        format!("{}: {}", what, std::io::Error::last_os_error())
+    }
 
     fn stat_ino(fd: libc::c_int) -> Option<(u64, u64, i64)> {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -118,39 +179,47 @@ mod linux {
     }
 
     /// Map `fd` read-only and accept it only if its content equals `bytes`.
-    fn map_verified(fd: libc::c_int, path: &CStr, bytes: &[u8]) -> Option<SharedRegion> {
-        let (_, nlink, size) = stat_ino(fd)?;
-        if nlink == 0 || size != bytes.len() as i64 {
-            return None;
+    fn map_verified(fd: libc::c_int, path: &CStr, bytes: &[u8]) -> Result<SharedRegion, String> {
+        let (_, nlink, size) = stat_ino(fd).ok_or_else(|| errno("fstat"))?;
+        if nlink == 0 {
+            return Err("object was removed".into());
         }
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                bytes.len(),
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            return None;
+        if size != bytes.len() as i64 {
+            return Err(format!("size mismatch ({} vs {})", size, bytes.len()));
         }
+        let p = map_aligned(fd, bytes.len())?;
         let mapped = unsafe { std::slice::from_raw_parts(p as *const u8, bytes.len()) };
         if mapped != bytes {
             unsafe { libc::munmap(p, bytes.len()) };
-            return None;
+            return Err("content mismatch".into());
         }
-        // Huge pages when the host's shmem policy allows them; a no-op otherwise.
-        unsafe { libc::madvise(p, bytes.len(), libc::MADV_HUGEPAGE) };
-        Some(SharedRegion { ptr: p as *mut u8, len: bytes.len(), fd, path: path.to_owned() })
+        // Ask for 2 MB pages. MADV_COLLAPSE (Linux 6.1+) builds them in the
+        // shared page cache regardless of the host's shmem THP policy, and
+        // every process whose mapping is 2 MB-aligned then maps them huge.
+        // The first caller pays the collapse; later ones find it done.
+        // Without huge pages the shared copy runs on 4 KB pages, which costs
+        // measurable speed against a private THP copy.
+        unsafe {
+            libc::madvise(p, bytes.len(), libc::MADV_HUGEPAGE);
+            // A collapse racing another process's attach can fail with
+            // EAGAIN; a couple of retries settle it.
+            for _ in 0..3 {
+                if libc::madvise(p, bytes.len(), MADV_COLLAPSE) == 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+                    break;
+                }
+            }
+        }
+        Ok(SharedRegion { ptr: p as *mut u8, len: bytes.len(), fd, path: path.to_owned() })
     }
 
     /// Attach to an already-published object.
-    pub fn attach(path: &CStr, bytes: &[u8]) -> Option<SharedRegion> {
+    pub fn attach(path: &CStr, bytes: &[u8]) -> Result<SharedRegion, String> {
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
-            return None;
+            return Err(errno("open"));
         }
         // Only a last-user cleanup ever holds the lock exclusively, and it does
         // so without blocking, so a short retry covers that window.
@@ -162,13 +231,15 @@ mod linux {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        if locked {
-            if let Some(r) = map_verified(fd, path, bytes) {
-                return Some(r);
-            }
+        let result = if locked {
+            map_verified(fd, path, bytes)
+        } else {
+            Err("lock busy".into())
+        };
+        if result.is_err() {
+            unsafe { libc::close(fd) };
         }
-        unsafe { libc::close(fd) };
-        None
+        result
     }
 
     /// Remove unlocked leftovers of earlier runs (other nets, crashed
@@ -199,14 +270,14 @@ mod linux {
 
     /// Write a new object and publish it under `path`; on losing a publish
     /// race, attach to the winner's object instead.
-    pub fn publish_then_attach(path: &CStr, bytes: &[u8]) -> Option<SharedRegion> {
+    pub fn publish_then_attach(path: &CStr, bytes: &[u8]) -> Result<SharedRegion, String> {
         collect_garbage(path);
         let tmp_name = format!(
             "{}.tmp{}",
-            path.to_str().ok()?,
+            path.to_str().map_err(|_| "bad name".to_string())?,
             std::process::id()
         );
-        let tmp = CString::new(tmp_name).ok()?;
+        let tmp = CString::new(tmp_name).map_err(|_| "bad name".to_string())?;
         let fd = unsafe {
             libc::open(
                 tmp.as_ptr(),
@@ -215,37 +286,42 @@ mod linux {
             )
         };
         if fd < 0 {
-            return None;
+            return Err(errno("create"));
         }
         // Hold the shared lock from creation on: the garbage collector of a
         // concurrent publisher then cannot remove this file mid-publish.
-        let ok = unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } == 0
-            && write_all(fd, bytes);
-        if !ok {
+        let written = if unsafe { libc::flock(fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+            Err(errno("flock"))
+        } else {
+            write_all(fd, bytes)
+        };
+        if let Err(e) = written {
             unsafe {
                 libc::unlink(tmp.as_ptr());
                 libc::close(fd);
             }
-            return None;
+            return Err(e);
         }
         let linked = unsafe { libc::link(tmp.as_ptr(), path.as_ptr()) } == 0;
         unsafe { libc::unlink(tmp.as_ptr()) };
         if linked {
-            if let Some(r) = map_verified(fd, path, bytes) {
-                return Some(r);
-            }
-            // Could not map what we just wrote: withdraw it.
-            unsafe { libc::unlink(path.as_ptr()) };
-            unsafe { libc::close(fd) };
-            return None;
+            return match map_verified(fd, path, bytes) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    // Could not map what we just wrote: withdraw it.
+                    unsafe { libc::unlink(path.as_ptr()) };
+                    unsafe { libc::close(fd) };
+                    Err(e)
+                }
+            };
         }
         unsafe { libc::close(fd) };
         attach(path, bytes)
     }
 
-    fn write_all(fd: libc::c_int, bytes: &[u8]) -> bool {
+    fn write_all(fd: libc::c_int, bytes: &[u8]) -> Result<(), String> {
         if unsafe { libc::ftruncate(fd, bytes.len() as libc::off_t) } != 0 {
-            return false;
+            return Err(errno("ftruncate"));
         }
         let mut off = 0usize;
         while off < bytes.len() {
@@ -258,11 +334,13 @@ mod linux {
                 )
             };
             if n <= 0 {
-                return false;
+                // ENOSPC here usually means /dev/shm is smaller than the net
+                // (e.g. a container's default 64 MB).
+                return Err(errno("write"));
             }
             off += n as usize;
         }
-        true
+        Ok(())
     }
 
     impl Drop for SharedRegion {
@@ -297,6 +375,7 @@ mod tests {
         let tag = format!("test{}", std::process::id());
         let a = share(&data, &tag).expect("publish");
         let b = share(&data, &tag).expect("attach");
+        assert!(share(&[], &tag).is_err());
         assert_eq!(unsafe { std::slice::from_raw_parts(a.as_ptr(), data.len()) }, &data[..]);
         assert_eq!(unsafe { std::slice::from_raw_parts(b.as_ptr(), data.len()) }, &data[..]);
         // Different content must never attach to this object.
