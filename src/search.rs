@@ -113,7 +113,7 @@ tunables!(
     // ROUNDS rather than truncates. Whole raw bands therefore collapse to one
     // effective value, so such a parameter can post a large SPSA percentage
     // while changing nothing at all. Check the bucket before acting on a mover.
-    (NMP_BASE_R_10X, 50, 20, 80, 15.0, true),
+    (NMP_BASE_R_10X, 58, 20, 80, 15.0, true),
     (NMP_DEPTH_DIV_10X, 32, 10, 200, 15.0, true),
     (NMP_EVAL_DIV, 51, 50, 400, 17.5, true),
     (NMP_EVAL_MAX_10X, 35, 10, 60, 5.0, false),
@@ -185,7 +185,7 @@ tunables!(
     // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
     // One SPSA step either way changes under 0.04% of futility prunes, so
     // in core SPSA it would only add gradient noise. Kept at its value.
-    (FUT_LMR_DEPTH, 15, 6, 24, 2.0, false),
+    (FUT_LMR_DEPTH, 14, 6, 24, 2.0, false),
     // Move-count term: later quiets get a tighter futility margin. Default
     // FUT_PER_DEPTH / 8 — one depth-ply of margin per eight moves; capped at
     // the depth term so the margin never drops below FUT_BASE. Futility is
@@ -293,7 +293,7 @@ tunables!(
     // capture history is single-source, so it needs a smaller divisor than
     // quiet history to produce an equivalent reduction magnitude. Both are
     // continuous (`R -= hist / DIV`), not stepped.
-    (LMR_HIST_DIV_CAP, 5055, 1000, 20000, 1500.0, true),
+    (LMR_HIST_DIV_CAP, 4865, 1000, 20000, 1500.0, true),
     (LMR_C_QUIET, 179, 40, 300, 13.0, true),
     (LMR_C_CAP, 253, 80, 350, 12.5, true),
     // Two independent degrees of freedom on the LMR curve, both in centi-ply
@@ -309,7 +309,7 @@ tunables!(
     (LMR_ALLNODE_DECAY_NUM, 323, 0, 1600, 80.0, true),
     // Cut-node LMR bump, in centi-ply. Cut nodes reduce by this amount
     // (plus a further ply with no TT move); all-nodes keep +1.
-    (LMR_CUTNODE_BUMP_CENTI, 261, 100, 500, 40.0, true),
+    (LMR_CUTNODE_BUMP_CENTI, 271, 100, 500, 40.0, true),
     // LMR correction battery — sub-ply terms in centi-ply, needing the
     // fractional accumulator to express. These were seeded well below their
     // source values because Coda's ln(d)·ln(m) base already carries a
@@ -323,7 +323,7 @@ tunables!(
     // all-nodes). Seeded below source values for the double-counting reason
     // above. The >2 threshold is fixed, not a knob.
     (LMR_CUTOFF_CNT_CENTI, 60, 0, 250, 12.0, true),
-    (LMR_CUTOFF_ALLNODE_CENTI, 22, 0, 150, 8.0, true),
+    (LMR_CUTOFF_ALLNODE_CENTI, 21, 0, 150, 8.0, true),
     // Minimum depth at which singular extension is attempted. Too low and
     // singular_depth is itself too shallow to judge singularity reliably.
     (SE_DEPTH_10X, 40, 40, 200, 20.0, true),
@@ -363,7 +363,7 @@ tunables!(
     // again on the v10 net 2026-08-17, and the idea was closed then without
     // implementation. Tested anyway at Adam's request (2026-08-17) since the
     // predictor here differs from the post-hoc selector that was measured.
-    (LMP_MARGIN_THRESH, 53, 50, 500, 35.0, true),
+    (LMP_MARGIN_THRESH, 61, 50, 500, 35.0, true),
     // Root-depth-aware uplift on the LMP predictive margin, same shape as the
     // RFP_ROOT_* correction above with the sign flipped: that one demands MORE
     // confidence as the search gets deeper, this one demands more as it gets
@@ -379,7 +379,7 @@ tunables!(
     // preferred +23 divided by the measured 3-ply gap between the two medians.
     (LMP_ROOT_KNEE, 17, 10, 24, 1.5, true),
     (LMP_ROOT_COEF, 8, 0, 20, 1.5, true),
-    (LMP_MARGIN_PCT, 58, 40, 100, 6.0, true),
+    (LMP_MARGIN_PCT, 55, 40, 100, 6.0, true),
     // Root-depth-aware LMR relaxation (single-set, self-adapts STC<->LTC):
     // reduce LESS as the OVERALL search depth grows past LMR_ROOT_THRESH
     // (diminishing returns — at LTC the reduced re-search is cheap vs the
@@ -405,8 +405,8 @@ tunables!(
     // shallow root depths than deep ones, so add an offset below
     // PROBCUT_ROOT_THRESH and fade it out as root depth grows.
     (PROBCUT_ROOT_THRESH, 17, 8, 28, 1.5, true),
-    (PROBCUT_ROOT_FADE_10X, 35, 10, 120, 10.0, true),
-    (PROBCUT_ROOT_MARGIN, 69, 0, 120, 8.0, false),
+    (PROBCUT_ROOT_FADE_10X, 40, 10, 120, 10.0, true),
+    (PROBCUT_ROOT_MARGIN, 74, 0, 120, 8.0, false),
     (HINDSIGHT_THRESH, 133, 50, 400, 17.5, true),
     (QS_DELTA_MARGIN, 361, 100, 500, 20.0, true),
     // Cap on captures actually SEARCHED in qsearch (delta/SEE-pruned moves
@@ -573,13 +573,13 @@ tunables!(
     (NULL_THREAT_ESCAPE_BONUS, 8321, 0, 30000, 1000.0, false),
     (NMP_KING_ZONE_MAX_10X, 20, 20, 90, 15.0, true),
     (PROBCUT_KING_ZONE_MAX_10X, 86, 20, 90, 15.0, true),
-    (LMR_THREAT_DIV_10X, 48, 10, 50, 15.0, true),
+    (LMR_THREAT_DIV_10X, 42, 10, 50, 15.0, true),
     (LMR_KING_PRESSURE_DIV_10X, 78, 20, 90, 15.0, true),
     // Reduce later moves more once this node has already raised alpha N times
     // (alpha_raises reduction, a known LMR refinement). Fixed-point ×10: reduction += raises *
     // VALUE/10. Only fires at PV nodes (cut nodes break on the first fail-high
     // before alpha is raised). Default 5 = +0.5 reduction per prior alpha-raise.
-    (LMR_ALPHA_RAISE_10X, 5, 0, 40, 5.0, false),
+    (LMR_ALPHA_RAISE_10X, 10, 0, 40, 5.0, false),
     (FUT_THREATS_MARGIN, 42, 0, 200, 10.0, true),
     (DISCOVERED_ATTACK_BONUS, 0, 0, 30000, 1500.0, false),
     // xray-SE: when the TT move is from an x-ray blocker square (moving it
@@ -625,7 +625,7 @@ tunables!(
     // Minimum depth for internal iterative reduction. Floor runs low so SPSA
     // can explore "fire at any depth >= 1" rather than being clamped out of it.
     (IIR_MIN_DEPTH_10X, 34, 5, 100, 15.0, true),
-    (PROBCUT_MIN_DEPTH_10X, 15, 10, 120, 15.0, false),     // ProbCut activation gate
+    (PROBCUT_MIN_DEPTH_10X, 12, 10, 120, 15.0, false),     // ProbCut activation gate
     (PROBCUT_ROOT_MIN_DEPTH_10X, 23, 0, 80, 8.0, true),
     (SEE_CAP_DEPTH_10X, 99, 30, 150, 15.0, true),         // SEE capture prune depth cap
     // Capture-SEE prune margin, a common cross-engine shape: margin =
@@ -637,14 +637,14 @@ tunables!(
     // historically-good captures (the ones that produce cutoffs) so the base
     // can be lowered without over-pruning them. Dropping the base alone,
     // without the history term, cost +17% bench nodes.
-    (SEE_CAP_MULT, 98, 40, 250, 12.0, true),
-    (SEE_CAP_HIST, 11, 0, 40, 2.0, true),
+    (SEE_CAP_MULT, 94, 40, 250, 12.0, true),
+    (SEE_CAP_HIST, 12, 0, 40, 2.0, true),
     (BAD_NOISY_DEPTH_10X, 57, 40, 150, 15.0, true),       // BNFP depth cap
     // NMP activation gate (2 sites). This can sit low because RFP runs FIRST:
     // shallow NMP then only sees nodes static pruning could not already cut,
     // so it no longer intercepts free cutoffs. Reordering NMP ahead of RFP
     // would require pushing this gate back up to compensate.
-    (NMP_MIN_DEPTH_10X, 62, 20, 200, 15.0, true),
+    (NMP_MIN_DEPTH_10X, 65, 20, 200, 15.0, true),
     (HINDSIGHT_MIN_DEPTH_10X, 26, 0, 200, 15.0, true),
     // Net output scale in percent: the final NNUE eval is multiplied by
     // PCT/100. Nets train to very different natural scales (eval RMS has
