@@ -32,6 +32,7 @@ macro_rules! scratch_slice {
 
 mod types;
 mod hugepage;
+mod shared_weights;
 mod bitboard;
 mod zobrist;
 mod attacks;

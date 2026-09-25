@@ -129,6 +129,9 @@ pub struct AlignedVec<T> {
     /// True when backed by a direct anonymous mmap (hugepage path) —
     /// Drop must munmap instead of dealloc.
     mmapped: bool,
+    /// Set when the data lives in a read-only mapping shared with other Coda
+    /// processes (see `shared_weights`). The region owns that memory.
+    shared: Option<crate::shared_weights::SharedRegion>,
 }
 unsafe impl<T: Send> Send for AlignedVec<T> {}
 unsafe impl<T: Sync> Sync for AlignedVec<T> {}
@@ -139,11 +142,11 @@ impl<T: Default + Copy> AlignedVec<T> {
 
     fn zeros_aligned(n: usize, align: usize) -> Self {
         use std::alloc::{alloc_zeroed, Layout};
-        if n == 0 { return Self { ptr: std::ptr::NonNull::dangling().as_ptr(), len: 0, cap: n, align, mmapped: false }; }
+        if n == 0 { return Self { ptr: std::ptr::NonNull::dangling().as_ptr(), len: 0, cap: n, align, mmapped: false, shared: None }; }
         let layout = Layout::from_size_align(n * std::mem::size_of::<T>(), align).unwrap();
         let ptr = unsafe { alloc_zeroed(layout) } as *mut T;
         if ptr.is_null() { std::alloc::handle_alloc_error(layout); }
-        Self { ptr, len: n, cap: n, align, mmapped: false }
+        Self { ptr, len: n, cap: n, align, mmapped: false, shared: None }
     }
 
     pub fn zeros(n: usize) -> Self {
@@ -207,6 +210,7 @@ impl<T: Default + Copy> AlignedVec<T> {
                         cap: n,
                         align: Self::HUGE_PAGE,
                         mmapped: true,
+                        shared: None,
                     };
                 }
             }
@@ -244,6 +248,7 @@ impl<T: Default + Copy> AlignedVec<T> {
                     cap: n,
                     align: Self::HUGE_PAGE,
                     mmapped: true,
+                    shared: None,
                 };
             }
         }
@@ -260,6 +265,35 @@ impl<T: Default + Copy> AlignedVec<T> {
             );
         }
         v
+    }
+
+    /// Move the contents into a read-only mapping shared with other Coda
+    /// processes holding byte-identical data, freeing the private copy.
+    /// Returns whether the array is now shared; on any failure the private
+    /// copy is kept unchanged. The array must not be written afterwards.
+    pub fn share(&mut self, tag: &str) -> bool {
+        if self.shared.is_some() || self.len == 0 {
+            return self.shared.is_some();
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.ptr as *const u8, self.len * std::mem::size_of::<T>())
+        };
+        let Some(region) = crate::shared_weights::share(bytes, tag) else { return false };
+        let shared = Self {
+            ptr: region.as_ptr() as *mut T,
+            len: self.len,
+            cap: self.len,
+            align: 64,
+            mmapped: false,
+            shared: Some(region),
+        };
+        // Dropping the old value frees the private copy.
+        drop(std::mem::replace(self, shared));
+        true
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.shared.is_some()
     }
 
     /// Best-effort synchronous THP promotion (MADV_COLLAPSE, Linux 6.1+).
@@ -286,7 +320,11 @@ impl<T> std::ops::Deref for AlignedVec<T> {
     #[inline] fn deref(&self) -> &[T] { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } }
 }
 impl<T> std::ops::DerefMut for AlignedVec<T> {
-    #[inline] fn deref_mut(&mut self) -> &mut [T] { unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) } }
+    #[inline] fn deref_mut(&mut self) -> &mut [T] {
+        // Shared weights are mapped read-only; writing would fault.
+        debug_assert!(self.shared.is_none(), "write to a shared weight array");
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
 }
 impl<T: Default + Copy> From<Vec<T>> for AlignedVec<T> {
     fn from(v: Vec<T>) -> Self {
@@ -297,7 +335,8 @@ impl<T: Default + Copy> From<Vec<T>> for AlignedVec<T> {
 }
 impl<T> Drop for AlignedVec<T> {
     fn drop(&mut self) {
-        if self.cap == 0 { return; }
+        // A shared region frees itself when the `shared` field drops.
+        if self.cap == 0 || self.shared.is_some() { return; }
         if self.mmapped {
             #[cfg(target_os = "linux")]
             unsafe {
@@ -2984,9 +3023,25 @@ impl NNUENet {
     /// Load from a byte slice (for embedded nets). No temp files needed.
     pub fn load_from_bytes(data: &[u8]) -> Result<Self, String> {
         let mut reader = std::io::Cursor::new(data);
-        let net = Self::load_from_reader(&mut reader, data.len() as u64, "<embedded>")?;
+        let mut net = Self::load_from_reader(&mut reader, data.len() as u64, "<embedded>")?;
         net.validate_compat()?;
+        net.share_weights();
         Ok(net)
+    }
+
+    /// Back the two large weight matrices with memory shared across Coda
+    /// processes holding the same net (see `shared_weights`). Runs after the
+    /// load is complete, so the shared bytes are the final ones, and leaves a
+    /// private copy in place wherever sharing is off or fails.
+    fn share_weights(&mut self) {
+        if !crate::shared_weights::enabled() {
+            return;
+        }
+        let psq = self.input_weights.share("psq");
+        let thr = self.threat_weights.len() > 0 && self.threat_weights.share("thr");
+        println!("info string shared weights: PSQ {} MB {}, threat {} MB {}",
+            (self.input_weights.len() * 2) >> 20, if psq { "shared" } else { "private" },
+            self.threat_weights.len() >> 20, if thr { "shared" } else { "private" });
     }
 
     /// Load a v5/v6/v7 .nnue file.
@@ -2994,8 +3049,9 @@ impl NNUENet {
         let file_len = std::fs::metadata(path).map_err(|e| format!("stat {}: {}", path, e))?.len();
         let file = File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
         let mut reader = BufReader::new(file);
-        let net = Self::load_from_reader(&mut reader, file_len, path)?;
+        let mut net = Self::load_from_reader(&mut reader, file_len, path)?;
         net.validate_compat()?;
+        net.share_weights();
         Ok(net)
     }
 
