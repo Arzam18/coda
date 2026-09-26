@@ -336,6 +336,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 println!("option name Threads type spin default 1 min 1 max 256");
                 println!("option name NNUEFile type string default <empty>");
                 println!("option name OwnBook type check default true");
+                println!("option name SharedWeights type check default true");
                 println!("option name BookFile type string default <empty>");
                 println!("option name MoveOverhead type spin default 100 min 0 max 5000");
                 println!("option name Ponder type check default false");
@@ -1086,7 +1087,14 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                             // a drawn TB endgame; the TB draw move is
                             // safer.
                             if tb_valid {
-                                // Stop search and play TB move
+                                // Stop search and play TB move. Suppress the
+                                // ponder thread's own emit, as the `go` and
+                                // `ucinewgame` abandon paths do: the external
+                                // stop wakes its wait loop, and without this it
+                                // prints a bestmove ahead of ours. The GUI plays
+                                // the first and reads the second as a premature
+                                // bestmove inside its next `go ponder`.
+                                suppress_bestmove.store(true, Ordering::Relaxed);
                                 external_stop.store(true, Ordering::SeqCst);
                                 stop_flag.store(true, Ordering::SeqCst);
                                 if let Some(handle) = search_handle.take() {
@@ -1753,6 +1761,23 @@ fn parse_option(tokens: &[&str], info: &mut SearchInfo, num_threads: &mut usize,
         "MultiPV" => {
             if let Ok(n) = value.parse::<usize>() {
                 info.multipv = n.max(1).min(256);
+            }
+        }
+        // Share the big weight matrices with other Coda processes on this
+        // machine (see shared_weights). The embedded net is loaded before any
+        // option arrives, so a change reloads the current net under the new
+        // setting. Off gives each process a private copy, as before.
+        "SharedWeights" => {
+            let on = value.eq_ignore_ascii_case("true");
+            let was = crate::shared_weights::ENABLED.swap(on, std::sync::atomic::Ordering::AcqRel);
+            if on != was && info.nnue_net.is_some() {
+                let reloaded = match info.nnue_source.clone() {
+                    Some(path) => info.load_nnue(&path).is_ok(),
+                    None => info.auto_discover_nnue(),
+                };
+                if !reloaded {
+                    println!("info string ERROR: net reload for SharedWeights failed");
+                }
             }
         }
         "NNUEFile" => {

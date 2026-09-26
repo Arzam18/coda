@@ -113,7 +113,7 @@ tunables!(
     // ROUNDS rather than truncates. Whole raw bands therefore collapse to one
     // effective value, so such a parameter can post a large SPSA percentage
     // while changing nothing at all. Check the bucket before acting on a mover.
-    (NMP_BASE_R_10X, 50, 20, 80, 15.0, true),
+    (NMP_BASE_R_10X, 58, 20, 80, 15.0, true),
     (NMP_DEPTH_DIV_10X, 32, 10, 200, 15.0, true),
     (NMP_EVAL_DIV, 51, 50, 400, 17.5, true),
     (NMP_EVAL_MAX_10X, 35, 10, 60, 5.0, false),
@@ -158,6 +158,19 @@ tunables!(
     // depth, gated to shallow depths only.
     (RAZOR_MULT, 294, 100, 500, 20.0, false),
     (RAZOR_DEPTH_10X, 35, 10, 80, 5.0, true),
+    // Razoring is disabled once |alpha| exceeds this, so it only fires in
+    // positions that are still in the balance. The MAX IS DELIBERATELY FAR
+    // BELOW TB_WIN (28800): the tablebase floor/ceiling can only be set when
+    // |alpha| is up at TB range, so keeping this bound low is what makes
+    // razoring and a proven TB result mutually exclusive, and therefore what
+    // lets razoring skip the TB guard that RFP needs. Do not raise the max
+    // into TB range without re-deriving that argument.
+    (RAZOR_ALPHA_MAX, 2000, 500, 8000, 150.0, false),
+    // Weak-winning-confirmation guard: when alpha already represents an
+    // advantage this large, decline a razor cut whose qsearch result only
+    // grazes alpha by less than the margin below, and search it instead.
+    (RAZOR_WEAK_ALPHA, 200, 0, 1000, 20.0, false),
+    (RAZOR_WEAK_MARGIN, 32, 0, 150, 5.0, false),
     // Futility margin: base + per-depth, compared against alpha at the
     // frontier. History adjusts the effective lmr_depth used here, so these
     // interact with the LMR history terms — retune the pair together.
@@ -169,7 +182,10 @@ tunables!(
     // SPSA-tunable -- so SPSA has been optimising a formula with one frozen
     // input. Exposing it costs nothing and is behaviour-identical at 12000.
     (FUT_HIST_EXEMPT, 12628, 2000, 16384, 900.0, true),
-    (FUT_LMR_DEPTH, 15, 6, 24, 2.0, true),
+    // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
+    // One SPSA step either way changes under 0.04% of futility prunes, so
+    // in core SPSA it would only add gradient noise. Kept at its value.
+    (FUT_LMR_DEPTH, 14, 6, 24, 2.0, false),
     // Move-count term: later quiets get a tighter futility margin. Default
     // FUT_PER_DEPTH / 8 — one depth-ply of margin per eight moves; capped at
     // the depth term so the margin never drops below FUT_BASE. Futility is
@@ -277,7 +293,7 @@ tunables!(
     // capture history is single-source, so it needs a smaller divisor than
     // quiet history to produce an equivalent reduction magnitude. Both are
     // continuous (`R -= hist / DIV`), not stepped.
-    (LMR_HIST_DIV_CAP, 5055, 1000, 20000, 1500.0, true),
+    (LMR_HIST_DIV_CAP, 4865, 1000, 20000, 1500.0, true),
     (LMR_C_QUIET, 179, 40, 300, 13.0, true),
     (LMR_C_CAP, 253, 80, 350, 12.5, true),
     // Two independent degrees of freedom on the LMR curve, both in centi-ply
@@ -293,7 +309,7 @@ tunables!(
     (LMR_ALLNODE_DECAY_NUM, 323, 0, 1600, 80.0, true),
     // Cut-node LMR bump, in centi-ply. Cut nodes reduce by this amount
     // (plus a further ply with no TT move); all-nodes keep +1.
-    (LMR_CUTNODE_BUMP_CENTI, 261, 100, 500, 40.0, true),
+    (LMR_CUTNODE_BUMP_CENTI, 271, 100, 500, 40.0, true),
     // LMR correction battery — sub-ply terms in centi-ply, needing the
     // fractional accumulator to express. These were seeded well below their
     // source values because Coda's ln(d)·ln(m) base already carries a
@@ -307,7 +323,7 @@ tunables!(
     // all-nodes). Seeded below source values for the double-counting reason
     // above. The >2 threshold is fixed, not a knob.
     (LMR_CUTOFF_CNT_CENTI, 60, 0, 250, 12.0, true),
-    (LMR_CUTOFF_ALLNODE_CENTI, 22, 0, 150, 8.0, true),
+    (LMR_CUTOFF_ALLNODE_CENTI, 21, 0, 150, 8.0, true),
     // Minimum depth at which singular extension is attempted. Too low and
     // singular_depth is itself too shallow to judge singularity reliably.
     (SE_DEPTH_10X, 40, 40, 200, 20.0, true),
@@ -331,7 +347,10 @@ tunables!(
     // `(BASE + d²·DEPTH) / (2 - improving)`. BASE dominates at shallow depth
     // and sets how many quiets survive at d=1.
     (LMP_BASE_10X, 55, 10, 150, 20.0, true),
-    (LMP_DEPTH_10X, 127, 40, 200, 20.0, true),
+    // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
+    // One step down changes 0.02% of LMP prunes and one step up none: the
+    // move-count limit already outgrows the move list at these depths.
+    (LMP_DEPTH_10X, 127, 40, 200, 20.0, false),
     // Margin-aware LMP. Coda's LMP limit keys on depth and improving only; the
     // fail-low histogram (b_probe_*) shows late-quiet work concentrating at
     // nodes that end up failing low, but its margin is only knowable AFTER the
@@ -344,7 +363,7 @@ tunables!(
     // again on the v10 net 2026-08-17, and the idea was closed then without
     // implementation. Tested anyway at Adam's request (2026-08-17) since the
     // predictor here differs from the post-hoc selector that was measured.
-    (LMP_MARGIN_THRESH, 53, 50, 500, 35.0, true),
+    (LMP_MARGIN_THRESH, 61, 50, 500, 35.0, true),
     // Root-depth-aware uplift on the LMP predictive margin, same shape as the
     // RFP_ROOT_* correction above with the sign flipped: that one demands MORE
     // confidence as the search gets deeper, this one demands more as it gets
@@ -360,7 +379,7 @@ tunables!(
     // preferred +23 divided by the measured 3-ply gap between the two medians.
     (LMP_ROOT_KNEE, 17, 10, 24, 1.5, true),
     (LMP_ROOT_COEF, 8, 0, 20, 1.5, true),
-    (LMP_MARGIN_PCT, 58, 40, 100, 6.0, true),
+    (LMP_MARGIN_PCT, 55, 40, 100, 6.0, true),
     // Root-depth-aware LMR relaxation (single-set, self-adapts STC<->LTC):
     // reduce LESS as the OVERALL search depth grows past LMR_ROOT_THRESH
     // (diminishing returns — at LTC the reduced re-search is cheap vs the
@@ -386,8 +405,8 @@ tunables!(
     // shallow root depths than deep ones, so add an offset below
     // PROBCUT_ROOT_THRESH and fade it out as root depth grows.
     (PROBCUT_ROOT_THRESH, 17, 8, 28, 1.5, true),
-    (PROBCUT_ROOT_FADE_10X, 35, 10, 120, 10.0, true),
-    (PROBCUT_ROOT_MARGIN, 69, 0, 120, 8.0, false),
+    (PROBCUT_ROOT_FADE_10X, 40, 10, 120, 10.0, true),
+    (PROBCUT_ROOT_MARGIN, 74, 0, 120, 8.0, false),
     (HINDSIGHT_THRESH, 133, 50, 400, 17.5, true),
     (QS_DELTA_MARGIN, 361, 100, 500, 20.0, true),
     // Cap on captures actually SEARCHED in qsearch (delta/SEE-pruned moves
@@ -468,7 +487,10 @@ tunables!(
     (DEXT_MARGIN_QUIET, 17, 0, 100, 4.0, false),
     (DEXT_MARGIN_CORR, 16, 0, 64, 3.0, true),
     (DEXT_MARGIN_BASE, 28, -50, 150, 6.0, true),
-    (DEXT_CAP, 11, 4, 32, 2.0, true),
+    // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
+    // The cap binds on 0.02-0.15% of double-extension decisions. It is a
+    // safety valve against extension runaway; keep the value, don't tune it.
+    (DEXT_CAP, 11, 4, 32, 2.0, false),
     // How large a TT score has to be before the 50-move clock is allowed to
     // veto a cutoff on it. See `tt_halfmove_ok`.
     //
@@ -517,7 +539,11 @@ tunables!(
     // bonus a check that is not badly losing). Without it Coda orders losing
     // check-sacs into the first-searched slot. Margin on Coda's pawn=100 scale:
     // a check that loses more than this by SEE gets no ordering bonus.
-    (QUIET_CHECK_SEE_MARGIN, 78, 0, 300, 12.0, true),
+    // Non-core: a plateau knob (dead-knob audit 2026-09-24). SEE outcomes
+    // are sums of piece values, so every margin in 0..=99 behaves
+    // identically (bench-verified at 0, 50, 78 and 99); SPSA steps inside
+    // the plateau are pure noise. Change it only in whole-pawn steps.
+    (QUIET_CHECK_SEE_MARGIN, 78, 0, 300, 12.0, false),
     // Effective correction magnitude is sum(W) / (DIV * GRAIN_T), so this
     // divisor trades off directly against the CORR_W_* weights — the pair is
     // degenerate and must be read together, never one in isolation. The floor
@@ -547,13 +573,13 @@ tunables!(
     (NULL_THREAT_ESCAPE_BONUS, 8321, 0, 30000, 1000.0, false),
     (NMP_KING_ZONE_MAX_10X, 20, 20, 90, 15.0, true),
     (PROBCUT_KING_ZONE_MAX_10X, 86, 20, 90, 15.0, true),
-    (LMR_THREAT_DIV_10X, 48, 10, 50, 15.0, true),
+    (LMR_THREAT_DIV_10X, 42, 10, 50, 15.0, true),
     (LMR_KING_PRESSURE_DIV_10X, 78, 20, 90, 15.0, true),
     // Reduce later moves more once this node has already raised alpha N times
     // (alpha_raises reduction, a known LMR refinement). Fixed-point ×10: reduction += raises *
     // VALUE/10. Only fires at PV nodes (cut nodes break on the first fail-high
     // before alpha is raised). Default 5 = +0.5 reduction per prior alpha-raise.
-    (LMR_ALPHA_RAISE_10X, 5, 0, 40, 5.0, false),
+    (LMR_ALPHA_RAISE_10X, 10, 0, 40, 5.0, false),
     (FUT_THREATS_MARGIN, 42, 0, 200, 10.0, true),
     (DISCOVERED_ATTACK_BONUS, 0, 0, 30000, 1500.0, false),
     // xray-SE: when the TT move is from an x-ray blocker square (moving it
@@ -592,15 +618,6 @@ tunables!(
     // avoid contributing loose-knob false gradients to the sweep.
     (PAWN_HIST_MULT_10X, 14, 0, 80, 10.0, false),
     (KNIGHT_FORK_BONUS, 8722, 0, 20000, 1000.0, false),
-    // LMR endgame gate: skip LMR entirely when popcount(occupied) <= this.
-    // Fixes endgame-conversion blunders where LMR over-reduces the
-    // king-restriction moves that complete a mate.
-    //
-    // DELIBERATELY NARROW RANGE: this is correctness-load-bearing on live-play
-    // quality (a rook on an open board gets over-reduced as "late"), and SPSA
-    // has previously drifted it below the safe band. The floor is set so the
-    // effective value cannot fall under 5.
-    (LMR_ENDGAME_PIECES_10X, 0, 0, 90, 15.0, true),
     // --- Pruning depth gates ---
     // These are sensitive to eval quality and want re-calibrating after a net
     // change, which is why they are tunable rather than hardcoded.
@@ -608,7 +625,7 @@ tunables!(
     // Minimum depth for internal iterative reduction. Floor runs low so SPSA
     // can explore "fire at any depth >= 1" rather than being clamped out of it.
     (IIR_MIN_DEPTH_10X, 34, 5, 100, 15.0, true),
-    (PROBCUT_MIN_DEPTH_10X, 15, 10, 120, 15.0, false),     // ProbCut activation gate
+    (PROBCUT_MIN_DEPTH_10X, 12, 10, 120, 15.0, false),     // ProbCut activation gate
     (PROBCUT_ROOT_MIN_DEPTH_10X, 23, 0, 80, 8.0, true),
     (SEE_CAP_DEPTH_10X, 99, 30, 150, 15.0, true),         // SEE capture prune depth cap
     // Capture-SEE prune margin, a common cross-engine shape: margin =
@@ -620,14 +637,14 @@ tunables!(
     // historically-good captures (the ones that produce cutoffs) so the base
     // can be lowered without over-pruning them. Dropping the base alone,
     // without the history term, cost +17% bench nodes.
-    (SEE_CAP_MULT, 98, 40, 250, 12.0, true),
-    (SEE_CAP_HIST, 11, 0, 40, 2.0, true),
+    (SEE_CAP_MULT, 94, 40, 250, 12.0, true),
+    (SEE_CAP_HIST, 12, 0, 40, 2.0, true),
     (BAD_NOISY_DEPTH_10X, 57, 40, 150, 15.0, true),       // BNFP depth cap
     // NMP activation gate (2 sites). This can sit low because RFP runs FIRST:
     // shallow NMP then only sees nodes static pruning could not already cut,
     // so it no longer intercepts free cutoffs. Reordering NMP ahead of RFP
     // would require pushing this gate back up to compensate.
-    (NMP_MIN_DEPTH_10X, 62, 20, 200, 15.0, true),
+    (NMP_MIN_DEPTH_10X, 65, 20, 200, 15.0, true),
     (HINDSIGHT_MIN_DEPTH_10X, 26, 0, 200, 15.0, true),
     // Net output scale in percent: the final NNUE eval is multiplied by
     // PCT/100. Nets train to very different natural scales (eval RMS has
@@ -881,6 +898,7 @@ pub static FEAT_NMP: AtomicBool = AtomicBool::new(true);
 /// Off by default, controlled by UCI option `TMDebug`.
 pub static TM_DEBUG: AtomicBool = AtomicBool::new(false);
 pub static FEAT_RFP: AtomicBool = AtomicBool::new(true);
+pub static FEAT_RAZOR: AtomicBool = AtomicBool::new(true);
 pub static FEAT_PROBCUT: AtomicBool = AtomicBool::new(true);
 pub static FEAT_LMR: AtomicBool = AtomicBool::new(true);
 pub static FEAT_LMP: AtomicBool = AtomicBool::new(true);
@@ -916,6 +934,7 @@ pub static RFP_AUDIT: AtomicBool = AtomicBool::new(false);
 /// Disable all features (pure negamax + eval)
 pub fn disable_all_features() {
     FEAT_NMP.store(false, Ordering::Relaxed); FEAT_RFP.store(false, Ordering::Relaxed);
+    FEAT_RAZOR.store(false, Ordering::Relaxed);
     FEAT_PROBCUT.store(false, Ordering::Relaxed); FEAT_LMR.store(false, Ordering::Relaxed); FEAT_LMP.store(false, Ordering::Relaxed);
     FEAT_FUTILITY.store(false, Ordering::Relaxed); FEAT_SEE_PRUNE.store(false, Ordering::Relaxed);
     FEAT_BAD_NOISY.store(false, Ordering::Relaxed); FEAT_EXTENSIONS.store(false, Ordering::Relaxed); FEAT_FH_BLEND.store(false, Ordering::Relaxed);
@@ -1164,6 +1183,7 @@ prune_stats! {
     nmp_verify: u64,
     nmp_verify_fail: u64,
     rfp_cutoffs: u64,
+    razor_attempts: u64,
     razor_cutoffs: u64,
     lmp_prunes: u64,
     futility_prunes: u64,
@@ -1554,6 +1574,9 @@ pub struct SearchInfo {
     /// Correction-history tables, shared by all threads of a search.
     corr: std::sync::Arc<CorrTables>,
     pub nnue_net: Option<std::sync::Arc<crate::nnue::NNUENet>>,
+    /// Where the loaded net came from: its file path, or None for the
+    /// embedded net. Lets `SharedWeights` reload it under the new setting.
+    pub nnue_source: Option<String>,
     pub nnue_acc: Option<crate::nnue::NNUEAccumulator>,
     pub threat_stack: crate::threat_accum::ThreatStack,
     /// Syzygy tablebases (shared, read-only). Interior WDL probes in search.
@@ -1671,6 +1694,7 @@ impl SearchInfo {
             pawn_hist: alloc_zeroed_box(),
             corr: CorrTables::new(),
             nnue_net: None,
+            nnue_source: None,
             nnue_acc: None,
             threat_stack: crate::threat_accum::ThreatStack::new(768), // max v9 accum size
             syzygy: None,
@@ -1712,6 +1736,7 @@ impl SearchInfo {
         }
         self.nnue_net = Some(std::sync::Arc::new(net));
         self.nnue_acc = Some(acc);
+        self.nnue_source = Some(path.to_string());
         Ok(())
     }
 
@@ -1732,6 +1757,7 @@ impl SearchInfo {
                     }
                     self.nnue_net = Some(std::sync::Arc::new(net));
                     self.nnue_acc = Some(acc);
+                    self.nnue_source = None;
                     return true;
                 }
                 Err(e) => {
@@ -2708,6 +2734,7 @@ pub(crate) fn init_feature_flags() {
             disable_all_features();
             if std::env::var("ENABLE_NMP").is_ok() { FEAT_NMP.store(true, Ordering::Relaxed); }
             if std::env::var("ENABLE_RFP").is_ok() { FEAT_RFP.store(true, Ordering::Relaxed); }
+            if std::env::var("ENABLE_RAZOR").is_ok() { FEAT_RAZOR.store(true, Ordering::Relaxed); }
             if std::env::var("ENABLE_PROBCUT").is_ok() { FEAT_PROBCUT.store(true, Ordering::Relaxed); }
             if std::env::var("ENABLE_LMR").is_ok() { FEAT_LMR.store(true, Ordering::Relaxed); }
             if std::env::var("ENABLE_LMP").is_ok() { FEAT_LMP.store(true, Ordering::Relaxed); }
@@ -5756,16 +5783,19 @@ fn negamax(
         // Runs before RFP (consensus order: razor -> RFP -> NMP).
         if !is_pv
             && ply > 0
+            && FEAT_RAZOR.load(Ordering::Relaxed)
             && depth <= tp10(&RAZOR_DEPTH_10X)
-            && alpha.abs() < 2000
+            && alpha.abs() < tp(&RAZOR_ALPHA_MAX)
             && info.excluded_move[ply_u] == NO_MOVE
             && static_eval + tp(&RAZOR_MULT) * depth <= alpha
         {
+            info.stats.razor_attempts += 1;
             let v = quiescence(board, info, alpha, alpha + 1, ply);
             // When alpha already represents a substantial advantage, a QS
             // result that only grazes it is weak evidence that no quiet move
             // can preserve that advantage. Search those marginal cases.
-            let weak_winning_confirmation = alpha > 200 && v > alpha - 32;
+            let weak_winning_confirmation =
+                alpha > tp(&RAZOR_WEAK_ALPHA) && v > alpha - tp(&RAZOR_WEAK_MARGIN);
             if v <= alpha && !weak_winning_confirmation {
                 info.stats.razor_cutoffs += 1;
                 return v;
@@ -6631,11 +6661,6 @@ fn negamax(
 
         // Late Move Reductions (LMR) + Principal Variation Search (PVS)
         let mut reduction = 0i32;
-        // Endgame gate: skip LMR in low-piece-count positions where
-        // mate-completing king-restriction moves would be over-reduced.
-        let endgame_threshold = tp10(&LMR_ENDGAME_PIECES_10X) as u32;
-        let is_endgame_skip = endgame_threshold > 0
-            && crate::bitboard::popcount(board.occupied()) <= endgame_threshold;
         // Explicit `move_count > 1 && mv != tt_move` guards (defensive,
         // bench-neutral). Currently safe via LMR_TABLE zero-init at
         // depth<3 / move<3, but if the table is ever populated differently
@@ -6644,7 +6669,7 @@ fn negamax(
         // line-numbered: the pointer that was here had rotted by ~2400 lines.
         // NOTE: `!in_check` is deliberately ABSENT — see the check-relief
         // change below, which lets late evasions be reduced.
-        if !is_cap && !is_promo && !is_endgame_skip
+        if !is_cap && !is_promo
             && move_count > 1 && mv != tt_move
             && FEAT_LMR.load(Ordering::Relaxed) {
             let d = (depth as usize).min(63);
@@ -6835,7 +6860,7 @@ fn negamax(
         }
 
         // LMR for captures: use separate capture LMR table with capture history adjustments
-        if is_cap && !is_promo && move_count > 1 && mv != tt_move && !is_endgame_skip && FEAT_LMR.load(Ordering::Relaxed) {
+        if is_cap && !is_promo && move_count > 1 && mv != tt_move && FEAT_LMR.load(Ordering::Relaxed) {
             // Only reduce at non-PV nodes (zero window search)
             if beta - alpha == 1 {
                 let d = (depth as usize).min(63);
@@ -8294,6 +8319,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
     eprintln!("NMP attempts:   {:>8}  cutoffs: {} ({:.0}%)", s.nmp_attempts, s.nmp_cutoffs,
         if s.nmp_attempts > 0 { s.nmp_cutoffs as f64 / s.nmp_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("RFP cutoffs:    {:>8}  ({:.1}% of nodes)", s.rfp_cutoffs, s.rfp_cutoffs as f64 / total_nodes as f64 * 100.0);
+    eprintln!("Razor attempts: {:>8}  cutoffs: {} ({:.0}%)", s.razor_attempts, s.razor_cutoffs,
+              if s.razor_attempts > 0 { s.razor_cutoffs as f64 / s.razor_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("LMP prunes:     {:>8}", s.lmp_prunes);
     eprintln!("Futility prunes:{:>8}", s.futility_prunes);
     eprintln!("SEE prunes:     {:>8}", s.see_prunes);
@@ -8390,6 +8417,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
     eprintln!("NMP cutoffs:    {:>6.1}/Kn  ({:.0}% of attempts)", s.nmp_cutoffs as f64 / kn,
         if s.nmp_attempts > 0 { s.nmp_cutoffs as f64 / s.nmp_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("RFP cutoffs:    {:>6.1}/Kn", s.rfp_cutoffs as f64 / kn);
+    eprintln!("Razor cutoffs:  {:>6.1}/Kn  ({:.0}% of attempts)", s.razor_cutoffs as f64 / kn,
+              if s.razor_attempts > 0 { s.razor_cutoffs as f64 / s.razor_attempts as f64 * 100.0 } else { 0.0 });
     eprintln!("LMP prunes:     {:>6.1}/Kn", s.lmp_prunes as f64 / kn);
     eprintln!("Futility:       {:>6.1}/Kn", s.futility_prunes as f64 / kn);
     eprintln!("SEE prune:      {:>6.1}/Kn", s.see_prunes as f64 / kn);
