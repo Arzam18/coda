@@ -1574,6 +1574,9 @@ pub struct SearchInfo {
     /// Correction-history tables, shared by all threads of a search.
     corr: std::sync::Arc<CorrTables>,
     pub nnue_net: Option<std::sync::Arc<crate::nnue::NNUENet>>,
+    /// Where the loaded net came from: its file path, or None for the
+    /// embedded net. Lets `SharedWeights` reload it under the new setting.
+    pub nnue_source: Option<String>,
     pub nnue_acc: Option<crate::nnue::NNUEAccumulator>,
     pub threat_stack: crate::threat_accum::ThreatStack,
     /// Syzygy tablebases (shared, read-only). Interior WDL probes in search.
@@ -1691,6 +1694,7 @@ impl SearchInfo {
             pawn_hist: alloc_zeroed_box(),
             corr: CorrTables::new(),
             nnue_net: None,
+            nnue_source: None,
             nnue_acc: None,
             threat_stack: crate::threat_accum::ThreatStack::new(768), // max v9 accum size
             syzygy: None,
@@ -1732,6 +1736,7 @@ impl SearchInfo {
         }
         self.nnue_net = Some(std::sync::Arc::new(net));
         self.nnue_acc = Some(acc);
+        self.nnue_source = Some(path.to_string());
         Ok(())
     }
 
@@ -1752,6 +1757,7 @@ impl SearchInfo {
                     }
                     self.nnue_net = Some(std::sync::Arc::new(net));
                     self.nnue_acc = Some(acc);
+                    self.nnue_source = None;
                     return true;
                 }
                 Err(e) => {
