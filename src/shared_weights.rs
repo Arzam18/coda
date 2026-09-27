@@ -10,7 +10,7 @@
 //! because one search touches ~40 MB of distinct weight rows. With a single
 //! physical copy those rows occupy L3 once.
 //!
-//! Scheme (Linux only; everything else keeps the private copy):
+//! Scheme on Linux (Windows below; everything else keeps the private copy):
 //! - Each process still loads the net privately, exactly as before, so the
 //!   bytes it expects are known locally.
 //! - The shared object is a file in `/dev/shm` named by a hash of those final
@@ -30,6 +30,13 @@
 //! filesystem `link()` after the file is fully written, and readers verify the
 //! whole content, so there is no memory-ordering contract to get wrong on
 //! weakly-ordered CPUs.
+//!
+//! Windows: a named section backed by the page file, in the per-session
+//! `Local\` namespace (no privileges needed). A named mutex serialises the
+//! first fill, so a process never maps a half-written section; attach then
+//! compares every byte exactly as on Linux. The kernel frees the section when
+//! the last handle closes, crash included, so there is nothing to clean up.
+//! The shared copy uses normal pages, as does the private copy it replaces.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -42,7 +49,7 @@ pub fn enabled() -> bool {
 
 /// A read-only shared mapping of one weight array. Dropping it unmaps the
 /// memory and, if this process was the last user, removes the name.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub struct SharedRegion {
     ptr: *mut u8,
     len: usize,
@@ -50,19 +57,21 @@ pub struct SharedRegion {
     fd: libc::c_int,
     #[cfg(target_os = "linux")]
     path: std::ffi::CString,
+    #[cfg(windows)]
+    map: isize,
 }
 
 unsafe impl Send for SharedRegion {}
 unsafe impl Sync for SharedRegion {}
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 impl SharedRegion {
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 /// Deterministic content hash used only to NAME the object, over a sparse
 /// sample (one 64-byte line in every 64): hashing all ~92 MB would cost every
 /// engine launch tens of milliseconds. Correctness never rests on the name —
@@ -78,7 +87,7 @@ fn content_hash(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 const PREFIX: &str = "coda-w1-";
 
 /// The host's huge-page policy for shared memory (the bracketed value of
@@ -119,10 +128,126 @@ pub fn share(bytes: &[u8], tag: &str) -> Result<SharedRegion, String> {
             Err(e) => Err(e),
         };
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let name = format!("Local\\{}{}-{:016x}-{}", PREFIX, tag, content_hash(bytes), bytes.len());
+        return windows::share(&name, bytes);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = tag;
         Err("not supported on this platform".into())
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use super::SharedRegion;
+    use core::ffi::c_void;
+
+    type Handle = isize;
+    const INVALID_HANDLE_VALUE: Handle = -1;
+    const PAGE_READWRITE: u32 = 0x04;
+    const FILE_MAP_WRITE: u32 = 0x0002;
+    const FILE_MAP_READ: u32 = 0x0004;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_ABANDONED: u32 = 0x80;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileMappingW(file: Handle, attrs: *const c_void, protect: u32,
+                              size_high: u32, size_low: u32, name: *const u16) -> Handle;
+        fn MapViewOfFile(map: Handle, access: u32, off_high: u32, off_low: u32,
+                         bytes: usize) -> *mut c_void;
+        fn UnmapViewOfFile(base: *const c_void) -> i32;
+        fn CloseHandle(h: Handle) -> i32;
+        fn CreateMutexW(attrs: *const c_void, initial_owner: i32, name: *const u16) -> Handle;
+        fn WaitForSingleObject(h: Handle, ms: u32) -> u32;
+        fn ReleaseMutex(h: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn last_error(what: &str) -> String {
+        format!("{}: error {}", what, unsafe { GetLastError() })
+    }
+
+    /// Open the named section, creating and filling it if this is the first
+    /// process, all under a named mutex so nobody maps it half-written.
+    pub fn share(name: &str, bytes: &[u8]) -> Result<SharedRegion, String> {
+        // Mutexes and sections share one namespace, so the lock needs its own name.
+        let lock = wide(&format!("{}-init", name));
+        let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, lock.as_ptr()) };
+        if mutex == 0 {
+            return Err(last_error("CreateMutex"));
+        }
+        // An abandoned mutex means an earlier holder died mid-fill; the byte
+        // comparison below then rejects whatever it left, so carry on.
+        let w = unsafe { WaitForSingleObject(mutex, 30_000) };
+        if w != WAIT_OBJECT_0 && w != WAIT_ABANDONED {
+            unsafe { CloseHandle(mutex) };
+            return Err(format!("init lock wait: {:#x}", w));
+        }
+        let result = open_or_create(name, bytes);
+        unsafe {
+            ReleaseMutex(mutex);
+            CloseHandle(mutex);
+        }
+        result
+    }
+
+    fn open_or_create(name: &str, bytes: &[u8]) -> Result<SharedRegion, String> {
+        let len = bytes.len() as u64;
+        let wname = wide(name);
+        let map = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE,
+                               (len >> 32) as u32, len as u32, wname.as_ptr())
+        };
+        if map == 0 {
+            return Err(last_error("CreateFileMapping"));
+        }
+        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        if !existed {
+            let v = unsafe { MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, bytes.len()) };
+            if v.is_null() {
+                let e = last_error("MapViewOfFile (fill)");
+                unsafe { CloseHandle(map) };
+                return Err(e);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), v as *mut u8, bytes.len());
+                UnmapViewOfFile(v);
+            }
+        }
+        let v = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, bytes.len()) };
+        if v.is_null() {
+            let e = last_error("MapViewOfFile");
+            unsafe { CloseHandle(map) };
+            return Err(e);
+        }
+        let mapped = unsafe { std::slice::from_raw_parts(v as *const u8, bytes.len()) };
+        if mapped != bytes {
+            unsafe {
+                UnmapViewOfFile(v);
+                CloseHandle(map);
+            }
+            return Err("content mismatch".into());
+        }
+        Ok(SharedRegion { ptr: v as *mut u8, len: bytes.len(), map })
+    }
+
+    impl Drop for SharedRegion {
+        fn drop(&mut self) {
+            // The kernel frees the section when its last handle closes.
+            unsafe {
+                UnmapViewOfFile(self.ptr as *const c_void);
+                CloseHandle(self.map);
+            }
+        }
     }
 }
 
@@ -389,5 +514,21 @@ mod tests {
         drop(b);
         assert!(!std::path::Path::new(&path).exists(), "last user unlinks");
         drop(c);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn share_attach_verify_windows() {
+        let data: Vec<u8> = (0..300_000u32).map(|i| ((i % 251) ^ (i / 997)) as u8).collect();
+        let tag = format!("test{}", std::process::id());
+        let a = share(&data, &tag).expect("create");
+        let b = share(&data, &tag).expect("open existing");
+        assert_eq!(unsafe { std::slice::from_raw_parts(a.as_ptr(), data.len()) }, &data[..]);
+        assert_eq!(unsafe { std::slice::from_raw_parts(b.as_ptr(), data.len()) }, &data[..]);
+        let mut other = data.clone();
+        other[12345] ^= 1;
+        let c = share(&other, &tag).expect("distinct object");
+        assert_ne!(a.as_ptr(), c.as_ptr());
+        assert!(share(&[], &tag).is_err());
     }
 }
