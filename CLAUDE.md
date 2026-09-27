@@ -101,7 +101,9 @@ PromoteN=4..PromoteQ=7. Double-push has no flag (detected by distance in make_mo
 
 ### Search
 Negamax + alpha-beta, iterative deepening, PVS, aspiration windows (from depth 4).
-Lazy SMP: helper threads search at offset depths sharing the TT (atomic) + stop flag.
+Lazy SMP: helper threads run the same iterative deepening from depth 1, sharing the TT
+(atomic) + stop flag. Search diversity comes from TT interaction and scheduling, not from
+depth offsets — those were removed in May 2026. The pool is persistent across `go`s.
 
 **Pruning / extension features** (all SPSA-tunable via the `tunables!` macro in
 `search.rs` — that macro is the authoritative feature list, defaults, and ranges):
