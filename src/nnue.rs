@@ -3565,9 +3565,11 @@ impl NNUENet {
         // when production moved to L1=16 — i.e. at the moment the answer changed.
         let fused_width = l1_size == 32 || l1_size == 16;
         let plain_avx2 = has_avx2 && !has_avx_vnni && !has_avx512_vnni;
-        if plain_avx2 && fused_width && x2_safe {
-            println!("info string maddubs-pair fusion: safe — using fused AVX2 L1 kernel");
-        }
+        // NOTE: what kernel is actually USED is reported after select_l1_kernel
+        // below. This gate only establishes that fusion is SAFE for these
+        // weights; it does not decide the kernel, and reporting a kernel from
+        // here claimed the fused path even when something else was selected.
+        let fusion_safe_note = plain_avx2 && fused_width && x2_safe;
         // Announce the REJECTION on every host, not just plain-AVX2 ones. The
         // gate is per-net and its failure is otherwise invisible: a net that
         // fails it still loads cleanly and is simply ~4% slower on AVX2 — and
@@ -3596,6 +3598,16 @@ impl NNUENet {
             has_dotprod,
             has_i8mm,
         );
+
+        // Report the kernel that was actually SELECTED, not the one the fusion
+        // gate implies. These can differ — a bucketed net, or CODA_FORCE_ROWMAJOR_L1
+        // — and the old line asserted the fused path regardless, which is exactly
+        // the kind of diagnostic that sends someone down the wrong hole.
+        if fusion_safe_note {
+            println!("info string maddubs-pair fusion: safe (weights within the \
+                      saturation bound)");
+        }
+        println!("info string L1 kernel selected: {:?}", l1_kernel);
 
         Ok(NNUENet {
             hidden_size,
