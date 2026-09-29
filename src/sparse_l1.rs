@@ -1200,6 +1200,44 @@ pub unsafe fn dense_l1_avx_vnni(
 mod tests {
     use super::*;
 
+    /// Each per-bucket section built by `transpose_weights_for_sparse_range`
+    /// must equal the plain transpose of that bucket's neurons taken as a
+    /// standalone (unbucketed) net — i.e. exactly the table the column-major
+    /// kernels already consume for an unbucketed net of the per-bucket width.
+    #[test]
+    fn test_transpose_range_matches_standalone_bucket() {
+        let buckets = 3usize;
+        let per_bucket = 4usize;
+        let total = buckets * per_bucket;
+        let pw = 8usize; // per-perspective inputs; total_input = 2 * pw
+        let total_input = 2 * pw;
+        // Full row-major table: STM block [neuron][pw] for ALL neurons, then NTM block.
+        let mut full = vec![0i8; 2 * total * pw];
+        for (i, w) in full.iter_mut().enumerate() {
+            *w = ((i * 37 + 11) % 251) as i8; // distinct, deterministic, signed values
+        }
+        for b in 0..buckets {
+            // Standalone net holding only bucket b's neurons, same row-major layout.
+            let mut sub = vec![0i8; 2 * per_bucket * pw];
+            for local in 0..per_bucket {
+                let n = b * per_bucket + local;
+                for j in 0..pw {
+                    sub[local * pw + j] = full[n * pw + j];
+                    sub[per_bucket * pw + local * pw + j] = full[total * pw + n * pw + j];
+                }
+            }
+            let expect = transpose_weights_for_sparse(&sub, total_input, per_bucket);
+            let got = transpose_weights_for_sparse_range(&full, total_input, total, b * per_bucket, per_bucket);
+            assert_eq!(got, expect, "bucket {b}: section differs from the standalone transpose");
+            assert_eq!(got.len(), (total_input / 4) * per_bucket * 4, "section size");
+        }
+        // The unbucketed wrapper is the range over everything.
+        assert_eq!(
+            transpose_weights_for_sparse(&full, total_input, total),
+            transpose_weights_for_sparse_range(&full, total_input, total, 0, total)
+        );
+    }
+
     #[test]
     fn test_transpose_weights() {
         // 2 neurons, pw=4 per perspective, total_input=8 (4 STM + 4 NTM)

@@ -2798,12 +2798,13 @@ struct Align64<T>(T);
 /// meant silent double-accumulation or a missing bias seed).
 ///
 /// Column-major `Dense*` kernels read the input-chunk-major
-/// `l1_weights_sparse` table. That table is laid out with the TOTAL
-/// (bucketed) neuron count as its per-chunk stride and the kernels take no
-/// bucket offset, so they are only sound for UNBUCKETED nets —
-/// `select_l1_kernel` guards them with `!bucketed_hidden`. `RowMajor*`
-/// kernels index `l1_weights_8t` with an explicit `l1_off` and support
-/// bucketed-hidden nets.
+/// `l1_weights_sparse` table and take no bucket offset. For a bucketed-hidden
+/// net that table is built as one independent section per output bucket
+/// (each strided by the PER-BUCKET neuron count; `NNUENet::sparse_bucket_stride`
+/// bytes apart), and the forward pass hands the kernel its bucket's section,
+/// so the same kernels serve bucketed and unbucketed nets. `RowMajor*`
+/// kernels index `l1_weights_8t` with an explicit `l1_off` and are the
+/// reference the column-major path is checked against (CODA_FORCE_ROWMAJOR_L1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum L1Kernel {
     /// AVX-512 VNNI column-major dense (one VPDPBUSD per chunk, L1=16).
@@ -2845,8 +2846,8 @@ pub enum L1Kernel {
 }
 
 /// Mirror of the historical dispatch priority in
-/// `forward_with_l1_pairwise_inner`, with `!bucketed_hidden` guards added
-/// to the column-major arms (see `L1Kernel` docs). All inputs are
+/// `forward_with_l1_pairwise_inner`. Bucketed-hidden nets use the
+/// column-major arms too (per-bucket sections; see `L1Kernel` docs). All inputs are
 /// net/CPU-static, so the result is cached in `NNUENet::l1_kernel`.
 #[allow(clippy::too_many_arguments)]
 fn select_l1_kernel(
@@ -3937,8 +3938,8 @@ impl NNUENet {
             };
         }
         // L1 matmul. Kernel choice is net/CPU-static and cached at load
-        // (`select_l1_kernel`) — see the `L1Kernel` docs for why the
-        // column-major arms exclude bucketed-hidden nets.
+        // (`select_l1_kernel`) — see the `L1Kernel` docs for how the
+        // column-major arms serve bucketed-hidden nets (per-bucket sections).
         //
         // The three NEON row-major arms differ only in the x4 dot kernel
         // (`$x4`), so they share one macro to stay identical-by-construction.
