@@ -2798,12 +2798,13 @@ struct Align64<T>(T);
 /// meant silent double-accumulation or a missing bias seed).
 ///
 /// Column-major `Dense*` kernels read the input-chunk-major
-/// `l1_weights_sparse` table. That table is laid out with the TOTAL
-/// (bucketed) neuron count as its per-chunk stride and the kernels take no
-/// bucket offset, so they are only sound for UNBUCKETED nets —
-/// `select_l1_kernel` guards them with `!bucketed_hidden`. `RowMajor*`
-/// kernels index `l1_weights_8t` with an explicit `l1_off` and support
-/// bucketed-hidden nets.
+/// `l1_weights_sparse` table and take no bucket offset. For a bucketed-hidden
+/// net that table is built as one independent section per output bucket
+/// (each strided by the PER-BUCKET neuron count; `NNUENet::sparse_bucket_stride`
+/// bytes apart), and the forward pass hands the kernel its bucket's section,
+/// so the same kernels serve bucketed and unbucketed nets. `RowMajor*`
+/// kernels index `l1_weights_8t` with an explicit `l1_off` and are the
+/// reference the column-major path is checked against (CODA_FORCE_ROWMAJOR_L1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum L1Kernel {
     /// AVX-512 VNNI column-major dense (one VPDPBUSD per chunk, L1=16).
@@ -2845,8 +2846,8 @@ pub enum L1Kernel {
 }
 
 /// Mirror of the historical dispatch priority in
-/// `forward_with_l1_pairwise_inner`, with `!bucketed_hidden` guards added
-/// to the column-major arms (see `L1Kernel` docs). All inputs are
+/// `forward_with_l1_pairwise_inner`. Bucketed-hidden nets use the
+/// column-major arms too (per-bucket sections; see `L1Kernel` docs). All inputs are
 /// net/CPU-static, so the result is cached in `NNUENet::l1_kernel`.
 #[allow(clippy::too_many_arguments)]
 fn select_l1_kernel(
@@ -2868,7 +2869,14 @@ fn select_l1_kernel(
     if !use_pairwise {
         return L1Kernel::Scalar;
     }
-    let col_ok = have_sparse && !bucketed_hidden;
+    // Bucketed nets are fine on the column-major path now that the table is
+    // built one section per bucket and the caller passes that section.
+    //
+    // CODA_FORCE_ROWMAJOR_L1 forces the row-major path. It exists so the two
+    // kernels can be compared on the SAME binary and net: row-major already
+    // handled bucketed nets correctly, so it is the reference implementation
+    // this change is verified against. Off unless the variable is set.
+    let col_ok = have_sparse && std::env::var_os("CODA_FORCE_ROWMAJOR_L1").is_none();
     #[cfg(target_arch = "x86_64")]
     {
         if has_avx512_vnni && col_ok && l1 == 16 && pw.is_multiple_of(4) {
@@ -2946,6 +2954,11 @@ pub struct NNUENet {
     pub l1_weights_t: Vec<i16>,   // [l1_size × 2*hidden_size] transposed for SIMD
     pub l1_weights_8t: Vec<i8>,   // [l1_size × 2*hidden_size] transposed int8 for VPMADDUBSW
     pub l1_weights_sparse: AlignedVec<i8>, // input-chunk-major for sparse L1 dpbusd 64B-aligned (perf M2)
+    /// Byte stride between per-bucket sections of `l1_weights_sparse`.
+    /// Non-zero ONLY for bucketed-hidden nets, where the table is built as
+    /// one independent section per output bucket so the column-major kernels
+    /// (which take no bucket index) can consume a section unchanged.
+    pub sparse_bucket_stride: usize,
     pub l1_biases: Vec<i16>,      // [l1_size]
     pub l2_weights_f: Vec<f32>,   // [l2_input × l2_size] — float (l2_input = l1*2 if dual)
     pub l2_biases_f: Vec<f32>,    // [l2_size]
@@ -3436,12 +3449,28 @@ impl NNUENet {
         }).collect();
 
         // Sparse L1 weights: input-chunk-major for dpbusd kernel
-        let l1_weights_sparse: AlignedVec<i8> = if l1_size > 0 && use_pairwise {
-            let total_input = if use_pairwise { hidden_size } else { 2 * hidden_size };
-            crate::sparse_l1::transpose_weights_for_sparse(&l1_weights_8t, total_input, bl1).into()
-        } else {
-            AlignedVec::zeros(0)
-        };
+        // Column-major sparse L1 table. For a bucketed-hidden net, build ONE
+        // SECTION PER BUCKET rather than a single table strided by the total
+        // neuron count: the Dense kernels take no bucket index, so a combined
+        // table would have them read another bucket's weights. Sections are
+        // equal-sized and selected by a flat byte offset at eval time.
+        let (l1_weights_sparse, sparse_bucket_stride): (AlignedVec<i8>, usize) =
+            if l1_size > 0 && use_pairwise {
+                let total_input = if use_pairwise { hidden_size } else { 2 * hidden_size };
+                if bucketed_hidden {
+                    let section = (total_input / 4) * l1_size * 4;
+                    let mut all: Vec<i8> = Vec::with_capacity(section * NNUE_OUTPUT_BUCKETS);
+                    for b in 0..NNUE_OUTPUT_BUCKETS {
+                        all.extend_from_slice(&crate::sparse_l1::transpose_weights_for_sparse_range(
+                            &l1_weights_8t, total_input, bl1, b * l1_size, l1_size));
+                    }
+                    (all.into(), section)
+                } else {
+                    (crate::sparse_l1::transpose_weights_for_sparse(&l1_weights_8t, total_input, bl1).into(), 0)
+                }
+            } else {
+                (AlignedVec::zeros(0), 0)
+            };
 
         // Prepare float weights for v7 hidden layer forward pass
         // L2 and output use QA_L1 (not QA) for dequantization
@@ -3519,16 +3548,28 @@ impl NNUENet {
         }
 
         // maddubs-pair fusion saturation gate — O(weights), once at load.
+        // x2 fusion pairs adjacent chunks, so it must be checked WITHIN a
+        // section — across a section boundary the pairing is meaningless.
         let x2_safe = !l1_weights_sparse.is_empty()
-            && crate::sparse_l1::x2_fusion_safe(&l1_weights_sparse, l1_size);
+            && if sparse_bucket_stride > 0 {
+                (0..NNUE_OUTPUT_BUCKETS).all(|b| {
+                    let lo = b * sparse_bucket_stride;
+                    crate::sparse_l1::x2_fusion_safe(
+                        &l1_weights_sparse[lo..lo + sparse_bucket_stride], l1_size)
+                })
+            } else {
+                crate::sparse_l1::x2_fusion_safe(&l1_weights_sparse, l1_size)
+            };
         // Widths for which a fused AVX2 kernel exists. Before the L1=16 kernel
         // this reporting was gated on `l1_size == 32`, so it went silent exactly
         // when production moved to L1=16 — i.e. at the moment the answer changed.
         let fused_width = l1_size == 32 || l1_size == 16;
         let plain_avx2 = has_avx2 && !has_avx_vnni && !has_avx512_vnni;
-        if plain_avx2 && fused_width && x2_safe {
-            println!("info string maddubs-pair fusion: safe — using fused AVX2 L1 kernel");
-        }
+        // NOTE: what kernel is actually USED is reported after select_l1_kernel
+        // below. This gate only establishes that fusion is SAFE for these
+        // weights; it does not decide the kernel, and reporting a kernel from
+        // here claimed the fused path even when something else was selected.
+        let fusion_safe_note = plain_avx2 && fused_width && x2_safe;
         // Announce the REJECTION on every host, not just plain-AVX2 ones. The
         // gate is per-net and its failure is otherwise invisible: a net that
         // fails it still loads cleanly and is simply ~4% slower on AVX2 — and
@@ -3558,6 +3599,16 @@ impl NNUENet {
             has_i8mm,
         );
 
+        // Report the kernel that was actually SELECTED, not the one the fusion
+        // gate implies. These can differ — a bucketed net, or CODA_FORCE_ROWMAJOR_L1
+        // — and the old line asserted the fused path regardless, which is exactly
+        // the kind of diagnostic that sends someone down the wrong hole.
+        if fusion_safe_note {
+            println!("info string maddubs-pair fusion: safe (weights within the \
+                      saturation bound)");
+        }
+        println!("info string L1 kernel selected: {:?}", l1_kernel);
+
         Ok(NNUENet {
             hidden_size,
             num_pawn_pair_features,
@@ -3578,6 +3629,7 @@ impl NNUENet {
             l1_weights_t,
             l1_weights_8t,
             l1_weights_sparse,
+            sparse_bucket_stride,
             l1_weights,
             l1_biases,
             l2_weights_f,
@@ -3769,6 +3821,7 @@ impl NNUENet {
 
         // For bucketed nets: only compute neurons for this bucket
         let l1_off = if self.bucketed_hidden { bucket * l1_pb } else { 0 };
+        let l1_sparse = &self.l1_weights_sparse[bucket * self.sparse_bucket_stride..];
         let l1 = if self.bucketed_hidden { l1_pb } else { l1_total };
 
         let has_threats = !stm_threat.is_empty();
@@ -3897,8 +3950,8 @@ impl NNUENet {
             };
         }
         // L1 matmul. Kernel choice is net/CPU-static and cached at load
-        // (`select_l1_kernel`) — see the `L1Kernel` docs for why the
-        // column-major arms exclude bucketed-hidden nets.
+        // (`select_l1_kernel`) — see the `L1Kernel` docs for how the
+        // column-major arms serve bucketed-hidden nets (per-bucket sections).
         //
         // The three NEON row-major arms differ only in the x4 dot kernel
         // (`$x4`), so they share one macro to stay identical-by-construction.
@@ -3959,7 +4012,7 @@ impl NNUENet {
                 // per-neuron paths.
                 unsafe {
                     crate::sparse_l1::dense_l1_avx512_vnni(
-                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        stm_pw, ntm_pw, pw, l1_sparse,
                         l1, &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
                     );
                 }
@@ -3973,7 +4026,7 @@ impl NNUENet {
                 // fallback that re-scanned the input 32×.
                 unsafe {
                     crate::sparse_l1::dense_l1_avx512_vnni_l1_32(
-                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        stm_pw, ntm_pw, pw, l1_sparse,
                         &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
                     );
                 }
@@ -3999,7 +4052,7 @@ impl NNUENet {
                 // AVX-VNNI (YMM VPDPBUSD) — Alder Lake+, Zen 4+ without full AVX-512.
                 unsafe {
                     crate::sparse_l1::dense_l1_avx_vnni(
-                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        stm_pw, ntm_pw, pw, l1_sparse,
                         l1, &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
                     );
                 }
@@ -4012,7 +4065,7 @@ impl NNUENet {
                 // dense_l1_avx2_l1_32 (already column-major) with VPDPBUSD.
                 unsafe {
                     crate::sparse_l1::dense_l1_avx_vnni_l1_32(
-                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        stm_pw, ntm_pw, pw, l1_sparse,
                         &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
                     );
                 }
@@ -4042,7 +4095,7 @@ impl NNUENet {
                 // selected).
                 unsafe {
                     crate::sparse_l1::dense_l1_avx2_l1_32_x2(
-                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        stm_pw, ntm_pw, pw, l1_sparse,
                         &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
                     );
                 }
@@ -4054,7 +4107,7 @@ impl NNUENet {
                 // x2_fusion_safe gate (else this arm is never selected).
                 unsafe {
                     crate::sparse_l1::dense_l1_avx2_l1_16_x2(
-                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        stm_pw, ntm_pw, pw, l1_sparse,
                         &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
                     );
                 }
@@ -4068,7 +4121,7 @@ impl NNUENet {
                 // parallel via VPMADDUBSW + VPMADDWD.
                 unsafe {
                     crate::sparse_l1::dense_l1_avx2_l1_32(
-                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        stm_pw, ntm_pw, pw, l1_sparse,
                         &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
                     );
                 }
@@ -4093,7 +4146,7 @@ impl NNUENet {
                 // correct here.
                 unsafe {
                     crate::sparse_l1::dense_l1_avx2(
-                        stm_pw, ntm_pw, pw, &self.l1_weights_sparse,
+                        stm_pw, ntm_pw, pw, l1_sparse,
                         l1, &self.l1_biases[l1_off..], pw_scale, hidden32_ptr,
                     );
                 }
