@@ -6,7 +6,7 @@ on:
       uci_date:
         description: "Coda UCI version/date (example: 20260926)"
         required: true
-        default: "20260929"
+        default: "20261005"
         type: string
 
 permissions:
