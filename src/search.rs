@@ -3779,7 +3779,6 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     }
 
     // Age history tables (×0.80) to preserve useful move ordering from prior searches.
-    // Killers and counter-moves are cleared (position-specific).
     // Correction history PERSISTS across `go` (cleared on ucinewgame only, in
     // uci.rs) — as it does in every engine surveyed. This only pays off given
     // the full-error corrhist updates: under a tight error pre-clamp the table
