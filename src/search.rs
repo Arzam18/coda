@@ -584,35 +584,6 @@ tunables!(
     // before alpha is raised). Default 5 = +0.5 reduction per prior alpha-raise.
     (LMR_ALPHA_RAISE_10X, 10, 0, 40, 5.0, false),
     (FUT_THREATS_MARGIN, 42, 0, 200, 10.0, true),
-    (DISCOVERED_ATTACK_BONUS, 0, 0, 30000, 1500.0, false),
-    // xray-SE: when the TT move is from an x-ray blocker square (moving it
-    // uncovers our slider's attack on an enemy), this flat bonus is
-    // SUBTRACTED from singular_beta (`singular_beta = tt_score - depth -
-    // xray_bonus`). That LOWERS singular_beta → WIDENS the SE margin →
-    // STRICTER singularity test → FEWER extensions on x-ray-blocker TT moves,
-    // not more. This reads backwards but is correct: SPSA drives the value UP
-    // away from the 0 floor, so do NOT "fix" the sign.
-    // NON-CORE, and this is not a judgement call: the parameter is PROVABLY
-    // INERT at every value in its range. Its only consumer gates on
-    // `our_xray_blockers`, which is computed as 0 whenever
-    // DISCOVERED_ATTACK_BONUS is 0 -- and that has been 0 since SPSA #660 drove
-    // it there in the v9 era. Measured 2026-08-26: bench is bit-identical at
-    // 2521318 with this set to 0, 46 and 400, while a control
-    // (DEXT_MARGIN_PV=400) moves bench to 2112498.
-    //
-    // It was flagged core, so every core sweep has been spending gradient
-    // budget on a parameter that cannot affect the search. Per
-    // docs/loose_spsa_knobs_2026-05-16.md that is not merely wasted: SPSA
-    // averages the loss change across ALL parameters per iteration, so an inert
-    // knob injects noise into the gradient seen by every useful knob. A recent
-    // core tune moved it +101.7% (23 -> 46), which is pure noise by
-    // construction.
-    //
-    // Left in place rather than deleted because the SE half of the xray feature
-    // has never been tested live -- only the movepicker half has (that is
-    // try/discovered-attack-on, H0 at about -5.8 Elo). Decoupling the two so
-    // this one can actually fire is a separate, untested experiment.
-    (SE_XRAY_BLOCKER_MARGIN_10X, 46, 0, 400, 20.0, false),
     // Continuation-history weight in quiet move ordering. Range runs to 0 so
     // SPSA can disable the term entirely rather than pinning at a floor.
     (CONT_HIST_MULT_10X, 20, 0, 80, 15.0, true),
@@ -5188,15 +5159,6 @@ fn negamax(
     // pieces under any enemy attack (pawn OR piece). Widens margin in
     // tactical positions. Uses existing enemy_attacks — no new bitboard.
     let any_threat_count = popcount(enemy_attacks & our_non_pawns) as i32;
-    // B1: Discovered-attack bitboard. Our pieces that are currently
-    // blocking one of our sliders' attack on an enemy piece — moving
-    // any such piece uncovers a slider attack. Used as a quiet-move
-    // ordering bonus in MovePicker. Cost: 10-20 magic lookups.
-    let our_xray_blockers: u64 = if tp(&DISCOVERED_ATTACK_BONUS) > 0 {
-        board.xray_blockers(board.side_to_move)
-    } else {
-        0
-    };
 
     // (PV length already cleared at function entry, before early returns.)
 
@@ -6234,7 +6196,7 @@ fn negamax(
     let mut picker = if in_check {
         MovePicker::new_evasion(tt_move, safe_ply, checkers, pinned, &info.history, &info.cont, prev_move, pawn_hist_ref, enemy_attacks, &info.moved_piece_stack, &info.moved_to_stack)
     } else {
-        MovePicker::new(board, tt_move, safe_ply, checkers, pinned, &info.history, &info.cont, prev_move, pawn_hist_ref, enemy_attacks, our_xray_blockers, &info.moved_piece_stack, &info.moved_to_stack)
+        MovePicker::new(board, tt_move, safe_ply, checkers, pinned, &info.history, &info.cont, prev_move, pawn_hist_ref, enemy_attacks, &info.moved_piece_stack, &info.moved_to_stack)
     };
     picker.threat_sq = threat_sq;
 
@@ -6453,16 +6415,7 @@ fn negamax(
 
             // Skip SE for mate scores (margin comparison meaningless)
             if !is_decisive(tt_score_local) {
-                // xray bonus: if TT move uncovers our slider's attack on enemy
-                // (from-square ∈ our_xray_blockers), subtract this from
-                // singular_beta → WIDER SE margin → STRICTER singularity →
-                // FEWER extensions on these discovered-attack TT moves (the
-                // margin comment at the tunable def has the full rationale;
-                // the effect is the opposite of the old "more extensions" note).
-                let xray_bonus = if our_xray_blockers & (1u64 << move_from(tt_move)) != 0 {
-                    tp10(&SE_XRAY_BLOCKER_MARGIN_10X)
-                } else { 0 };
-                let singular_beta = tt_score_local - depth - xray_bonus;
+let singular_beta = tt_score_local - depth;
                 let singular_depth = (depth - 1) / 2;
 
                 info.excluded_move[ply_u] = tt_move;
