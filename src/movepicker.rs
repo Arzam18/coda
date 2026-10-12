@@ -292,7 +292,6 @@ pub struct MovePicker {
     threats: Threats, // enemy attack bitboard for threat-aware history
     // B1: our own pieces blocking a slider's attack on an enemy piece.
     // Moving one of these creates a discovered attack.
-    xray_blockers: Bitboard,
     // Evasion support
     checkers: Bitboard,
     pinned: Bitboard,
@@ -320,7 +319,6 @@ impl MovePicker {
         _prev_move: Move,
         pawn_hist: Option<&[[i16; 64]; 13]>,
         threats: Threats,
-        xray_blockers: Bitboard,
         moved_piece_stack: &[u8],
         moved_to_stack: &[u8],
     ) -> Self {
@@ -361,7 +359,6 @@ impl MovePicker {
             skip_quiet: false,
             no_see_partition: false,
             threats,
-            xray_blockers,
             checkers,
             pinned,
             threat_sq: -1,
@@ -400,7 +397,6 @@ impl MovePicker {
             skip_quiet: true,
             no_see_partition: true,
             threats: 0,
-            xray_blockers: 0,
             // Real pin/check masks so the TTMove-stage is_legal check works.
             // These must not be hardcoded to 0: with pinned=0, is_legal cannot
             // reject pinned-piece TT moves in QS.
@@ -467,7 +463,6 @@ impl MovePicker {
             // in-check cutoffs invisible to in-check reads. SF keeps reads and
             // writes symmetric.
             threats,
-            xray_blockers: 0, // evasions don't use discovered-attack bonus
             checkers,
             pinned,
             threat_sq: -1,
@@ -691,7 +686,6 @@ impl MovePicker {
         ];
         let quiet_check_bonus = crate::search::QUIET_CHECK_BONUS.load(Ordering::Relaxed);
         let quiet_check_see_margin = crate::search::QUIET_CHECK_SEE_MARGIN.load(Ordering::Relaxed);
-        let discovered_attack_bonus = crate::search::DISCOVERED_ATTACK_BONUS.load(Ordering::Relaxed);
         let kf_bonus = crate::search::KNIGHT_FORK_BONUS.load(Ordering::Relaxed);
         let us = board.side_to_move;
         let them = 1 - us;
@@ -761,13 +755,6 @@ impl MovePicker {
                 score += quiet_check_bonus;
             }
 
-            // B1: Discovered-attack bonus. If `from` is one of our pieces
-            // currently blocking our slider's attack on an enemy, moving
-            // it uncovers that attack. Flat bonus — victim-value scaling
-            // is a follow-up if H1 resolves.
-            if self.xray_blockers & (1u64 << from) != 0 {
-                score += discovered_attack_bonus;
-            }
 
 
             // "Offense bonus": quiet move that lands on a square
@@ -1785,7 +1772,7 @@ mod cont_hist_symmetry_tests {
 
                 let mp = MovePicker::new(
                     &board, NO_MOVE, ply, 0, 0, &h, &c, NO_MOVE, None,
-                    Default::default(), 0, &mps, &mts,
+                    Default::default(), &mps, &mts,
                 );
 
                 let sub = mp.cont_hist_subs[0].unwrap_or_else(|| panic!(
@@ -1810,7 +1797,7 @@ mod cont_hist_symmetry_tests {
         let mts = [0u8; 64];
         let mp = MovePicker::new(
             &board, NO_MOVE, 7, 0, 0, &h, &c, NO_MOVE, None,
-            Default::default(), 0, &mps, &mts,
+            Default::default(), &mps, &mts,
         );
         assert!(mp.cont_hist_subs[0].is_none(), "null sentinel must not select a plane");
     }
