@@ -2965,6 +2965,14 @@ pub struct NNUENet {
     pub out_weights_f: Vec<f32>,  // [NNUE_OUTPUT_BUCKETS × out_l_size] — float output
     pub out_bias_f: Vec<f32>,     // [NNUE_OUTPUT_BUCKETS]
     pub dual_l1: bool,            // v8: dual L1 activation (CReLU+SCReLU on L1 output)
+    /// Raw L1 readout: a learned linear read of the UNCLAMPED L1 pre-activations
+    /// (one weight per L1 unit, shared by all buckets), added to the output.
+    /// Every other route from L1 to the output crosses a clamp, which in decided
+    /// positions leaves most units pinned, so material changes barely reach the
+    /// eval (research repo, won-position saturation 2026-10-08). This route reads
+    /// values L1 already computes, so it costs `l1` multiply-adds per eval.
+    pub has_l1_raw: bool,
+    pub l1_raw_w: Vec<f32>,
     // v9 threat features
     pub threat_weights: AlignedVec<i8>,  // [num_threat_features × hidden_size] i8 weights, 64-B rows, hugepage-backed
     pub num_threat_features: usize,
@@ -3088,6 +3096,7 @@ impl NNUENet {
         let mut l1_scale = QA; // default int16 scale
         let mut bucketed_hidden = false; // bit 3: output buckets baked into L1/L2 dims
         let mut dual_l1 = false; // bit 4: dual L1 activation (CReLU+SCReLU, v8)
+        let mut has_l1_raw = false; // arch_flags2 bit 4 (v11)
         // bit 5 is context-dependent:
         //   - extended_kb=0: consensus_buckets (legacy 16-bucket encoding)
         //   - extended_kb=1: hl_crelu (hidden-layer CReLU, vs default SCReLU)
@@ -3227,10 +3236,15 @@ impl NNUENet {
                 // it. Unlike training_flags (which records TRAINING-side config
                 // inference must match), this byte records ARCHITECTURE.
                 //   bit 0: has_pawn_pair — a u32 feature count follows
-                //   bits 1-7: reserved, must be zero
+                //   bits 1-3: reserved, must be zero (bits 1-3 were used by
+                //             research nets that never shipped; leaving them
+                //             reserved keeps those nets refused, not misread)
+                //   bit 4: raw L1 readout (see `has_l1_raw`)
+                //   bits 5-7: reserved, must be zero
                 if version >= 11 {
                     let arch_flags2 = read_u8(reader)?;
-                    if arch_flags2 & !1 != 0 {
+                    has_l1_raw = arch_flags2 & 16 != 0;
+                    if arch_flags2 & !(1 | 16) != 0 {
                         return Err(format!(
                             "unknown arch_flags2 bits set (0x{:02x}); this net uses an \
                              architecture feature this build does not implement",
@@ -3392,6 +3406,17 @@ impl NNUENet {
         let mut output_bias = [0i32; NNUE_OUTPUT_BUCKETS];
         for i in 0..NNUE_OUTPUT_BUCKETS {
             output_bias[i] = read_i32(reader)?;
+        }
+
+        // Raw L1 readout (arch_flags2 bit 4): one f32 per L1 unit, after the
+        // output bias. Shared L1 only: a bucketed L1 would need one row per bucket.
+        let mut l1_raw_w: Vec<f32> = Vec::new();
+        if has_l1_raw {
+            if !use_pairwise || bucketed_hidden {
+                return Err("raw L1 readout requires a pairwise net with a shared L1".to_string());
+            }
+            l1_raw_w = vec![0.0f32; l1_size];
+            for w in l1_raw_w.iter_mut() { *w = f32::from_bits(read_u32(reader)?); }
         }
 
         // Compute king bucket tables for this net's layout. Stored on the
@@ -3637,6 +3662,8 @@ impl NNUENet {
             out_weights_f,
             out_bias_f,
             dual_l1,
+            has_l1_raw,
+            l1_raw_w,
             threat_weights,
             num_threat_features,
             has_threats,
@@ -4250,6 +4277,15 @@ impl NNUENet {
         }
         let _ = hidden32_seeded;
         let hidden32 = scratch_slice!(hidden32_ptr, l1);
+        // Raw L1 readout: pre-activation x at the same dequant as the CReLU half
+        // (hidden32 / pw_scale / qa_l1), but read before any clamp.
+        let raw_f = if self.has_l1_raw {
+            let mut acc = 0.0f32;
+            for i in 0..l1 { acc += hidden32[i] as f32 * self.l1_raw_w[i]; }
+            acc / (pw_scale as f32 * qa_l1 as f32)
+        } else {
+            0.0
+        };
 
         // Dequantize + activation
         let qa_l1_f = qa_l1 as f32;
@@ -4420,13 +4456,13 @@ impl NNUENet {
             };
             #[cfg(not(target_arch = "x86_64"))]
             let out_f = dot_out_canonical(&h2[..l2], &out_w[..l2], bias);
-            return (out_f * EVAL_SCALE as f32) as i32;
+            return ((out_f + raw_f) * EVAL_SCALE as f32) as i32;
         }
 
         let out_w = &self.out_weights_f[bucket * l1_pb..bucket * l1_pb + l1_pb];
         let mut out_f = self.out_bias_f[bucket];
         for i in 0..l1 { out_f += l1_out[i] * out_w[i]; }
-        (out_f * EVAL_SCALE as f32) as i32
+        ((out_f + raw_f) * EVAL_SCALE as f32) as i32
     }
 
     /// v7 hidden layer forward pass (SCReLU).
