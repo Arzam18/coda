@@ -205,12 +205,9 @@ pub(crate) fn tt_ponder_hint(tt: &crate::tt::TT, after_best: &Board) -> Move {
         return NO_MOVE;
     }
     let legal = crate::movegen::generate_legal_moves(after_best);
-    let (cf, ct, cfl) = (move_from(cand), move_to(cand), move_flags(cand));
     for i in 0..legal.len {
         let m = legal.get(i);
-        if move_from(m) == cf && move_to(m) == ct
-            && (!is_promotion(cand) || move_flags(m) == cfl)
-        {
+        if move_matches(m, cand) {
             return m;
         }
     }
@@ -336,6 +333,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 println!("option name Threads type spin default 1 min 1 max 256");
                 println!("option name NNUEFile type string default <empty>");
                 println!("option name OwnBook type check default true");
+                println!("option name UCI_Chess960 type check default false");
                 println!("option name SharedWeights type check default true");
                 println!("option name BookFile type string default <empty>");
                 println!("option name MoveOverhead type spin default 100 min 0 max 5000");
@@ -627,8 +625,9 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                     }
                 }
 
-                // Try opening book first (not in ponder mode)
-                if use_book && !is_ponder {
+                // Try opening book first (not in ponder mode). The Polyglot book
+                // is standard chess only, so it is never consulted in Chess960.
+                if use_book && !is_ponder && !crate::types::chess960() {
                     if let Some(ref book) = opening_book {
                         if let Some(book_move) = book.pick_move(&board) {
                             let uci = move_to_uci(book_move);
@@ -959,7 +958,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                         if suppress.load(std::sync::atomic::Ordering::Relaxed) {
                             // Skip emit. Caller's new go owns the next bestmove.
                         } else if pv_consistent {
-                            println!("bestmove {} ponder {}", move_to_uci(best_move), move_to_uci(si.pv_table[0][1]));
+                            println!("bestmove {} ponder {}", search_board.uci_move(best_move), search_board.uci_move(si.pv_table[0][1]));
                         } else {
                             // P4: no usable pv[1] (short PV / dropped illegal
                             // hint / SMP-vote inconsistency) — manufacture a
@@ -981,9 +980,9 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                                         "PONDER_HINT_TT manufactured hint={} after best={} (total={})",
                                         move_to_uci(hint), move_to_uci(best_move), n);
                                 }
-                                println!("bestmove {} ponder {}", move_to_uci(best_move), move_to_uci(hint));
+                                println!("bestmove {} ponder {}", search_board.uci_move(best_move), search_board.uci_move(hint));
                             } else {
-                                println!("bestmove {}", move_to_uci(best_move));
+                                println!("bestmove {}", search_board.uci_move(best_move));
                             }
                         }
                         // Explicit flush: default stdout is LineWriter which *should*
@@ -1365,6 +1364,9 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 if ni > 0 && vi > 0 && vi < tokens.len() {
                     match tokens[ni] {
                         "OwnBook" => { use_book = tokens[vi] == "true"; }
+                        "UCI_Chess960" => {
+                            crate::types::set_chess960(tokens[vi].eq_ignore_ascii_case("true"));
+                        }
                         "SyzygyPath" => {
                             // Read the raw remainder so spaced paths (e.g.
                             // `C:\Program Files\Syzygy`) aren't truncated at
@@ -1931,6 +1933,51 @@ pub fn parse_uci_move(board: &Board, s: &str) -> Option<Move> {
 
     // Find the matching move in the legal move list
     let legal = crate::movegen::generate_legal_moves(board);
+
+    // Chess960 (UCI_Chess960 on): castling arrives as king-from -> own
+    // castling rook ("e1h1" for a standard kingside castle), and a plain
+    // king-from -> king-to string is an ordinary king step, never a castle —
+    // in 960 the two can share from/to. Match on the same string we print.
+    if crate::types::chess960() {
+        for i in 0..legal.len {
+            let mv = legal.get(i);
+            if move_flags(mv) == FLAG_CASTLE {
+                if board.uci_move_mode(mv, true) == s {
+                    return Some(mv);
+                }
+            }
+        }
+        for i in 0..legal.len {
+            let mv = legal.get(i);
+            if move_flags(mv) == FLAG_CASTLE { continue; }
+            if move_from(mv) == from && move_to(mv) == to {
+                match promo_pt {
+                    Some(pf) if move_flags(mv) == pf => return Some(mv),
+                    None if !is_promotion(mv) => return Some(mv),
+                    _ => {}
+                }
+            }
+        }
+        if promo_pt.is_none() {
+            for i in 0..legal.len {
+                let mv = legal.get(i);
+                if move_from(mv) == from && move_to(mv) == to && move_flags(mv) == FLAG_PROMOTE_Q {
+                    return Some(mv);
+                }
+            }
+        }
+        // Tolerate a GUI that still sends castling king-from -> king-to:
+        // accept it only when no ordinary move has those squares (checked
+        // above), so it cannot be ambiguous.
+        for i in 0..legal.len {
+            let mv = legal.get(i);
+            if move_flags(mv) == FLAG_CASTLE && move_from(mv) == from && move_to(mv) == to {
+                return Some(mv);
+            }
+        }
+        return None;
+    }
+
     for i in 0..legal.len {
         let mv = legal.get(i);
         if move_from(mv) == from && move_to(mv) == to {

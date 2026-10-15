@@ -473,14 +473,8 @@ fn make_sf_move(_pos: &SfPosition, mv: Move, board: &Board) -> Option<SfMove> {
         SfMove::new(from, to, SfMoveType::EnPassant, SfPiece::none())
     } else if flags == FLAG_CASTLE {
         // sfbinpack expects king→rook (not king→destination)
-        let rook_sq = match move_to(mv) {
-            6 => SfSquare::new(7),   // g1 → h1
-            2 => SfSquare::new(0),   // c1 → a1
-            62 => SfSquare::new(63), // g8 → h8
-            58 => SfSquare::new(56), // c8 → a8
-            _ => to,
-        };
-        SfMove::new(from, rook_sq, SfMoveType::Castle, SfPiece::none())
+        let (rook_from, _) = board.castle_rook_squares(board.side_to_move, move_to(mv));
+        SfMove::new(from, SfSquare::new(rook_from as u32), SfMoveType::Castle, SfPiece::none())
     } else if is_promotion(mv) {
         let sf_color = if board.side_to_move == WHITE { SfColor::White } else { SfColor::Black };
         let promo_piece = match promotion_piece_type(mv) {
@@ -807,14 +801,13 @@ fn material_worker(
             // castling bit set with no rook; removing a pawn that had just
             // double-pushed leaves the EP square valid but pointing at
             // empty. Clean these up so the produced position is legal.
-            // Removing a rook from a corner: clear that castling right.
+            // Removing a castling rook (A1/H1/A8/H8 in standard chess):
+            // clear that castling right.
             if pt == ROOK {
-                match (color, sq) {
-                    (WHITE, 0) => modified.castling &= !0b0010,  // white queenside (A1)
-                    (WHITE, 7) => modified.castling &= !0b0001,  // white kingside (H1)
-                    (BLACK, 56) => modified.castling &= !0b1000, // black queenside (A8)
-                    (BLACK, 63) => modified.castling &= !0b0100, // black kingside (H8)
-                    _ => {}
+                for i in 0..4 {
+                    if modified.castle_rooks[i] == sq && (i / 2) as u8 == color {
+                        modified.castling &= !(1u8 << i);
+                    }
                 }
             }
             // Removing a pawn invalidates any EP square that's the
