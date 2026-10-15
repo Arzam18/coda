@@ -237,6 +237,7 @@ pub fn convert_v7(
     num_threats: usize,
     hl_crelu: bool,
     pawn_pairs: bool,
+    l1_raw: bool,
 ) -> Result<(), String> {
     // Pawn-pair features extend the THREAT feature space (see nnue.rs), so they
     // occupy l0 columns immediately after the threat block and cannot exist
@@ -295,7 +296,9 @@ pub fn convert_v7(
     // Verify size
     let l1_input = l1_mul * h;
     let expected = total_ft_inputs * h * 2 + h * 2 + l1_input * bl1 * l1w_bytes_per
-        + l1b_bytes + l2_bytes + out_bytes;
+        + l1b_bytes + l2_bytes + out_bytes
+        // Raw L1 readout (trainer --l1-raw-readout): [l1_size] f32 after the output.
+        + if l1_raw { l1_size * 4 } else { 0 };
     if expected != data_len {
         return Err(format!(
             "Size mismatch: expected {} bytes for FT={}, got {} (total_ft_inputs={}). \
@@ -494,6 +497,15 @@ pub fn convert_v7(
         }
     }
 
+    // Raw L1 readout: one f32 per L1 unit, a read of the unclamped pre-activation.
+    let mut l1_raw_w = Vec::new();
+    if l1_raw {
+        if !use_pairwise || bucketed_hidden {
+            return Err("--l1-raw requires a pairwise net with a shared L1".to_string());
+        }
+        for _ in 0..l1_size { l1_raw_w.push(read_f32_le(&data, offset)); offset += 4; }
+    }
+
     println!("Parsed {} bytes of {} (FT={})", offset, data.len(), h);
 
     // Write .nnue — v10 for threats (adds training_flags byte), v8 for dual L1, v7 otherwise.
@@ -503,7 +515,7 @@ pub fn convert_v7(
     // is the intended fail-loud behavior for format mismatch.
     // v11 adds an arch_flags2 byte (pawn-pair block). See nnue.rs for why it is
     // a new byte rather than a ninth meaning for a bit in the first flags byte.
-    let version = if num_pawn_pairs > 0 { 11u32 }
+    let version = if num_pawn_pairs > 0 || l1_raw { 11u32 }
         else if num_threats > 0 { 10u32 } else if dual_l1 { 8u32 } else { 7u32 };
     let mut buf = Vec::new();
     write_u32_le(&mut buf, NNUE_MAGIC);
@@ -566,10 +578,13 @@ pub fn convert_v7(
     // v11 arch_flags2 (ARCHITECTURE, not training config — that distinction is
     // why this is not a reserved training_flags bit).
     //   bit 0: has_pawn_pair, followed by a u32 feature count
-    //   bits 1-7: reserved (must be 0)
+    //   bits 1-3: reserved (must be 0)
+    //   bit 4: raw L1 readout, [l1_size] f32 after the output bias
+    //   bits 5-7: reserved (must be 0)
     if version >= 11 {
         let mut arch_flags2 = 0u8;
         if num_pawn_pairs > 0 { arch_flags2 |= 1; }
+        if l1_raw { arch_flags2 |= 16; }
         buf.push(arch_flags2);
         if num_pawn_pairs > 0 {
             write_u32_le(&mut buf, num_pawn_pairs as u32);
@@ -596,6 +611,9 @@ pub fn convert_v7(
     }
     for &w in &output_weights { write_i16_le(&mut buf, w); } // [BUCKETS][L2]
     for &b in &output_bias { write_i32_le(&mut buf, b); }     // [BUCKETS]
+    if l1_raw {
+        for &w in &l1_raw_w { buf.extend_from_slice(&w.to_le_bytes()); } // [l1_size] f32
+    }
 
     std::fs::File::create(output_path)
         .and_then(|mut f| f.write_all(&buf))
