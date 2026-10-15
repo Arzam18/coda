@@ -1132,6 +1132,18 @@ fn main() {
             let mut board = Board::from_fen(&fen_str);
             println!("Position: {}", fen_str);
             println!("Depth: {}", depth);
+            // Side NOT to move in check = invalid position: its king could be
+            // captured. Perft skips king captures (make_move refuses them), so
+            // counts differ from generators that play them.
+            {
+                use crate::types::flip_color;
+                let them = flip_color(board.side_to_move);
+                let ksq = board.king_sq(them) as u32;
+                if board.attackers_to(ksq, board.occupied()) & board.colors[board.side_to_move as usize] != 0 {
+                    println!("WARNING: invalid position: the side not to move is in check; \
+                              king captures are not counted");
+                }
+            }
             println!();
             let start = std::time::Instant::now();
             let nodes = perft_divide(&mut board, depth);

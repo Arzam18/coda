@@ -742,7 +742,10 @@ pub fn perft(board: &mut Board, depth: u32) -> u64 {
     let mut nodes = 0u64;
     for i in 0..moves.len {
         let mv = moves.get(i);
-        board.make_move(mv);
+        // make_move refuses a king capture, which only exists in an invalid
+        // position (side not to move in check). Skip it rather than unmake a
+        // move that was never made.
+        if !board.make_move(mv) { continue; }
         nodes += perft(board, depth - 1);
         board.unmake_move();
     }
@@ -757,7 +760,7 @@ pub fn perft_divide(board: &mut Board, depth: u32) -> u64 {
 
     for i in 0..moves.len {
         let mv = moves.get(i);
-        board.make_move(mv);
+        if !board.make_move(mv) { continue; } // king capture: invalid position
         let count = if depth <= 1 { 1 } else { perft(board, depth - 1) };
         board.unmake_move();
         println!("{}: {}", move_to_uci(mv), count);
@@ -1088,6 +1091,10 @@ mod tests {
     /// illegal, since the rook was the only shield); an attacked destination
     /// or transit square; an inner rook as the castling rook; and mid-game
     /// positions from random play, most with castling rights left.
+    ///
+    /// Also: kings castling AWAY from their rook (king on the b-file castling
+    /// queenside moves right, both colours) and kings passing over their own
+    /// rook to a destination beyond it (king b1, inner kingside rook c1).
     const CHESS960_PERFT3: &[(&str, u64)] = &[
         ("r5kr/8/8/8/8/8/8/R5KR w HAha - 0 1", 11069), // king_stays_ks
         ("1r4kr/8/8/8/8/8/8/1R4KR w HBhb - 0 1", 10954), // ks_stay
@@ -1106,6 +1113,13 @@ mod tests {
         ("r3k2r/8/8/8/8/8/8/RK5r w A - 0 1", 1046), // dest_attacked
         ("r3k2r/8/8/8/8/8/6b1/RK5R w HA - 0 1", 13207), // transit_bishop
         ("rk2r2r/8/8/8/8/8/8/RK2R2R w EAea - 0 1", 25073), // inner_rook
+        ("rk5r/1p6/8/8/8/8/8/1R2K2R w HBha - 0 1", 13222), // b8 king castles q-side rightward
+        ("rk5r/1p6/8/8/8/8/8/1R2K2R b HBha - 0 1", 13627), // same, black to move
+        ("r3k2r/8/8/8/8/8/8/RK5R w HAha - 0 1", 11291), // b1 king castles q-side rightward
+        ("rk5r/8/8/8/8/8/8/R3K2R b HAha - 0 1", 11291), // b8 king, black to move
+        ("rkr4r/8/8/8/8/8/8/RKR4R w CAca - 0 1", 22404), // king passes over inner k-side rook
+        ("rkr4r/8/8/8/8/8/8/RKR4R b CAca - 0 1", 22404), // same, black to move
+        ("r2k3r/8/8/8/8/8/8/R2K3R w HAha - 0 1", 13177), // rook passes king dest, lands on king start
         ("2rk3r/8/8/8/8/8/8/2RK3R b HChc - 0 1", 9924), // black_swap
         ("Rr1k3r/8/8/8/8/8/8/1R1K3R b HBhb - 0 1", 10738), // black_xray
         ("br1bqnr1/2pk2pp/5p1n/p3p3/4PP1P/8/PPPP1QP1/BRK2NRN w GB - 0 8", 27965), // mid801_14
@@ -1147,6 +1161,17 @@ mod tests {
         ("rkbnrbnq/pppppppp/8/8/8/8/PPPPPPPP/RKBNRBNQ w EAea - 0 1", 8934), // start854
         ("brkrnnqb/pppppppp/8/8/8/8/PPPPPPPP/BRKRNNQB w DBdb - 0 1", 8950), // start947
     ];
+
+    /// An INVALID position (side not to move in check: the b1 rook attacks the
+    /// b8 king) must not panic. make_move refuses the king capture and perft
+    /// skips it; python-chess, which does generate king captures here,
+    /// agrees once those are excluded (77403 at depth 4).
+    #[test]
+    fn perft_invalid_position_skips_king_capture() {
+        init();
+        let mut b = Board::from_fen("rk5r/8/8/8/8/8/8/1R2K2R w HBha - 0 1");
+        assert_eq!(perft(&mut b, 4), 77403);
+    }
 
     #[test]
     fn perft_chess960_matches_python_chess() {
