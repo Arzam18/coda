@@ -2282,7 +2282,14 @@ impl SearchInfo {
         // fades the correction out exactly where it is needed. Measured on the
         // first attempt -- the -12 -> -31 band stayed inverted. Material is
         // monotone by construction, so there is no feedback loop.
-        if FEAT_SAT_TIEBREAK.load(Ordering::Relaxed) {
+        //
+        // A net with the raw L1 readout carries its own unclamped route from
+        // material to the output, so it is already monotone past the knee and
+        // the tiebreak would count material twice. It is skipped for such nets,
+        // which is the configuration they were tested in (tiebreak off); older
+        // nets keep it, also as tested.
+        let net_has_raw_readout = self.nnue_net.as_ref().map_or(false, |n| n.has_l1_raw);
+        if FEAT_SAT_TIEBREAK.load(Ordering::Relaxed) && !net_has_raw_readout {
             // stm-relative, to match the point of view of `final_score`
             let mat = if board.side_to_move == WHITE {
                 signed_material
