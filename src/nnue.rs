@@ -8774,7 +8774,7 @@ mod tests {
         use crate::board::Board;
         use crate::movegen::generate_legal_moves;
         use crate::search::build_dirty_piece;
-        use crate::types::{flip_color, move_from, move_to};
+        use crate::types::{flip_color, move_from};
 
         crate::init();
 
@@ -8804,7 +8804,16 @@ mod tests {
             "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
             "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
             "4k3/P6P/8/8/8/8/p6p/4K3 w - - 0 1", // promotion testbed
+            // Chess960 castling; castles are favoured from here on (below).
+            "r4kr1/pppppppp/8/8/8/8/PPPPPPPP/R4KR1 w GAga - 0 1",
+            "2rk3r/pppppppp/8/8/8/8/PPPPPPPP/2RK3R w HChc - 0 1",
+            "r5kr/pppppppp/8/8/8/8/PPPPPPPP/R5KR w HAha - 0 1",
+            "r1k4r/pppppppp/8/8/8/8/PPPPPPPP/R1K4R w HAha - 0 1",
+            "r2k1r2/pppppppp/8/8/8/8/PPPPPPPP/R2K1R2 w FAfa - 0 1",
+            "3r1k1r/pppppppp/8/8/8/8/PPPPPPPP/3R1K1R w HDhd - 0 1",
+            "1r1k3r/8/8/8/8/8/8/rR1K3R w HBh - 0 1",
         ];
+        const FIRST_960_FEN: usize = 5;
 
         fn next_u32(state: &mut u32) -> u32 {
             let mut x = *state;
@@ -8830,13 +8839,18 @@ mod tests {
                 for ply in 0..MAX_PLIES {
                     let legal = generate_legal_moves(&board);
                     if legal.len == 0 { break; }
-                    let mv = legal.get((next_u32(&mut rng) as usize) % legal.len);
+                    let mut mv = legal.get((next_u32(&mut rng) as usize) % legal.len);
+                    if fen_idx >= FIRST_960_FEN && next_u32(&mut rng) % 2 == 0 {
+                        for i in 0..legal.len {
+                            if move_flags(legal.get(i)) == FLAG_CASTLE { mv = legal.get(i); }
+                        }
+                    }
 
                     let us = board.side_to_move;
                     let them = flip_color(us);
                     let moved_pt = board.piece_type_at(move_from(mv));
-                    let captured_pt = board.piece_type_at(move_to(mv));
-                    let dirty = build_dirty_piece(mv, us, them, moved_pt, captured_pt, &net);
+                    let captured_pt = board.captured_piece_type(mv);
+                    let dirty = build_dirty_piece(mv, us, them, moved_pt, captured_pt, &board.castle_rooks, &net);
 
                     let ok = board.make_move(mv);
                     assert!(ok, "psq fuzz {} game {} ply {}: move {} illegal?",
@@ -9012,7 +9026,7 @@ mod tests {
             let moved_pt = board.piece_type_at(from);
             let captured_pt = board.piece_type_at(to);
             assert_eq!(captured_pt, NO_PIECE_TYPE, "king march: no captures expected");
-            let dirty = build_dirty_piece(mv, us, them, moved_pt, captured_pt, &net);
+            let dirty = build_dirty_piece(mv, us, them, moved_pt, captured_pt, &board.castle_rooks, &net);
 
             let ok = board.make_move(mv);
             assert!(ok, "king march step {}: move illegal {}→{}", i, from, to);

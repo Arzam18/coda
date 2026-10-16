@@ -121,7 +121,9 @@ pub fn move_to_san(board: &Board, mv: Move) -> String {
 
     // Castling
     if flags == FLAG_CASTLE {
-        return if to > from { "O-O".to_string() } else { "O-O-O".to_string() };
+        // Kingside castling always lands the king on the g-file, queenside on
+        // the c-file (Chess960 too, where `to > from` doesn't tell them apart).
+        return if file_of(to) == 6 { "O-O".to_string() } else { "O-O-O".to_string() };
     }
 
     let mut san = String::new();

@@ -851,7 +851,7 @@ impl MovePicker {
             // pawn-takes-and-promotes) take the capture path rather than the
             // flat promotion score below, which would rank them BELOW ordinary
             // captures.
-            let is_cap = board.piece_type_at(to) != NO_PIECE_TYPE || flags == FLAG_EN_PASSANT;
+            let is_cap = board.is_capture(m);
             let score = if is_cap {
                 // Capture (possibly also a promotion): MVV-LVA + capture
                 // history. mvv_lva folds in the promotion material delta, so
@@ -1036,6 +1036,19 @@ pub fn is_pseudo_legal(board: &Board, mv: Move) -> bool {
     if mv == NO_MOVE { return false; }
     let from = move_from(mv);
     let to = move_to(mv);
+
+    // Castling: the full check — right held, our king on `from`, our rook on
+    // the right's castling-rook square, king and rook paths empty, and no
+    // attack on the king's start, transit or destination squares (computed
+    // with king and castling rook lifted). Handled before the generic checks
+    // below because in Chess960 the king may already stand on its castling
+    // destination (from == to) or land on its own rook. This also defends
+    // against TT-collision castles on a board where the rook has moved away
+    // but a stale right is still set.
+    if move_flags(mv) == FLAG_CASTLE {
+        return board.castle_is_legal(board.side_to_move, from, to);
+    }
+
     if from > 63 || to > 63 || from == to { return false; }
 
     let us = board.side_to_move;
@@ -1083,57 +1096,6 @@ pub fn is_pseudo_legal(board: &Board, mv: Move) -> bool {
         let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
         if cap_sq >= 64 || (1u64 << cap_sq) & board.pieces[PAWN as usize] & board.colors[them as usize] == 0 {
             return false;
-        }
-        return true;
-    }
-
-    // Castling: validate rights, path, ROOK-on-corner, and no attacks on
-    // king/intermediate/destination. The rook-on-corner check defends against
-    // TT-collision castles on a board where the rook has moved away but the
-    // synthetic FEN / corrupt state still has the right set.
-    if flags == FLAG_CASTLE {
-        if pt != KING { return false; }
-        let occ = board.occupied();
-        let them_bb = board.colors[flip_color(us) as usize];
-        let our_rooks = board.pieces[ROOK as usize] & board.colors[us as usize];
-        if us == WHITE {
-            if from != 4 { return false; } // king must be on e1
-            if to == 6 { // kingside
-                if board.castling & CASTLE_WK == 0 { return false; }
-                if our_rooks & (1u64 << 7) == 0 { return false; } // rook on h1
-                if occ & 0x60 != 0 { return false; }
-                // King(e1), f1, g1 must not be attacked
-                if board.attackers_to(4, occ) & them_bb != 0 { return false; }
-                if board.attackers_to(5, occ) & them_bb != 0 { return false; }
-                if board.attackers_to(6, occ) & them_bb != 0 { return false; }
-            } else if to == 2 { // queenside
-                if board.castling & CASTLE_WQ == 0 { return false; }
-                if our_rooks & 1u64 == 0 { return false; } // rook on a1
-                if occ & 0x0E != 0 { return false; }
-                // King(e1), d1, c1 must not be attacked
-                if board.attackers_to(4, occ) & them_bb != 0 { return false; }
-                if board.attackers_to(3, occ) & them_bb != 0 { return false; }
-                if board.attackers_to(2, occ) & them_bb != 0 { return false; }
-            } else { return false; }
-        } else {
-            if from != 60 { return false; } // king must be on e8
-            if to == 62 { // kingside
-                if board.castling & CASTLE_BK == 0 { return false; }
-                if our_rooks & (1u64 << 63) == 0 { return false; } // rook on h8
-                if occ & (0x60u64 << 56) != 0 { return false; }
-                // King(e8), f8, g8 must not be attacked
-                if board.attackers_to(60, occ) & them_bb != 0 { return false; }
-                if board.attackers_to(61, occ) & them_bb != 0 { return false; }
-                if board.attackers_to(62, occ) & them_bb != 0 { return false; }
-            } else if to == 58 { // queenside
-                if board.castling & CASTLE_BQ == 0 { return false; }
-                if our_rooks & (1u64 << 56) == 0 { return false; } // rook on a8
-                if occ & (0x0Eu64 << 56) != 0 { return false; }
-                // King(e8), d8, c8 must not be attacked
-                if board.attackers_to(60, occ) & them_bb != 0 { return false; }
-                if board.attackers_to(59, occ) & them_bb != 0 { return false; }
-                if board.attackers_to(58, occ) & them_bb != 0 { return false; }
-            } else { return false; }
         }
         return true;
     }

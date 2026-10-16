@@ -74,7 +74,6 @@ pub fn init() {
         attacks::init_attacks();
         bitboard::init_bitboards();
         zobrist::init_zobrist();
-        board::init_castle_masks();
         search::init_lmr();
         cuckoo::init_cuckoo();
         nnue::init_nnue();
@@ -864,7 +863,7 @@ fn main() {
             } else if mode == "incremental" {
                 use crate::movegen::generate_legal_moves;
                 use crate::search::build_dirty_piece;
-                use crate::types::{flip_color, move_from, move_to};
+                use crate::types::{flip_color, move_from};
                 for fen in positions_slice {
                     let mut board = Board::from_fen(fen);
                     acc.force_recompute(&net, &board);
@@ -879,8 +878,8 @@ fn main() {
                         let us = board.side_to_move;
                         let them = flip_color(us);
                         let moved_pt = board.piece_type_at(move_from(mv));
-                        let captured_pt = board.piece_type_at(move_to(mv));
-                        let dirty = build_dirty_piece(mv, us, them, moved_pt, captured_pt, &net);
+                        let captured_pt = board.captured_piece_type(mv);
+                        let dirty = build_dirty_piece(mv, us, them, moved_pt, captured_pt, &board.castle_rooks, &net);
                         if !board.make_move(mv) { break; }
                         acc.push(dirty);
                         let s = evaluate_nnue(&board, &net, &mut acc, &tstack);
@@ -1133,6 +1132,18 @@ fn main() {
             let mut board = Board::from_fen(&fen_str);
             println!("Position: {}", fen_str);
             println!("Depth: {}", depth);
+            // Side NOT to move in check = invalid position: its king could be
+            // captured. Perft skips king captures (make_move refuses them), so
+            // counts differ from generators that play them.
+            {
+                use crate::types::flip_color;
+                let them = flip_color(board.side_to_move);
+                let ksq = board.king_sq(them) as u32;
+                if board.attackers_to(ksq, board.occupied()) & board.colors[board.side_to_move as usize] != 0 {
+                    println!("WARNING: invalid position: the side not to move is in check; \
+                              king captures are not counted");
+                }
+            }
             println!();
             let start = std::time::Instant::now();
             let nodes = perft_divide(&mut board, depth);

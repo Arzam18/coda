@@ -54,32 +54,85 @@ pub struct Board {
     pub generate_threat_deltas: bool,
     /// Whether to generate pawn-pair deltas (net has a pawn-pair block).
     pub generate_pawn_pair_deltas: bool,
+    // Castling geometry: fixed for a game, read only when castling (rights
+    // update, castle generation/validation), so kept clear of the hot fields.
+    /// Starting square of the castling rook for each right, indexed by the
+    /// right's bit position (0=WK, 1=WQ, 2=BK, 3=BQ). Fixed for a game: set at
+    /// FEN parse, never changed by make/unmake. Standard chess: h1, a1, h8, a8.
+    /// Chess960 puts the rooks (and king) elsewhere on the back rank.
+    pub castle_rooks: [u8; 4],
+    /// Castling-rights mask per square: `castling &= mask[from] & mask[to]`
+    /// on every move. Derived from the king's and castling rooks' start
+    /// squares at FEN parse (see `build_castle_mask`).
+    pub castle_mask: [u8; 64],
+    /// Per right (same indexing as `castle_rooks`): the squares that must be
+    /// empty to castle — everything the king and rook cross or land on,
+    /// minus the castling king's and rook's own start squares.
+    pub castle_path: [Bitboard; 4],
+    /// Per right: the squares that must not be attacked — the king's start,
+    /// transit and destination squares.
+    pub castle_king_path: [Bitboard; 4],
 }
 
-/// Castling rook positions (from, to) indexed by castling flag bit.
-pub const CASTLE_ROOK_FROM: [u8; 4] = [7, 0, 63, 56];   // WK, WQ, BK, BQ
-pub const CASTLE_ROOK_TO: [u8; 4]   = [5, 3, 61, 59];
+/// Standard-chess castling rook start squares, indexed by right bit position
+/// (WK, WQ, BK, BQ): h1, a1, h8, a8.
+pub const STANDARD_CASTLE_ROOKS: [u8; 4] = [7, 0, 63, 56];
 
-/// Castling rights mask per square — AND with this on any move from/to that square.
-static mut CASTLE_MASK: [u8; 64] = [0xFF; 64];
+/// Index (0..4) of the castling right for `us` castling to `king_to`: the
+/// king always lands on the g-file when castling kingside and on the c-file
+/// when castling queenside, in standard chess and Chess960 alike.
+#[inline(always)]
+pub fn castle_index(us: Color, king_to: u8) -> usize {
+    (us as usize) * 2 + (file_of(king_to) != 6) as usize
+}
 
-pub fn init_castle_masks() {
-    unsafe {
-        // Reset all to 0xFF (no change)
-        CASTLE_MASK = [0xFF; 64];
-        // King squares
-        CASTLE_MASK[4] = !(CASTLE_WK | CASTLE_WQ);   // e1: white loses both
-        CASTLE_MASK[60] = !(CASTLE_BK | CASTLE_BQ);   // e8: black loses both
-        // Rook squares
-        CASTLE_MASK[7] = !CASTLE_WK;    // h1: white loses kingside
-        CASTLE_MASK[0] = !CASTLE_WQ;    // a1: white loses queenside
-        CASTLE_MASK[63] = !CASTLE_BK;   // h8: black loses kingside
-        CASTLE_MASK[56] = !CASTLE_BQ;   // a8: black loses queenside
+/// (rook_from, rook_to) for `us` castling with the king landing on
+/// `king_to`. The rook always ends on the f-file (kingside) or d-file
+/// (queenside); where it starts comes from the per-game `castle_rooks`.
+#[inline(always)]
+pub fn castle_rook_squares(castle_rooks: &[u8; 4], us: Color, king_to: u8) -> (u8, u8) {
+    let kingside = file_of(king_to) == 6;
+    let back_rank = if us == WHITE { 0u8 } else { 56u8 };
+    let rook_to = back_rank + if kingside { 5 } else { 3 };
+    (castle_rooks[castle_index(us, king_to)], rook_to)
+}
+
+/// True when a castling move can be applied as "move king, then move rook"
+/// without either step touching an occupied square or moving a piece onto
+/// itself. Always true in standard chess; false only for some 960 setups.
+#[inline(always)]
+pub fn castle_is_simple(king_from: u8, king_to: u8, rook_from: u8, rook_to: u8) -> bool {
+    king_from != king_to && king_to != rook_from && rook_from != rook_to
+}
+
+/// Squares strictly between two squares of the same rank. Used for the
+/// castling paths instead of `bitboard::between` so a fresh `Board::new()`
+/// can build them without the line tables having been initialised.
+fn rank_between(a: u8, b: u8) -> Bitboard {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    if hi <= lo + 1 { return 0; }
+    // Bits lo+1 ..= hi-1.
+    ((1u64 << hi) - 1) & !((1u64 << (lo + 1)) - 1)
+}
+
+/// Per-square castling-rights mask built from the kings' and castling rooks'
+/// start squares. A move from or to a king's start square drops both of that
+/// colour's rights; from or to a castling rook's start square drops that one
+/// right (the rook moved, or was captured at home).
+pub fn build_castle_mask(king_start: [u8; 2], castle_rooks: &[u8; 4]) -> [u8; 64] {
+    let mut m = [0xFFu8; 64];
+    for c in 0..2 {
+        m[king_start[c] as usize] &= !(0b11u8 << (2 * c));
     }
+    for (i, &sq) in castle_rooks.iter().enumerate() {
+        m[sq as usize] &= !(1u8 << i);
+    }
+    m
 }
 
-fn castle_mask(sq: u8) -> u8 {
-    unsafe { CASTLE_MASK[sq as usize] }
+/// The standard-chess mask: kings on e1/e8, rooks on a/h.
+pub fn standard_castle_mask() -> [u8; 64] {
+    build_castle_mask([4, 60], &STANDARD_CASTLE_ROOKS)
 }
 
 /// Returns true if `ep_sq` is an EP target that `capturing_side` can actually
@@ -120,12 +173,16 @@ pub fn ep_capture_available(
 
 impl Board {
     pub fn new() -> Self {
-        Board {
+        let mut b = Board {
             pieces: [0; 6],
             colors: [0; 2],
             mailbox: [NO_PIECE_TYPE; 64],
             side_to_move: WHITE,
             castling: 0,
+            castle_rooks: STANDARD_CASTLE_ROOKS,
+            castle_mask: standard_castle_mask(),
+            castle_path: [0; 4],
+            castle_king_path: [0; 4],
             ep_square: NO_SQUARE,
             halfmove: 0,
             fullmove: 1,
@@ -138,7 +195,9 @@ impl Board {
             pawn_pair_deltas: Vec::with_capacity(crate::pawn_pair::MAX_PAWN_PAIR_DELTAS),
             generate_threat_deltas: false,
             generate_pawn_pair_deltas: false,
-        }
+        };
+        b.rebuild_castle_paths([4, 60]);
+        b
     }
 
     /// All occupied squares.
@@ -471,34 +530,62 @@ impl Board {
         // Side to move
         self.side_to_move = if parts.len() > 1 && parts[1] == "b" { BLACK } else { WHITE };
 
-        // Castling
+        // Castling. Accepts standard/X-FEN letters (K/Q/k/q = the outermost
+        // rook on that side of the king) and Shredder-FEN file letters
+        // (A-H / a-h = the rook on that file; the side follows from which side
+        // of the king it stands on), so Chess960 positions parse too.
+        //
+        // A right is kept only if the king stands on its back rank and a rook
+        // of the same colour actually stands on the named square. A FEN may
+        // declare rights for a rook that doesn't exist (corrupt input); like
+        // the old e1/a1/h1-only check, this makes "right set => rook present
+        // on its castling square" an invariant that movegen and
+        // is_pseudo_legal can rely on.
         self.castling = 0;
+        self.castle_rooks = STANDARD_CASTLE_ROOKS;
         if parts.len() > 2 {
             for ch in parts[2].chars() {
-                match ch {
-                    'K' => self.castling |= CASTLE_WK,
-                    'Q' => self.castling |= CASTLE_WQ,
-                    'k' => self.castling |= CASTLE_BK,
-                    'q' => self.castling |= CASTLE_BQ,
-                    _ => {}
-                }
+                if !ch.is_ascii_alphabetic() { continue; }
+                let color = if ch.is_ascii_uppercase() { WHITE } else { BLACK };
+                let back_rank: u8 = if color == WHITE { 0 } else { 56 };
+                let rank_bb = 0xFFu64 << back_rank;
+                let kings = self.pieces[KING as usize] & self.colors[color as usize] & rank_bb;
+                if kings == 0 || kings & (kings - 1) != 0 { continue; }
+                let ksq = lsb(kings) as u8;
+                let kfile = file_of(ksq);
+                let rooks = self.pieces[ROOK as usize] & self.colors[color as usize] & rank_bb;
+                // Rook squares east (higher file) / west of the king on the back rank.
+                let below = (1u64 << ksq) - 1;
+                let east = rooks & !(below | (1u64 << ksq));
+                let west = rooks & below;
+                let rook_sq = match ch.to_ascii_lowercase() {
+                    'k' => if east != 0 { 63 - east.leading_zeros() as u8 } else { continue },
+                    'q' => if west != 0 { lsb(west) as u8 } else { continue },
+                    f @ 'a'..='h' => {
+                        let sq = back_rank + (f as u8 - b'a');
+                        if rooks & (1u64 << sq) == 0 || file_of(sq) == kfile { continue; }
+                        sq
+                    }
+                    _ => continue,
+                };
+                let kingside = file_of(rook_sq) > kfile;
+                let idx = (color as usize) * 2 + (!kingside) as usize;
+                self.castling |= 1u8 << idx;
+                self.castle_rooks[idx] = rook_sq;
             }
         }
-        // Sanitise castling rights against actual king/rook presence.
-        // A FEN may declare rights for a rook that doesn't exist (corrupt
-        // input, Chess960-style mixed FENs). SF does the same AND
-        // at parse time so downstream movegen + is_pseudo_legal can assume
-        // rights imply a rook on the corner.
-        let wk_on_e1 = self.pieces[KING as usize] & self.colors[WHITE as usize] & (1u64 << 4) != 0;
-        let bk_on_e8 = self.pieces[KING as usize] & self.colors[BLACK as usize] & (1u64 << 60) != 0;
-        let wr_on_h1 = self.pieces[ROOK as usize] & self.colors[WHITE as usize] & (1u64 << 7) != 0;
-        let wr_on_a1 = self.pieces[ROOK as usize] & self.colors[WHITE as usize] & (1u64 << 0) != 0;
-        let br_on_h8 = self.pieces[ROOK as usize] & self.colors[BLACK as usize] & (1u64 << 63) != 0;
-        let br_on_a8 = self.pieces[ROOK as usize] & self.colors[BLACK as usize] & (1u64 << 56) != 0;
-        if !(wk_on_e1 && wr_on_h1) { self.castling &= !CASTLE_WK; }
-        if !(wk_on_e1 && wr_on_a1) { self.castling &= !CASTLE_WQ; }
-        if !(bk_on_e8 && br_on_h8) { self.castling &= !CASTLE_BK; }
-        if !(bk_on_e8 && br_on_a8) { self.castling &= !CASTLE_BQ; }
+        // Mask and paths from the actual king square of each colour that
+        // holds a right; a colour with no right keeps e1/e8 (its entries are
+        // never consulted). For standard positions this reproduces the old
+        // fixed e1/e8/a1/h1/a8/h8 table exactly.
+        let mut king_start = [4u8, 60u8];
+        for c in 0..2u8 {
+            if self.castling & (0b11u8 << (2 * c)) != 0 {
+                king_start[c as usize] = self.king_sq(c);
+            }
+        }
+        self.castle_mask = build_castle_mask(king_start, &self.castle_rooks);
+        self.rebuild_castle_paths(king_start);
 
         // En passant. Bounds-check f and r to avoid wrapping into a
         // huge ep_square that later overflows `1u64 << ep_square`
@@ -636,12 +723,11 @@ impl Board {
             & self.colors[us as usize] & !from_bb;
 
         if flags == FLAG_CASTLE {
-            let (rook_from, rook_to) = if to > from {
-                if us == WHITE { (7u8, 5u8) } else { (63u8, 61u8) }
-            } else {
-                if us == WHITE { (0u8, 3u8) } else { (56u8, 59u8) }
-            };
-            occ = (occ ^ (1u64 << rook_from)) | to_bb | (1u64 << rook_to);
+            // Lift the rook before placing king and rook: in Chess960 the
+            // king can land on the rook's start square (and either piece may
+            // not move at all), so the order matters.
+            let (rook_from, rook_to) = self.castle_rook_squares(us, to);
+            occ = (occ & !(1u64 << rook_from)) | to_bb | (1u64 << rook_to);
             our_orth = (our_orth & !(1u64 << rook_from)) | (1u64 << rook_to);
         } else {
             if flags == FLAG_EN_PASSANT {
@@ -792,6 +878,13 @@ impl Board {
                 && rook_attacks(ksq, occ) & their_rooks == 0;
         }
 
+        // Castling: the full check, including the transit squares and the
+        // Chess960 case where the castling rook itself shields the king's
+        // path from an enemy slider on the back rank.
+        if flags == FLAG_CASTLE {
+            return self.castle_is_legal(us, from as u8, to as u8);
+        }
+
         // King moves: check destination not attacked
         if from == ksq {
             let occ = self.occupied() ^ (1u64 << from);
@@ -820,6 +913,123 @@ impl Board {
         true
     }
 
+    /// Precompute `castle_path` / `castle_king_path` from the kings' start
+    /// squares and `castle_rooks` (fixed for the game, so this runs once per
+    /// FEN). Entries for rights not held are filled but never consulted.
+    fn rebuild_castle_paths(&mut self, king_start: [u8; 2]) {
+        for idx in 0..4 {
+            let us = (idx / 2) as Color;
+            let ksq = king_start[us as usize];
+            let back_rank: u8 = if us == WHITE { 0 } else { 56 };
+            let king_to = back_rank + if idx % 2 == 0 { 6 } else { 2 };
+            let (rook_from, rook_to) = castle_rook_squares(&self.castle_rooks, us, king_to);
+            let king_path = rank_between(ksq, king_to) | (1u64 << king_to);
+            let rook_path = rank_between(rook_from, rook_to) | (1u64 << rook_to);
+            self.castle_path[idx] = (king_path | rook_path) & !(1u64 << ksq) & !(1u64 << rook_from);
+            self.castle_king_path[idx] = king_path | (1u64 << ksq);
+        }
+    }
+
+    /// Full legality of castling for `us`, king from `king_from` to `king_to`
+    /// (the g- or c-file of `us`'s back rank). Standard chess and Chess960:
+    /// - the right is held, our king is on `king_from` and our rook on the
+    ///   right's castling-rook square (a held right means neither has moved,
+    ///   so `king_from` is the king's start square the paths were built for);
+    /// - every square the king or the rook crosses or lands on is empty,
+    ///   ignoring the castling king and rook themselves (in 960 they can
+    ///   land on each other's start squares, or not move at all);
+    /// - no square from the king's start to its destination inclusive is
+    ///   attacked. Attacks are computed with BOTH the king and the castling
+    ///   rook lifted: in 960 the rook can stand between an enemy rook/queen
+    ///   and the king's path, a shield that is gone once it has castled.
+    ///   Lifting it is never too strict: an attacker it was shielding sits
+    ///   on the back rank beyond it, so the king's path is attacked after
+    ///   castling too. For standard positions this gives exactly the old
+    ///   e1/f1/g1 (e1/d1/c1) test.
+    #[inline]
+    pub fn castle_is_legal(&self, us: Color, king_from: u8, king_to: u8) -> bool {
+        let back_rank: u8 = if us == WHITE { 0 } else { 56 };
+        if king_to != back_rank + 6 && king_to != back_rank + 2 { return false; }
+        if king_from >= 64 { return false; }
+        let idx = castle_index(us, king_to);
+        if self.castling & (1u8 << idx) == 0 { return false; }
+        let king_bb = 1u64 << king_from;
+        let ours = self.colors[us as usize];
+        if king_bb & self.pieces[KING as usize] & ours == 0 { return false; }
+        let rook_bb = 1u64 << self.castle_rooks[idx];
+        if rook_bb & self.pieces[ROOK as usize] & ours == 0 { return false; }
+
+        let occ = self.occupied() ^ king_bb ^ rook_bb;
+        if occ & self.castle_path[idx] != 0 { return false; }
+
+        let them_bb = self.colors[flip_color(us) as usize];
+        let mut squares = self.castle_king_path[idx];
+        while squares != 0 {
+            let sq = pop_lsb(&mut squares);
+            if self.attacked_with_occ(sq, them_bb, occ) { return false; }
+        }
+        true
+    }
+
+    /// Is `sq` attacked by any piece in `attackers_bb`, given occupancy `occ`?
+    /// Early-exit form of `attackers_to(sq, occ) & attackers_bb != 0`.
+    #[inline]
+    fn attacked_with_occ(&self, sq: u32, attackers_bb: Bitboard, occ: Bitboard) -> bool {
+        let p = &self.pieces;
+        // Attacked by a white pawn iff a black pawn on `sq` would attack it.
+        let pawn_from = if attackers_bb & self.colors[WHITE as usize] != 0 { BLACK } else { WHITE };
+        knight_attacks(sq) & p[KNIGHT as usize] & attackers_bb != 0
+            || pawn_attacks(pawn_from, sq) & p[PAWN as usize] & attackers_bb != 0
+            || king_attacks(sq) & p[KING as usize] & attackers_bb != 0
+            || bishop_attacks(sq, occ) & (p[BISHOP as usize] | p[QUEEN as usize]) & attackers_bb != 0
+            || rook_attacks(sq, occ) & (p[ROOK as usize] | p[QUEEN as usize]) & attackers_bb != 0
+    }
+
+    /// Rook start/destination squares for a castling move (king to `king_to`).
+    #[inline]
+    pub fn castle_rook_squares(&self, us: Color, king_to: u8) -> (u8, u8) {
+        castle_rook_squares(&self.castle_rooks, us, king_to)
+    }
+
+    /// Piece type `mv` captures (NO_PIECE_TYPE if none). En passant captures
+    /// a pawn off the destination square; castling never captures, even in
+    /// Chess960 where the king's destination can hold its own castling rook.
+    #[inline(always)]
+    pub fn captured_piece_type(&self, mv: Move) -> u8 {
+        let flags = move_flags(mv);
+        if flags == FLAG_EN_PASSANT {
+            PAWN
+        } else if flags == FLAG_CASTLE {
+            NO_PIECE_TYPE
+        } else {
+            self.piece_type_at(move_to(mv))
+        }
+    }
+
+    /// Does `mv` capture (en passant included; castling never does)?
+    #[inline(always)]
+    pub fn is_capture(&self, mv: Move) -> bool {
+        self.captured_piece_type(mv) != NO_PIECE_TYPE
+    }
+
+    /// UCI string for `mv`. With the UCI_Chess960 option on, castling is
+    /// written king-from -> own castling rook ("king takes rook"), which is
+    /// unambiguous in 960; otherwise the standard king-from -> king-to form.
+    pub fn uci_move(&self, mv: Move) -> String {
+        self.uci_move_mode(mv, crate::types::chess960())
+    }
+
+    /// `uci_move` with the Chess960 output convention given explicitly.
+    pub fn uci_move_mode(&self, mv: Move, chess960: bool) -> String {
+        if chess960 && mv != NO_MOVE && move_flags(mv) == FLAG_CASTLE {
+            let from = move_from(mv);
+            let us = if rank_of(from) == 0 { WHITE } else { BLACK };
+            let (rook_from, _) = self.castle_rook_squares(us, move_to(mv));
+            return format!("{}{}", square_name(from), square_name(rook_from));
+        }
+        move_to_uci(mv)
+    }
+
     /// Make a move on the board. Returns false if the move is invalid
     /// (e.g., stale TT entry targeting an empty square).
     pub fn make_move(&mut self, mv: Move) -> bool {
@@ -830,12 +1040,9 @@ impl Board {
         let flags = move_flags(mv);
         let pt = self.piece_type_at(from);
 
-        // Save undo info
-        let captured = if flags == FLAG_EN_PASSANT {
-            PAWN
-        } else {
-            self.piece_type_at(to)
-        };
+        // Save undo info. Castling never captures (in Chess960 the king's
+        // destination may hold its own castling rook).
+        let captured = self.captured_piece_type(mv);
 
         // Safety: reject invalid moves (stale TT entries with hash collisions)
         if pt == NO_PIECE_TYPE || captured == KING {
@@ -853,14 +1060,20 @@ impl Board {
             }
         }
 
-        // Validate castling: ensure rook is on expected square
+        // Validate castling: the king is moving, our rook is on its castling
+        // square, and the squares king and rook land on are free (apart from
+        // the castling pair themselves, which can swap squares in 960).
         if flags == FLAG_CASTLE {
-            let rook_from = if to > from {
-                if us == WHITE { 7u8 } else { 63u8 }
-            } else {
-                if us == WHITE { 0u8 } else { 56u8 }
-            };
+            let back_rank: u8 = if us == WHITE { 0 } else { 56 };
+            if pt != KING || (to != back_rank + 6 && to != back_rank + 2) {
+                return false;
+            }
+            let (rook_from, rook_to) = self.castle_rook_squares(us, to);
             if (1u64 << rook_from) & self.pieces[ROOK as usize] & self.colors[us as usize] == 0 {
+                return false;
+            }
+            let others = self.occupied() & !(1u64 << from) & !(1u64 << rook_from);
+            if others & ((1u64 << to) | (1u64 << rook_to)) != 0 {
                 return false;
             }
         }
@@ -903,57 +1116,48 @@ impl Board {
                 us, mv, captured, pt);
         }
 
-        // Handle captures
-        if flags == FLAG_EN_PASSANT {
-            let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
-            debug_assert!(cap_sq < 64, "EP cap_sq out of bounds: {}", cap_sq);
-            self.remove_piece(them, PAWN, cap_sq);
-            if gen_threats { crate::threats::push_threats_on_change(
-                &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
-                self.colors[0] | self.colors[1], them, PAWN, cap_sq as u32, false); }
-        } else if captured != NO_PIECE_TYPE {
-            self.remove_piece(them, captured, to);
-            if gen_threats { crate::threats::push_threats_on_change(
-                &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
-                self.colors[0] | self.colors[1], them, captured, to as u32, false); }
-        }
-
-        // Move the piece
-        self.move_piece(us, pt, from, to);
-        if gen_threats { crate::threats::push_threats_on_move(
-            &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
-            self.colors[0] | self.colors[1], us, pt, from as u32, to as u32); }
-
-        // Handle promotion
-        if is_promotion(mv) {
-            let promo_pt = promotion_piece_type(mv);
-            self.remove_piece(us, pt, to);   // remove pawn
-            self.put_piece(us, promo_pt, to); // put promoted piece
-            if gen_threats {
-                crate::threats::push_threats_on_change(
+        if flags == FLAG_CASTLE {
+            self.make_castle(us, from, to, gen_threats);
+        } else {
+            // Handle captures
+            if flags == FLAG_EN_PASSANT {
+                let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
+                debug_assert!(cap_sq < 64, "EP cap_sq out of bounds: {}", cap_sq);
+                self.remove_piece(them, PAWN, cap_sq);
+                if gen_threats { crate::threats::push_threats_on_change(
                     &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
-                    self.colors[0] | self.colors[1], us, pt, to as u32, false);
-                crate::threats::push_threats_on_change(
+                    self.colors[0] | self.colors[1], them, PAWN, cap_sq as u32, false); }
+            } else if captured != NO_PIECE_TYPE {
+                self.remove_piece(them, captured, to);
+                if gen_threats { crate::threats::push_threats_on_change(
                     &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
-                    self.colors[0] | self.colors[1], us, promo_pt, to as u32, true);
+                    self.colors[0] | self.colors[1], them, captured, to as u32, false); }
+            }
+
+            // Move the piece
+            self.move_piece(us, pt, from, to);
+            if gen_threats { crate::threats::push_threats_on_move(
+                &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
+                self.colors[0] | self.colors[1], us, pt, from as u32, to as u32); }
+
+            // Handle promotion
+            if is_promotion(mv) {
+                let promo_pt = promotion_piece_type(mv);
+                self.remove_piece(us, pt, to);   // remove pawn
+                self.put_piece(us, promo_pt, to); // put promoted piece
+                if gen_threats {
+                    crate::threats::push_threats_on_change(
+                        &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
+                        self.colors[0] | self.colors[1], us, pt, to as u32, false);
+                    crate::threats::push_threats_on_change(
+                        &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
+                        self.colors[0] | self.colors[1], us, promo_pt, to as u32, true);
+                }
             }
         }
 
-        // Handle castling
-        if flags == FLAG_CASTLE {
-            let (rook_from, rook_to) = if to > from {
-                if us == WHITE { (7u8, 5u8) } else { (63u8, 61u8) }
-            } else {
-                if us == WHITE { (0u8, 3u8) } else { (56u8, 59u8) }
-            };
-            self.move_piece(us, ROOK, rook_from, rook_to);
-            if gen_threats { crate::threats::push_threats_on_move(
-                &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
-                self.colors[0] | self.colors[1], us, ROOK, rook_from as u32, rook_to as u32); }
-        }
-
         // Update castling rights (for any move from/to relevant squares)
-        self.castling &= castle_mask(from) & castle_mask(to);
+        self.castling &= self.castle_mask[from as usize] & self.castle_mask[to as usize];
 
         // Update en passant — detect double push by distance.
         // Only XOR ep_key into the hash if the OTHER side (them = the next
@@ -991,6 +1195,45 @@ impl Board {
         self.hash ^= side_key();
 
         true
+    }
+
+    /// Move king and rook for a castling move (king `from` -> `to`), with
+    /// hash and threat-delta updates.
+    ///
+    /// Standard castling, and any 960 castling where king and rook move to
+    /// squares the other doesn't occupy, moves the king and then the rook,
+    /// exactly as before Chess960 support. Otherwise (the king lands on the
+    /// rook's start square, or the king or the rook doesn't move) the rook is
+    /// lifted first, then the king moves, then the rook is put down, so no
+    /// step ever targets an occupied square or "moves" a piece onto itself.
+    /// `threats::replay_move_deltas` mirrors this sequence exactly.
+    fn make_castle(&mut self, us: Color, from: u8, to: u8, gen_threats: bool) {
+        let (rook_from, rook_to) = self.castle_rook_squares(us, to);
+        if castle_is_simple(from, to, rook_from, rook_to) {
+            self.move_piece(us, KING, from, to);
+            if gen_threats { crate::threats::push_threats_on_move(
+                &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
+                self.colors[0] | self.colors[1], us, KING, from as u32, to as u32); }
+            self.move_piece(us, ROOK, rook_from, rook_to);
+            if gen_threats { crate::threats::push_threats_on_move(
+                &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
+                self.colors[0] | self.colors[1], us, ROOK, rook_from as u32, rook_to as u32); }
+            return;
+        }
+        self.remove_piece(us, ROOK, rook_from);
+        if gen_threats { crate::threats::push_threats_on_change(
+            &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
+            self.colors[0] | self.colors[1], us, ROOK, rook_from as u32, false); }
+        if from != to {
+            self.move_piece(us, KING, from, to);
+            if gen_threats { crate::threats::push_threats_on_move(
+                &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
+                self.colors[0] | self.colors[1], us, KING, from as u32, to as u32); }
+        }
+        self.put_piece(us, ROOK, rook_to);
+        if gen_threats { crate::threats::push_threats_on_change(
+            &mut self.threat_deltas, &self.pieces, &self.colors, &self.mailbox,
+            self.colors[0] | self.colors[1], us, ROOK, rook_to as u32, true); }
     }
 
     // Threat delta methods use free functions to avoid borrow issues with &mut self
@@ -1034,43 +1277,39 @@ impl Board {
             return;
         }
 
-        // Undo promotion
-        if is_promotion(mv) {
-            let promo_pt = promotion_piece_type(mv);
-            self.remove_piece_no_hash(us, promo_pt, to);
-            self.put_piece_no_hash(us, PAWN, to);
-        }
-
-        // Undo piece move
-        let pt = self.piece_type_at(to);
-        let from_to = (1u64 << from) | (1u64 << to);
-        self.pieces[pt as usize] ^= from_to;
-        self.colors[us as usize] ^= from_to;
-        self.mailbox[to as usize] = NO_PIECE_TYPE;
-        self.mailbox[from as usize] = pt;
-
-        // Restore captured piece
-        if flags == FLAG_EN_PASSANT {
-            let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
-            if cap_sq < 64 {
-                self.put_piece_no_hash(them, PAWN, cap_sq);
-            }
-        } else if undo.captured != NO_PIECE_TYPE {
-            self.put_piece_no_hash(them, undo.captured, to);
-        }
-
-        // Undo castling rook move
         if flags == FLAG_CASTLE {
-            let (rook_from, rook_to) = if to > from {
-                if us == WHITE { (7u8, 5u8) } else { (63u8, 61u8) }
-            } else {
-                if us == WHITE { (0u8, 3u8) } else { (56u8, 59u8) }
-            };
-            let rook_from_to = (1u64 << rook_from) | (1u64 << rook_to);
-            self.pieces[ROOK as usize] ^= rook_from_to;
-            self.colors[us as usize] ^= rook_from_to;
-            self.mailbox[rook_to as usize] = NO_PIECE_TYPE;
-            self.mailbox[rook_from as usize] = ROOK;
+            // Lift both pieces before putting either back: in Chess960 the
+            // king's and rook's squares can coincide or not change.
+            let (rook_from, rook_to) = self.castle_rook_squares(us, to);
+            self.remove_piece_no_hash(us, KING, to);
+            self.remove_piece_no_hash(us, ROOK, rook_to);
+            self.put_piece_no_hash(us, KING, from);
+            self.put_piece_no_hash(us, ROOK, rook_from);
+        } else {
+            // Undo promotion
+            if is_promotion(mv) {
+                let promo_pt = promotion_piece_type(mv);
+                self.remove_piece_no_hash(us, promo_pt, to);
+                self.put_piece_no_hash(us, PAWN, to);
+            }
+
+            // Undo piece move
+            let pt = self.piece_type_at(to);
+            let from_to = (1u64 << from) | (1u64 << to);
+            self.pieces[pt as usize] ^= from_to;
+            self.colors[us as usize] ^= from_to;
+            self.mailbox[to as usize] = NO_PIECE_TYPE;
+            self.mailbox[from as usize] = pt;
+
+            // Restore captured piece
+            if flags == FLAG_EN_PASSANT {
+                let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
+                if cap_sq < 64 {
+                    self.put_piece_no_hash(them, PAWN, cap_sq);
+                }
+            } else if undo.captured != NO_PIECE_TYPE {
+                self.put_piece_no_hash(them, undo.captured, to);
+            }
         }
 
         // Restore state
@@ -1207,10 +1446,20 @@ impl Board {
         if self.castling == 0 {
             fen.push('-');
         } else {
-            if self.castling & CASTLE_WK != 0 { fen.push('K'); }
-            if self.castling & CASTLE_WQ != 0 { fen.push('Q'); }
-            if self.castling & CASTLE_BK != 0 { fen.push('k'); }
-            if self.castling & CASTLE_BQ != 0 { fen.push('q'); }
+            // K/Q/k/q when the castling rook is on its standard a/h file (so
+            // standard positions print exactly as always); otherwise the
+            // Shredder-FEN file letter of the castling rook (Chess960).
+            let rights = [(CASTLE_WK, 'K', 7u8), (CASTLE_WQ, 'Q', 0), (CASTLE_BK, 'k', 7), (CASTLE_BQ, 'q', 0)];
+            for (i, &(bit, letter, std_file)) in rights.iter().enumerate() {
+                if self.castling & bit == 0 { continue; }
+                let file = file_of(self.castle_rooks[i]);
+                if file == std_file {
+                    fen.push(letter);
+                } else {
+                    let c = (b'a' + file) as char;
+                    fen.push(if i < 2 { c.to_ascii_uppercase() } else { c });
+                }
+            }
         }
 
         fen.push(' ');
