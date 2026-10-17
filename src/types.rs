@@ -142,3 +142,32 @@ pub fn move_to_uci(m: Move) -> String {
         format!("{}{}", from, to)
     }
 }
+
+/// UCI_Chess960 option. Only changes how castling moves are written and read
+/// over UCI (king-from -> own rook in 960 mode, king-from -> king-to
+/// otherwise) and disables the opening book. Board, movegen and search handle
+/// Chess960 castling regardless: the castling rook squares come from the FEN.
+static CHESS960: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn chess960() -> bool {
+    CHESS960.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn set_chess960(on: bool) {
+    CHESS960.store(on, std::sync::atomic::Ordering::Release);
+}
+
+/// Does legal-list move `m` match candidate `cand` (a PV/TT/hint move)?
+/// From and to must agree; the flags must also agree whenever they tell
+/// apart moves sharing from/to: promotions (piece choice) and castling (in
+/// Chess960 a plain king step and a castle can share from and to, e.g. king
+/// f1-g1 with the rook on h1).
+#[inline]
+pub fn move_matches(m: Move, cand: Move) -> bool {
+    move_from(m) == move_from(cand)
+        && move_to(m) == move_to(cand)
+        && (move_flags(m) == move_flags(cand)
+            || !(is_promotion(cand) || move_flags(cand) == FLAG_CASTLE
+                 || move_flags(m) == FLAG_CASTLE))
+}

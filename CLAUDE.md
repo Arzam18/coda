@@ -162,12 +162,24 @@ production net is referenced by `net.txt`.
 ### Opening book
 Polyglot `.bin`, weighted random selection. Standard 781-entry Zobrist table.
 Castling encoded king-to-rook (convert to king-to-destination). EP hash only when a
-capture is actually possible.
+capture is actually possible. Never consulted when `UCI_Chess960` is on.
+
+### Chess960
+Castling geometry is per board, set at FEN parse: `castle_rooks` (rook start
+square per right), the rights mask, and the must-be-empty / must-not-be-attacked
+paths. FEN accepts KQkq, X-FEN and Shredder-FEN letters; output is KQkq when
+the rook is on the a/h file, else the Shredder file letter. Internal castle
+encoding stays king-from → king-destination (g/c file) + `FLAG_CASTLE`, so
+standard chess is bit-identical; in 960 `from == to` is possible and the king
+can land on its own rook's square — castling never captures (use
+`Board::captured_piece_type` / `is_capture`, not `piece_type_at(to)`).
+`UCI_Chess960` only changes the UCI wire form (king-takes-own-rook, `e1h1`).
 
 ### UCI options
 `Hash` (MB, default 64), `Threads` (default 1), `NNUEFile`, `OwnBook` (default
 true), `BookFile`, `MoveOverhead` (ms, default 100), `Ponder`, `SyzygyPath`,
-`TBHash` (WDL-cache MB, default 16), `SyzygyProbeDepth` (default 1). Debug/internal
+`TBHash` (WDL-cache MB, default 16), `SyzygyProbeDepth` (default 1),
+`UCI_Chess960` (default false). Debug/internal
 only: `HiddenActivation`, `LoadAnyway`, `TMDebug`, `PonderhitCreditPct`. All
 `tunables!` params are also exposed as spin options for SPSA (not for manual use).
 

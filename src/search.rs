@@ -1273,6 +1273,16 @@ struct TmDbg {
     adjusted_soft: u64,
 }
 
+/// One completed main-thread iteration, recorded when `SearchInfo::iter_log` is Some.
+#[derive(Clone, Copy, Debug)]
+pub struct IterRecord {
+    pub depth: i32,
+    pub best_move: Move,
+    pub score: i32,
+    pub nodes: u64,
+    pub time_ms: u64,
+}
+
 pub struct SearchInfo {
     pub nodes: u64,
     /// Interior Syzygy WDL probe hits this search, aggregated across SMP
@@ -1296,6 +1306,9 @@ pub struct SearchInfo {
     /// Cell because should_stop takes &self.
     last_flushed_nodes: std::cell::Cell<u64>,
     pub silent: bool,  // suppress UCI output (for datagen)
+    /// When Some, the main ID loop appends one record per completed iteration
+    /// (`coda epd` uses it to report the depth a solution was first found).
+    pub iter_log: Option<Vec<IterRecord>>,
     /// SMP defers search-end output until helpers have been collected and the
     /// winning thread and aggregate counters are final.
     defer_final_info: bool,
@@ -1615,6 +1628,7 @@ impl SearchInfo {
             num_threads: 1,
             last_flushed_nodes: std::cell::Cell::new(0),
             silent: false,
+            iter_log: None,
             defer_final_info: false,
             stats: PruneStats::default(),
             stats_tt_static_eval_hits: 0,
@@ -2409,11 +2423,14 @@ pub fn build_dirty_piece(
     them: u8,
     moved_pt: u8,
     captured_pt: u8,
+    castle_rooks: &[u8; 4],
     net: &crate::nnue::NNUENet,
 ) -> DirtyPiece {
     let from = move_from(mv);
     let to = move_to(mv);
     let flags = move_flags(mv);
+    // Castling never captures (a 960 king can land on its own rook's square).
+    let captured_pt = if flags == FLAG_CASTLE { NO_PIECE_TYPE } else { captured_pt };
 
     if moved_pt == KING {
         let mut from_ks = from as usize;
@@ -2441,11 +2458,7 @@ pub fn build_dirty_piece(
 
         // Castling: also move the rook
         if flags == FLAG_CASTLE {
-            let (rook_from, rook_to) = if to > from {
-                if us == WHITE { (7u8, 5u8) } else { (63u8, 61u8) }
-            } else {
-                if us == WHITE { (0u8, 3u8) } else { (56u8, 59u8) }
-            };
+            let (rook_from, rook_to) = crate::board::castle_rook_squares(castle_rooks, us, to);
             changes[n] = (false, us, ROOK, rook_from); n += 1;
             changes[n] = (true, us, ROOK, rook_to); n += 1;
         }
@@ -2476,11 +2489,7 @@ pub fn build_dirty_piece(
 
     // Castling: also move the rook
     if flags == FLAG_CASTLE {
-        let (rook_from, rook_to) = if to > from {
-            if us == WHITE { (7u8, 5u8) } else { (63u8, 61u8) }
-        } else {
-            if us == WHITE { (0u8, 3u8) } else { (56u8, 59u8) }
-        };
+        let (rook_from, rook_to) = crate::board::castle_rook_squares(castle_rooks, us, to);
         changes[n] = (false, us, ROOK, rook_from); n += 1;
         changes[n] = (true, us, ROOK, rook_to); n += 1;
     }
@@ -3609,7 +3618,7 @@ fn build_pv_string(info: &SearchInfo, board: &Board, target_depth: i32) -> Strin
         // loses information and, when a line repeats on its second move,
         // collapses the whole PV to a single ply.
         if !pv_str.is_empty() { pv_str.push(' '); }
-        pv_str.push_str(&move_to_uci(pv_mv));
+        pv_str.push_str(&pv_board.uci_move(pv_mv));
         pv_moves += 1;
         if seen_hashes.iter().filter(|&&h| h == pv_board.hash).count() >= 2 { break; }
         seen_hashes.push(pv_board.hash);
@@ -3624,23 +3633,18 @@ fn build_pv_string(info: &SearchInfo, board: &Board, target_depth: i32) -> Strin
 
             let pv_tt = info.tt.probe(pv_board.hash);
             if !pv_tt.hit || pv_tt.best_move == NO_MOVE { break; }
-            let pv_from = move_from(pv_tt.best_move);
-            let pv_to = move_to(pv_tt.best_move);
-            let pv_flags = move_flags(pv_tt.best_move);
             let pv_legal = generate_legal_moves(&pv_board);
             let mut found = NO_MOVE;
             for i in 0..pv_legal.len {
                 let m = pv_legal.get(i);
-                if move_from(m) == pv_from && move_to(m) == pv_to
-                    && (!is_promotion(pv_tt.best_move) || move_flags(m) == pv_flags)
-                {
+                if move_matches(m, pv_tt.best_move) {
                     found = m;
                     break;
                 }
             }
             if found == NO_MOVE { break; }
             if !pv_str.is_empty() { pv_str.push(' '); }
-            pv_str.push_str(&move_to_uci(found));
+            pv_str.push_str(&pv_board.uci_move(found));
             pv_board.make_move(found);
             pv_moves += 1;
         }
@@ -4161,12 +4165,9 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 info.pv_table[0][..iter_pv_len].copy_from_slice(&iter_pv[..iter_pv_len]);
                 // Adopt the banked move only if it validates against the legal list.
                 let bm = iter_pv[0];
-                let (bf, bt, bfl) = (move_from(bm), move_to(bm), move_flags(bm));
                 for i in 0..root_legal.len {
                     let m = root_legal.get(i);
-                    if move_from(m) == bf && move_to(m) == bt
-                        && (!is_promotion(bm) || move_flags(m) == bfl)
-                    {
+                    if move_matches(m, bm) {
                         best_move = m;
                         break;
                     }
@@ -4183,14 +4184,9 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
         if info.pv_len[0] > 0 {
             let pv_move = info.pv_table[0][0];
             // Validate against root legal list (match from/to/flags for promotions)
-            let pv_from = move_from(pv_move);
-            let pv_to = move_to(pv_move);
-            let pv_flags = move_flags(pv_move);
             for i in 0..root_legal.len {
                 let m = root_legal.get(i);
-                if move_from(m) == pv_from && move_to(m) == pv_to
-                    && (!is_promotion(pv_move) || move_flags(m) == pv_flags)
-                {
+                if move_matches(m, pv_move) {
                     best_move = m;
                     break;
                 }
@@ -4199,14 +4195,9 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
             // Fallback: probe TT
             let tt_entry = info.tt.probe(board.hash);
             if tt_entry.hit && tt_entry.best_move != NO_MOVE {
-                let tt_from = move_from(tt_entry.best_move);
-                let tt_to = move_to(tt_entry.best_move);
-                let tt_flags = move_flags(tt_entry.best_move);
                 for i in 0..root_legal.len {
                     let m = root_legal.get(i);
-                    if move_from(m) == tt_from && move_to(m) == tt_to
-                        && (!is_promotion(tt_entry.best_move) || move_flags(m) == tt_flags)
-                    {
+                    if move_matches(m, tt_entry.best_move) {
                         best_move = m;
                         break;
                     }
@@ -4350,7 +4341,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 // loses information and, when a line repeats on its second move,
                 // collapses the whole PV to a single ply.
                 if !pv_str.is_empty() { pv_str.push(' '); }
-                pv_str.push_str(&move_to_uci(pv_mv));
+                pv_str.push_str(&pv_board.uci_move(pv_mv));
                 pv_moves += 1;
                 if seen_hashes.iter().filter(|&&h| h == pv_board.hash).count() >= 2 { break; }
                 seen_hashes.push(pv_board.hash);
@@ -4373,23 +4364,18 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
 
                     let pv_tt = info.tt.probe(pv_board.hash);
                     if !pv_tt.hit || pv_tt.best_move == NO_MOVE { break; }
-                    let pv_from = move_from(pv_tt.best_move);
-                    let pv_to = move_to(pv_tt.best_move);
-                    let pv_flags = move_flags(pv_tt.best_move);
                     let pv_legal = generate_legal_moves(&pv_board);
                     let mut found = NO_MOVE;
                     for i in 0..pv_legal.len {
                         let m = pv_legal.get(i);
-                        if move_from(m) == pv_from && move_to(m) == pv_to
-                            && (!is_promotion(pv_tt.best_move) || move_flags(m) == pv_flags)
-                        {
+                        if move_matches(m, pv_tt.best_move) {
                             found = m;
                             break;
                         }
                     }
                     if found == NO_MOVE { break; }
                     if !pv_str.is_empty() { pv_str.push(' '); }
-                    pv_str.push_str(&move_to_uci(found));
+                    pv_str.push_str(&pv_board.uci_move(found));
                     pv_board.make_move(found);
                     pv_moves += 1;
                 }
@@ -4406,6 +4392,9 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 global, nps, elapsed,
                 info.tt.hashfull(), info.tb_hits, pv_str
             );
+        }
+        if let Some(log) = info.iter_log.as_mut() {
+            log.push(IterRecord { depth, best_move, score, nodes: global, time_ms: elapsed as u64 });
         }
 
         // Nothing can beat a mate in one, and nothing avoids being mated in
@@ -5526,8 +5515,7 @@ fn negamax(
                         // + capt-hist empty slot), so the capture branch below is
                         // the one the read side actually consults.
                         let tt_piece = board.piece_at(move_from(tt_move));
-                        let tt_is_cap = board.piece_type_at(move_to(tt_move)) != NO_PIECE_TYPE
-                            || move_flags(tt_move) == FLAG_EN_PASSANT
+                        let tt_is_cap = board.is_capture(tt_move)
                             || is_promotion(tt_move);
                         if !tt_is_cap && tt_piece != NO_PIECE {
                             let bonus = history_bonus(depth);
@@ -5537,7 +5525,7 @@ fn negamax(
                             );
                         } else if tt_is_cap && tt_piece != NO_PIECE {
                             let bonus = capture_history_bonus(depth);
-                            let cpt_pt = board.piece_type_at(move_to(tt_move));
+                            let cpt_pt = board.captured_piece_type(tt_move);
                             let ct = if move_flags(tt_move) == FLAG_EN_PASSANT {
                                 captured_type(PAWN)
                             } else if cpt_pt != NO_PIECE_TYPE {
@@ -5694,8 +5682,7 @@ fn negamax(
     // tactically loud). This must stay symmetric with the other
     // quiet/noisy classifications of the TT move in this file.
     let tt_move_noisy = tt_move != NO_MOVE && {
-        board.piece_type_at(move_to(tt_move)) != NO_PIECE_TYPE
-            || move_flags(tt_move) == FLAG_EN_PASSANT
+        board.is_capture(tt_move)
             || is_promotion(tt_move)
     };
 
@@ -5793,8 +5780,7 @@ fn negamax(
         // RFP TT quiet guard: skip RFP when TT has a quiet best move (Tucano/Weiss).
         // If we know a good quiet move exists, don't prune based on static eval alone.
         let tt_move_is_quiet = tt_move != NO_MOVE
-            && board.piece_type_at(move_to(tt_move)) == NO_PIECE_TYPE
-            && move_flags(tt_move) != FLAG_EN_PASSANT
+            && !board.is_capture(tt_move)
             && !is_promotion(tt_move);
         // TB/mate guard: every peer skips RFP when eval is near mate/TB range.
         // Without this, RFP could cut a node where NNUE sees forced mate. (RFP audit RFP-3)
@@ -6085,9 +6071,9 @@ fn negamax(
             // context stack after the move so the ply+1 child reads THIS move
             // as its parent (see stack write below).
             let pc_moved_piece = board.piece_at(move_from(mv));
-            let pc_captured_pt = if move_flags(mv) == FLAG_EN_PASSANT { PAWN } else { board.piece_type_at(move_to(mv)) };
+            let pc_captured_pt = board.captured_piece_type(mv);
             let pc_dirty = if let Some(net) = info.nnue_net.as_deref() {
-                build_dirty_piece(mv, board.side_to_move, flip_color(board.side_to_move), pc_moved_pt, pc_captured_pt, net)
+                build_dirty_piece(mv, board.side_to_move, flip_color(board.side_to_move), pc_moved_pt, pc_captured_pt, &board.castle_rooks, net)
             } else { DirtyPiece::recompute() };
 
             if let Some(acc) = &mut info.nnue_acc { acc.push(pc_dirty); }
@@ -6267,7 +6253,7 @@ fn negamax(
         let flags = move_flags(mv);
 
         // Check if capture BEFORE making the move
-        let is_cap = board.piece_type_at(to) != NO_PIECE_TYPE || flags == FLAG_EN_PASSANT;
+        let is_cap = board.is_capture(mv);
         let is_promo = is_promotion(mv);
 
         if skip_quiets && !is_cap && !is_promo {
@@ -6509,7 +6495,7 @@ let singular_beta = tt_score_local - depth;
             info.moved_to_stack[ply_u] = to;
         }
         let captured_pt = if is_cap {
-            if flags == FLAG_EN_PASSANT { PAWN } else { board.piece_type_at(to) }
+            board.captured_piece_type(mv)
         } else {
             NO_PIECE_TYPE
         };
@@ -6549,7 +6535,7 @@ let singular_beta = tt_score_local - depth;
 
         // Build NNUE dirty piece info BEFORE make_move
         let dirty = if let Some(net) = info.nnue_net.as_deref() {
-            build_dirty_piece(mv, us, flip_color(us), moved_pt, captured_pt, net)
+            build_dirty_piece(mv, us, flip_color(us), moved_pt, captured_pt, &board.castle_rooks, net)
         } else { DirtyPiece::recompute() };
 
         // Push NNUE accumulator
@@ -7458,8 +7444,7 @@ let singular_beta = tt_score_local - depth;
     // Training on noisy bestmoves pollutes the tables. Matches Stockfish
     // (skip the update when the best move is a capture/promotion).
     let best_move_noisy = best_move != NO_MOVE && {
-        board.piece_type_at(move_to(best_move)) != NO_PIECE_TYPE
-            || move_flags(best_move) == FLAG_EN_PASSANT
+        board.is_capture(best_move)
             || is_promotion(best_move)
     };
     // Correction history update: train on BOTH directions of error.
@@ -7746,16 +7731,15 @@ fn quiescence_with_depth(
             // Obsidian breaks after one quiet. Capture evasions always searched. The gate is
             // only satisfiable after at least one legal move scored, so
             // checkmate detection (move_count == 0) is unaffected.
-            let ev_is_cap = board.piece_type_at(move_to(mv)) != NO_PIECE_TYPE
-                || move_flags(mv) == FLAG_EN_PASSANT;
+            let ev_is_cap = board.is_capture(mv);
             if !ev_is_cap && !is_promotion(mv) && !is_loss(best_score) {
                 continue;
             }
 
             let qs_moved_pt = board.piece_type_at(move_from(mv));
-            let qs_captured_pt = if move_flags(mv) == FLAG_EN_PASSANT { PAWN } else { board.piece_type_at(move_to(mv)) };
+            let qs_captured_pt = board.captured_piece_type(mv);
             let qs_dirty = if let Some(net) = info.nnue_net.as_deref() {
-                build_dirty_piece(mv, board.side_to_move, flip_color(board.side_to_move), qs_moved_pt, qs_captured_pt, net)
+                build_dirty_piece(mv, board.side_to_move, flip_color(board.side_to_move), qs_moved_pt, qs_captured_pt, &board.castle_rooks, net)
             } else { DirtyPiece::recompute() };
 
             // Record on search stack so deeper QS evasion's MovePicker::new_evasion
@@ -8000,9 +7984,9 @@ fn quiescence_with_depth(
 
         // Build lazy NNUE update
         let qs_moved_pt = board.piece_type_at(move_from(mv));
-        let qs_captured_pt = if move_flags(mv) == FLAG_EN_PASSANT { PAWN } else { board.piece_type_at(move_to(mv)) };
+        let qs_captured_pt = board.captured_piece_type(mv);
         let qs_dirty = if let Some(net) = info.nnue_net.as_deref() {
-            build_dirty_piece(mv, board.side_to_move, flip_color(board.side_to_move), qs_moved_pt, qs_captured_pt, net)
+            build_dirty_piece(mv, board.side_to_move, flip_color(board.side_to_move), qs_moved_pt, qs_captured_pt, &board.castle_rooks, net)
         } else { DirtyPiece::recompute() };
 
         // Record on search stack — same reason as the evasion path above.

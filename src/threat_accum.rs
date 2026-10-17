@@ -1236,12 +1236,25 @@ mod incremental_tests {
         run_fuzz_random_games(false);
     }
 
-    fn run_fuzz_random_games(eager: bool) {
-        crate::init();
-        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let nf = num_threat_features();
-        let weights = make_weights(nf);
+    /// Chess960 castling (king landing on its rook's square, king or rook
+    /// not moving, rook shielding the back rank) through the same
+    /// incremental == refresh fuzz, eager and lazy, with castles favoured.
+    #[test]
+    fn fuzz_random_games_chess960() {
+        const FENS: &[&str] = &[
+            "r4kr1/pppppppp/8/8/8/8/PPPPPPPP/R4KR1 w GAga - 0 1",
+            "2rk3r/pppppppp/8/8/8/8/PPPPPPPP/2RK3R w HChc - 0 1",
+            "r5kr/pppppppp/8/8/8/8/PPPPPPPP/R5KR w HAha - 0 1",
+            "r1k4r/pppppppp/8/8/8/8/PPPPPPPP/R1K4R w HAha - 0 1",
+            "r2k1r2/pppppppp/8/8/8/8/PPPPPPPP/R2K1R2 w FAfa - 0 1",
+            "3r1k1r/pppppppp/8/8/8/8/PPPPPPPP/3R1K1R w HDhd - 0 1",
+            "1r1k3r/8/8/8/8/8/8/rR1K3R w HBh - 0 1",
+        ];
+        run_fuzz_random_games_on(true, FENS, true);
+        run_fuzz_random_games_on(false, FENS, true);
+    }
 
+    fn run_fuzz_random_games(eager: bool) {
         // Several varied starting positions — opening, kiwipete middle-game,
         // tactical midgame with heavy slider activity, and an endgame.
         const START_FENS: &[&str] = &[
@@ -1251,6 +1264,15 @@ mod incremental_tests {
             "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
             "4k3/P6P/8/8/8/8/p6p/4K3 w - - 0 1", // promotion testbed
         ];
+        run_fuzz_random_games_on(eager, START_FENS, false);
+    }
+
+    /// `favour_castles`: when a castle is legal, play one half the time.
+    fn run_fuzz_random_games_on(eager: bool, start_fens: &[&str], favour_castles: bool) {
+        crate::init();
+        let _space = crate::threats::FEATURE_SPACE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let nf = num_threat_features();
+        let weights = make_weights(nf);
 
         // Deterministic xorshift32 PRNG — reproducible failures.
         fn next_u32(state: &mut u32) -> u32 {
@@ -1265,7 +1287,7 @@ mod incremental_tests {
         const MAX_PLIES_PER_GAME: usize = 120;
         const GAMES_PER_FEN: usize = 20;
 
-        for (fen_idx, fen) in START_FENS.iter().enumerate() {
+        for (fen_idx, fen) in start_fens.iter().enumerate() {
             for game in 0..GAMES_PER_FEN {
                 let seed: u32 = 0xDEADBEEFu32
                     .wrapping_add((fen_idx as u32).wrapping_mul(1_000_003))
@@ -1292,7 +1314,14 @@ mod incremental_tests {
                         break; // stalemate or checkmate
                     }
                     let idx = (next_u32(&mut rng) as usize) % legal.len;
-                    let mv = legal.get(idx);
+                    let mut mv = legal.get(idx);
+                    if favour_castles && next_u32(&mut rng) % 2 == 0 {
+                        for i in 0..legal.len {
+                            if crate::types::move_flags(legal.get(i)) == crate::types::FLAG_CASTLE {
+                                mv = legal.get(i);
+                            }
+                        }
+                    }
 
                     incr.push(NO_MOVE, NO_PIECE_TYPE);
                     refs.push(NO_MOVE, NO_PIECE_TYPE);

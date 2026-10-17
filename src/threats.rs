@@ -1237,12 +1237,15 @@ pub struct PieceState {
     pub pieces: [Bitboard; 6],
     pub colors: [Bitboard; 2],
     pub mailbox: [u8; 64],
+    /// Castling rook start squares (the board's `castle_rooks`; fixed for a
+    /// game), needed to replay castling moves in Chess960.
+    pub castle_rooks: [u8; 4],
 }
 
 impl PieceState {
     #[inline]
     pub fn from_board(b: &crate::board::Board) -> Self {
-        Self { pieces: b.pieces, colors: b.colors, mailbox: b.mailbox }
+        Self { pieces: b.pieces, colors: b.colors, mailbox: b.mailbox, castle_rooks: b.castle_rooks }
     }
 
     #[inline]
@@ -1272,14 +1275,6 @@ impl PieceState {
         self.mailbox[from as usize] = NO_PIECE_TYPE;
         self.mailbox[to as usize] = pt;
     }
-}
-
-/// Castling rook squares for `us`, given the king's `from`/`to`.
-#[inline]
-fn castle_rook_squares(us: Color, from: u8, to: u8) -> (u8, u8) {
-    if to > from {
-        if us == WHITE { (7, 5) } else { (63, 61) }
-    } else if us == WHITE { (0, 3) } else { (56, 59) }
 }
 
 /// Regenerate the threat deltas for `mv` from the PRE-move piece state,
@@ -1317,6 +1312,33 @@ pub fn replay_move_deltas(
     let them = flip_color(us);
     let pt = st.mailbox[from as usize];
 
+    // Castling: the same two sequences as `Board::make_castle`.
+    if flags == FLAG_CASTLE {
+        let (rook_from, rook_to) =
+            crate::board::castle_rook_squares(&st.castle_rooks, us, to);
+        if crate::board::castle_is_simple(from, to, rook_from, rook_to) {
+            st.shift(us, KING, from, to);
+            push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
+                                 st.occ(), us, KING, from as u32, to as u32);
+            st.shift(us, ROOK, rook_from, rook_to);
+            push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
+                                 st.occ(), us, ROOK, rook_from as u32, rook_to as u32);
+        } else {
+            st.remove(us, ROOK, rook_from);
+            push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
+                                   st.occ(), us, ROOK, rook_from as u32, false);
+            if from != to {
+                st.shift(us, KING, from, to);
+                push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
+                                     st.occ(), us, KING, from as u32, to as u32);
+            }
+            st.put(us, ROOK, rook_to);
+            push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
+                                   st.occ(), us, ROOK, rook_to as u32, true);
+        }
+        return;
+    }
+
     if flags == FLAG_EN_PASSANT {
         let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
         st.remove(them, PAWN, cap_sq);
@@ -1341,13 +1363,6 @@ pub fn replay_move_deltas(
         push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
                                st.occ(), us, promo_pt, to as u32, true);
     }
-
-    if flags == FLAG_CASTLE {
-        let (rook_from, rook_to) = castle_rook_squares(us, from, to);
-        st.shift(us, ROOK, rook_from, rook_to);
-        push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
-                             st.occ(), us, ROOK, rook_from as u32, rook_to as u32);
-    }
 }
 
 /// Step `st` BACKWARDS over `mv`, turning a post-move piece state into the
@@ -1364,8 +1379,14 @@ pub fn undo_move_state(st: &mut PieceState, us: Color, mv: Move, captured: u8) {
     let them = flip_color(us);
 
     if flags == FLAG_CASTLE {
-        let (rook_from, rook_to) = castle_rook_squares(us, from, to);
-        st.shift(us, ROOK, rook_to, rook_from);
+        // Lift both before putting either back (960 squares can coincide).
+        let (rook_from, rook_to) =
+            crate::board::castle_rook_squares(&st.castle_rooks, us, to);
+        st.remove(us, KING, to);
+        st.remove(us, ROOK, rook_to);
+        st.put(us, KING, from);
+        st.put(us, ROOK, rook_from);
+        return;
     }
 
     if is_promotion(mv) {
@@ -3212,6 +3233,15 @@ mod tests {
             // the corpus seeds it directly as well as biasing toward it below.
             "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
             "rnbqkbnr/pppp1ppp/8/8/3PpP2/8/PPP1P1PP/RNBQKBNR b KQkq f3 0 3",
+            // Chess960 castling: the non-"simple" make_castle sequence
+            // (king onto its rook's square, king or rook not moving) has to
+            // be mirrored exactly too.
+            "r4kr1/pppppppp/8/8/8/8/PPPPPPPP/R4KR1 w GAga - 0 1",
+            "2rk3r/pppppppp/8/8/8/8/PPPPPPPP/2RK3R w HChc - 0 1",
+            "r5kr/pppppppp/8/8/8/8/PPPPPPPP/R5KR w HAha - 0 1",
+            "r1k4r/pppppppp/8/8/8/8/PPPPPPPP/R1K4R w HAha - 0 1",
+            "r2k1r2/pppppppp/8/8/8/8/PPPPPPPP/R2K1R2 w FAfa - 0 1",
+            "3r1k1r/pppppppp/8/8/8/8/PPPPPPPP/3R1K1R w HDhd - 0 1",
         ];
 
         fn next_u32(state: &mut u32) -> u32 {

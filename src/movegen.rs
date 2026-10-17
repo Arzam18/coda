@@ -365,7 +365,7 @@ pub fn generate_quiets(board: &Board) -> MoveList {
     }
 
     // Castling
-    generate_castling(board, &mut list, us, occ);
+    generate_castling(board, &mut list, us);
 
     list
 }
@@ -374,33 +374,25 @@ pub fn generate_quiets(board: &Board) -> MoveList {
 // Castling move generation
 // ---------------------------------------------------------------------------
 
-fn generate_castling(board: &Board, list: &mut MoveList, us: Color, occ: Bitboard) {
-    if us == WHITE {
-        // Kingside: f1 and g1 must be empty, e1/f1/g1 not attacked
-        if board.castling & CASTLE_WK != 0
-            && occ & 0x60 == 0
-                && !is_attacked(board, 4, BLACK) && !is_attacked(board, 5, BLACK) && !is_attacked(board, 6, BLACK) {
-                    list.push(make_move(4, 6, FLAG_CASTLE));
-                }
-        // Queenside: b1, c1, d1 must be empty, e1/d1/c1 not attacked
-        if board.castling & CASTLE_WQ != 0
-            && occ & 0x0E == 0
-                && !is_attacked(board, 4, BLACK) && !is_attacked(board, 3, BLACK) && !is_attacked(board, 2, BLACK) {
-                    list.push(make_move(4, 2, FLAG_CASTLE));
-                }
-    } else {
-        // Kingside
-        if board.castling & CASTLE_BK != 0
-            && occ & (0x60u64 << 56) == 0
-                && !is_attacked(board, 60, WHITE) && !is_attacked(board, 61, WHITE) && !is_attacked(board, 62, WHITE) {
-                    list.push(make_move(60, 62, FLAG_CASTLE));
-                }
-        // Queenside
-        if board.castling & CASTLE_BQ != 0
-            && occ & (0x0Eu64 << 56) == 0
-                && !is_attacked(board, 60, WHITE) && !is_attacked(board, 59, WHITE) && !is_attacked(board, 58, WHITE) {
-                    list.push(make_move(60, 58, FLAG_CASTLE));
-                }
+fn generate_castling(board: &Board, list: &mut MoveList, us: Color) {
+    // Rights for `us`: bit 0 = kingside, bit 1 = queenside.
+    let rights = (board.castling >> (2 * us)) & 0b11;
+    if rights == 0 {
+        return;
+    }
+    // Encoding is king-from -> king-destination (g-file kingside, c-file
+    // queenside) in standard chess and Chess960 alike; in 960 the two can be
+    // the same square. `castle_is_legal` does the full check (right, rook on
+    // its start square, empty paths, king's path unattacked with king and
+    // castling rook lifted), so these are fully legal, not just pseudo-legal.
+    // Kingside first, then queenside — the order movegen always used.
+    let ksq = board.king_sq(us);
+    let back_rank: u8 = if us == WHITE { 0 } else { 56 };
+    if rights & 0b01 != 0 && board.castle_is_legal(us, ksq, back_rank + 6) {
+        list.push(make_move(ksq, back_rank + 6, FLAG_CASTLE));
+    }
+    if rights & 0b10 != 0 && board.castle_is_legal(us, ksq, back_rank + 2) {
+        list.push(make_move(ksq, back_rank + 2, FLAG_CASTLE));
     }
 }
 
@@ -750,7 +742,10 @@ pub fn perft(board: &mut Board, depth: u32) -> u64 {
     let mut nodes = 0u64;
     for i in 0..moves.len {
         let mv = moves.get(i);
-        board.make_move(mv);
+        // make_move refuses a king capture, which only exists in an invalid
+        // position (side not to move in check). Skip it rather than unmake a
+        // move that was never made.
+        if !board.make_move(mv) { continue; }
         nodes += perft(board, depth - 1);
         board.unmake_move();
     }
@@ -765,7 +760,7 @@ pub fn perft_divide(board: &mut Board, depth: u32) -> u64 {
 
     for i in 0..moves.len {
         let mv = moves.get(i);
-        board.make_move(mv);
+        if !board.make_move(mv) { continue; } // king capture: invalid position
         let count = if depth <= 1 { 1 } else { perft(board, depth - 1) };
         board.unmake_move();
         println!("{}: {}", move_to_uci(mv), count);
@@ -1079,5 +1074,222 @@ mod tests {
         assert_eq!(perft(&mut b, 3), 2812);
         assert_eq!(perft(&mut b, 4), 43238);
         assert_eq!(perft(&mut b, 5), 674624);
+    }
+
+    // -----------------------------------------------------------------------
+    // Chess960
+    // -----------------------------------------------------------------------
+
+    /// Chess960 positions with depth-3 perft counts. The counts come from
+    /// python-chess (`chess.Board(fen, chess960=True)`, recursive perft over
+    /// `legal_moves`), an independent move generator, not from Coda itself.
+    /// The set covers: start setups with the king on the b/c/f/g file next to
+    /// a rook; the king already on its castling square (castling moves only
+    /// the rook); the rook already on its castling square (castling moves
+    /// only the king); king and rook swapping squares; an enemy rook or queen
+    /// on the back rank behind the castling rook (the castle must be
+    /// illegal, since the rook was the only shield); an attacked destination
+    /// or transit square; an inner rook as the castling rook; and mid-game
+    /// positions from random play, most with castling rights left.
+    ///
+    /// Also: kings castling AWAY from their rook (king on the b-file castling
+    /// queenside moves right, both colours) and kings passing over their own
+    /// rook to a destination beyond it (king b1, inner kingside rook c1).
+    const CHESS960_PERFT3: &[(&str, u64)] = &[
+        ("r5kr/8/8/8/8/8/8/R5KR w HAha - 0 1", 11069), // king_stays_ks
+        ("1r4kr/8/8/8/8/8/8/1R4KR w HBhb - 0 1", 10954), // ks_stay
+        ("r1k4r/8/8/8/8/8/8/R1K4R w HAha - 0 1", 13776), // qs_kingstay
+        ("1rk4r/8/8/8/8/8/8/1RK4R w HBhb - 0 1", 10990), // qs_kingstay_b
+        ("r2k1r2/8/8/8/8/8/8/R2K1R2 w FAfa - 0 1", 11735), // rook_stays_ks
+        ("3r1k1r/8/8/8/8/8/8/3R1K1R w HDhd - 0 1", 11601), // rook_stays_qs
+        ("rk5r/8/8/8/8/8/8/RK5R w HAha - 0 1", 11099), // king_b_qs
+        ("r4kr1/8/8/8/8/8/8/R4KR1 w GAga - 0 1", 9927), // swap_ks
+        ("2rk3r/8/8/8/8/8/8/2RK3R w HChc - 0 1", 9924), // swap_qs_d
+        ("1r1k3r/8/8/8/8/8/8/rR1K3R w HBh - 0 1", 10576), // xray_qs
+        ("1r1k3r/8/8/8/8/8/8/qR1K3R w HBh - 0 1", 11904), // xray_qs_q
+        ("r3k1r1/8/8/8/8/8/8/R3K1Rq w GAga - 0 1", 11782), // xray_ks
+        ("r4kr1/8/8/8/8/8/8/R4KRr w GAga - 0 1", 7889), // xray_ks2
+        ("r3k2r/8/8/8/8/8/8/1RK3r1 w B - 0 1", 1480), // xray_qs_far
+        ("r3k2r/8/8/8/8/8/8/RK5r w A - 0 1", 1046), // dest_attacked
+        ("r3k2r/8/8/8/8/8/6b1/RK5R w HA - 0 1", 13207), // transit_bishop
+        ("rk2r2r/8/8/8/8/8/8/RK2R2R w EAea - 0 1", 25073), // inner_rook
+        ("rk5r/1p6/8/8/8/8/8/1R2K2R w HBha - 0 1", 13222), // b8 king castles q-side rightward
+        ("rk5r/1p6/8/8/8/8/8/1R2K2R b HBha - 0 1", 13627), // same, black to move
+        ("r3k2r/8/8/8/8/8/8/RK5R w HAha - 0 1", 11291), // b1 king castles q-side rightward
+        ("rk5r/8/8/8/8/8/8/R3K2R b HAha - 0 1", 11291), // b8 king, black to move
+        ("rkr4r/8/8/8/8/8/8/RKR4R w CAca - 0 1", 22404), // king passes over inner k-side rook
+        ("rkr4r/8/8/8/8/8/8/RKR4R b CAca - 0 1", 22404), // same, black to move
+        ("r2k3r/8/8/8/8/8/8/R2K3R w HAha - 0 1", 13177), // rook passes king dest, lands on king start
+        ("2rk3r/8/8/8/8/8/8/2RK3R b HChc - 0 1", 9924), // black_swap
+        ("Rr1k3r/8/8/8/8/8/8/1R1K3R b HBhb - 0 1", 10738), // black_xray
+        ("br1bqnr1/2pk2pp/5p1n/p3p3/4PP1P/8/PPPP1QP1/BRK2NRN w GB - 0 8", 27965), // mid801_14
+        ("bqnrk1rb/ppp2pp1/4n3/4P3/4pPp1/8/PPP1P2P/BQNR1RKB b gd - 0 8", 26442), // mid195_15
+        ("nbbrkr2/pppp1ppq/6Bp/4p3/3P4/2P5/PPN1PPPP/2BRKRQN b FDfd - 2 5", 14327), // mid356_9
+        ("nbbrq1kr/3pppp1/pp2n2p/2p3P1/8/PP5P/2PPPPK1/NBBRQN1R b hd - 1 6", 17127), // mid132_11
+        ("1rnkrbnq/p1p3pp/2b1pp2/1p1p4/P7/3N1P2/1PPPP1PP/BR1KRBNQ w EBeb - 0 6", 16185), // mid658_10
+        ("b1kr1rqn/1pbpn1pp/2p1pp2/8/p1PPP3/7P/PPB2PPQ/BRN1KR1N w FB - 0 9", 25102), // mid641_16
+        ("bnnbrkrq/pppp2p1/4p3/5p1p/8/P2P3P/1PP1PPP1/BNNBRRKQ b ge - 0 4", 15561), // mid81_7
+        ("bbq1nrk1/2rQ2pp/1p3p2/4p3/2p2nP1/P2PP3/1PP2PNP/BBR2KNR w HC - 1 12", 45357), // mid496_22
+        ("bqr1kbnr/1pppppQ1/4n1pp/p7/P4P2/1P5P/2PPP1PR/B1RNKBN1 b Chc - 6 7", 18400), // mid482_13
+        ("r2bk2r/pppnp1pb/2n4p/3p1p2/8/1P2PB1q/P1PPNPPP/R1Q1KNBR b ha - 2 8", 36701), // mid525_15
+        ("brknr1qn/p1pp1ppp/1p1bp3/8/5P1P/8/PPPPPQP1/BRKNRB1N w EBeb - 2 4", 21497), // mid834_6
+        ("nq2b1kr/n1pr1p2/3bp3/p3pp1p/2p3PP/1P5R/P4K2/NQNRBB2 w h - 0 15", 53916), // mid26_28
+        ("rk2n1qr/ppb1ppp1/2pp4/4nb1p/BPP3P1/P2P4/RK2PP1P/2B1NNQR b ha - 2 8", 43536), // mid741_15
+        ("rk3brq/ppp1pnp1/3p1p1n/1b6/2P1P2p/P7/1P1P1PPP/RKNNB1RQ w GAga - 1 10", 14194), // mid762_18
+        ("brqk1brn/p1nppppp/1pp5/8/6PP/1P4N1/P1PPPP2/BRQKNBR1 b GBgb - 0 4", 21369), // mid786_7
+        ("brkbrqnn/1pp2ppp/p7/3p3B/Q3p3/4P3/PPPP1PPP/BRK1R1NN w EBeb - 0 5", 40732), // mid913_8
+        ("rkbnqb1r/pp1ppp2/7p/2p3p1/P1P3nP/4P1NB/RP1P1P2/K1BNQ2R b ha - 1 10", 16027), // mid726_19
+        ("n1bkrnqb/1rp1pppp/1p6/p2p4/8/P3N1P1/1PPPPPBP/NRBKR1Q1 w EBe - 0 5", 17409), // mid375_8
+        ("2rqkbbr/2pppppp/pp1n1Q2/8/4P3/1P1n2P1/P1PP1P1P/RN2KBBR w HAh - 0 8", 3040), // mid446_14
+        ("r1bknbqr/p3pp2/npPp2p1/7p/P7/2P5/2KPPPPP/RNB1NBQR b ha - 1 7", 19186), // mid550_13
+        ("r1kq1rn1/nppbpp1p/8/p1p3pP/4P3/2b2Q2/PPPP1PP1/RK2BRNB b FA - 3 9", 32278), // mid827_17
+        ("b2nnbr1/p1p2ppk/P7/Qr1pN2p/2PP1P2/7P/1P2PNP1/BR3BKR w HB - 0 15", 40635), // mid402_28
+        ("rkn1qrbb/1ppppp1p/6p1/p1N5/3P4/4P3/PP1P1PPP/RK1NQRBB b FAfa - 0 5", 14358), // mid751_9
+        ("nbbr2qr/p2k1ppp/2pppn2/8/1p3P1P/2PPP2R/PPN3P1/1BBRKQN1 w D - 1 9", 23843), // mid244_16
+        ("rbbnnkqr/ppppppp1/8/7p/1P4N1/8/P1PPPPPP/RBB1NKQR w HAha - 0 4", 12184), // mid452_6
+        ("rnbbqrkn/p1pppppp/8/1p6/PP4P1/8/2PPPP1P/RNBBQRKN w - - 0 5", 9838), // mid613_8
+        ("1krnqn1b/r3p1p1/1ppp1p2/7p/pPb1P2Q/P3BP2/1NPP2PP/RKR2N1B w CAc - 0 12", 43886), // mid943_22
+        ("1qkrbbnn/r1pppppp/pp6/8/2P5/P4P1N/1P1PP1PP/RQKRBB1N b DAd - 0 4", 15146), // mid890_7
+        ("n2rq1br/ppkp1p2/B6p/2p3p1/P2P2P1/2P4P/1P1K1P1b/NN1RQ1BR w - - 3 14", 29407), // mid78_26
+        ("Qrn1rbn1/p1pkp2p/3p1p2/1p4p1/1P3PP1/P7/1NPPP2P/qR1KRBN1 w EB - 0 8", 21336), // mid658_14
+        ("bbqnnrkr/pppppppp/8/8/8/8/PPPPPPPP/BBQNNRKR w HFhf - 0 1", 9006), // start0
+        ("nbbnrkrq/pppppppp/8/8/8/8/PPPPPPPP/NBBNRKRQ w GEge - 0 1", 8914), // start84
+        ("qbbnrknr/pppppppp/8/8/8/8/PPPPPPPP/QBBNRKNR w HEhe - 0 1", 9010), // start196
+        ("bbqrnnkr/pppppppp/8/8/8/8/PPPPPPPP/BBQRNNKR w HDhd - 0 1", 9024), // start384
+        ("bbrqnkrn/pppppppp/8/8/8/8/PPPPPPPP/BBRQNKRN w GCgc - 0 1", 8970), // start592
+        ("rknnqbbr/pppppppp/8/8/8/8/PPPPPPPP/RKNNQBBR w HAha - 0 1", 9032), // start750
+        ("rkbnrbnq/pppppppp/8/8/8/8/PPPPPPPP/RKBNRBNQ w EAea - 0 1", 8934), // start854
+        ("brkrnnqb/pppppppp/8/8/8/8/PPPPPPPP/BRKRNNQB w DBdb - 0 1", 8950), // start947
+    ];
+
+    /// An INVALID position (side not to move in check: the b1 rook attacks the
+    /// b8 king) must not panic. make_move refuses the king capture and perft
+    /// skips it; python-chess, which does generate king captures here,
+    /// agrees once those are excluded (77403 at depth 4).
+    #[test]
+    fn perft_invalid_position_skips_king_capture() {
+        init();
+        let mut b = Board::from_fen("rk5r/8/8/8/8/8/8/1R2K2R w HBha - 0 1");
+        assert_eq!(perft(&mut b, 4), 77403);
+    }
+
+    #[test]
+    fn perft_chess960_matches_python_chess() {
+        init();
+        for &(fen, expected) in CHESS960_PERFT3 {
+            let mut b = Board::from_fen(fen);
+            assert_eq!(perft(&mut b, 3), expected, "chess960 perft(3) mismatch: {}", fen);
+        }
+    }
+
+    /// Random games from the Chess960 set: make/unmake must restore the board
+    /// exactly, the incremental hash must equal a from-scratch hash after
+    /// every move, every legal move must pass `is_pseudo_legal` + `is_legal`
+    /// (the TT-move path), and FEN must round-trip. Castles are favoured so
+    /// the 960 make/unmake paths get exercised heavily.
+    #[test]
+    fn chess960_make_unmake_hash_and_fen_roundtrip() {
+        init();
+        let mut state = 0x9600_0001u32;
+        let mut rnd = || { state ^= state << 13; state ^= state >> 17; state ^= state << 5; state };
+        let mut castles = 0usize;
+        for &(fen, _) in CHESS960_PERFT3 {
+            let start = Board::from_fen(fen);
+            // FEN round-trip: what we print parses back to the same position.
+            let again = Board::from_fen(&start.to_fen());
+            assert_eq!(again.castling, start.castling, "castling round-trip {}", fen);
+            assert_eq!(again.castle_rooks, start.castle_rooks, "castle rooks round-trip {}", fen);
+            assert_eq!(again.hash, start.hash, "hash round-trip {}", fen);
+            for _game in 0..8 {
+                let mut b = start.clone();
+                for _ply in 0..60 {
+                    let legal = generate_legal_moves(&b);
+                    if legal.len == 0 { break; }
+                    let pinned = b.pinned();
+                    let checkers = b.checkers();
+                    for i in 0..legal.len {
+                        let m = legal.get(i);
+                        assert!(crate::movepicker::is_pseudo_legal(&b, m) && b.is_legal(m, pinned, checkers),
+                            "legal move {} rejected by is_pseudo_legal/is_legal in {}", move_to_uci(m), b.to_fen());
+                    }
+                    let mut mv = legal.get(rnd() as usize % legal.len);
+                    for i in 0..legal.len {
+                        if move_flags(legal.get(i)) == FLAG_CASTLE && rnd() % 2 == 0 {
+                            mv = legal.get(i);
+                        }
+                    }
+                    if move_flags(mv) == FLAG_CASTLE { castles += 1; }
+                    let before = b.clone();
+                    assert!(b.make_move(mv));
+                    assert_eq!(b.hash, b.compute_hash(), "incremental hash after {} from {}", move_to_uci(mv), before.to_fen());
+                    let fen_after = b.to_fen();
+                    assert_eq!(Board::from_fen(&fen_after).hash, b.hash, "FEN round-trip after {}", move_to_uci(mv));
+                    b.unmake_move();
+                    assert_eq!(b.pieces, before.pieces, "unmake pieces {}", move_to_uci(mv));
+                    assert_eq!(b.colors, before.colors, "unmake colors {}", move_to_uci(mv));
+                    assert_eq!(b.mailbox, before.mailbox, "unmake mailbox {}", move_to_uci(mv));
+                    assert_eq!(b.castling, before.castling);
+                    assert_eq!(b.hash, before.hash);
+                    b.make_move(mv);
+                }
+            }
+        }
+        assert!(castles > 100, "only {} castles played", castles);
+    }
+
+    /// FEN parsing: X-FEN K/Q mean the outermost rook, Shredder letters name
+    /// the file, and standard positions print exactly as before.
+    #[test]
+    fn chess960_fen_castling_fields() {
+        init();
+        // Standard: unchanged output.
+        let b = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+        assert_eq!(b.castle_rooks, crate::board::STANDARD_CASTLE_ROOKS);
+        assert!(b.to_fen().contains(" KQkq "));
+        // Shredder letters and X-FEN letters give the same position.
+        let s = Board::from_fen("1r1k2r1/8/8/8/8/8/8/1R1K2R1 w GBgb - 0 1");
+        let x = Board::from_fen("1r1k2r1/8/8/8/8/8/8/1R1K2R1 w KQkq - 0 1");
+        assert_eq!(s.castling, 0b1111);
+        assert_eq!(s.castle_rooks, [6, 1, 62, 57]);
+        assert_eq!(x.castle_rooks, s.castle_rooks);
+        assert_eq!(s.hash, x.hash);
+        assert!(s.to_fen().contains(" GBgb "), "{}", s.to_fen());
+        // K = OUTERMOST rook: with rooks on f1 and h1, K is h1; F names f1.
+        let k = Board::from_fen("4k3/8/8/8/8/8/8/R3KR1R w K - 0 1");
+        assert_eq!(k.castle_rooks[0], 7);
+        let f = Board::from_fen("4k3/8/8/8/8/8/8/R3KR1R w F - 0 1");
+        assert_eq!(f.castle_rooks[0], 5);
+        assert!(f.to_fen().contains(" F "), "{}", f.to_fen());
+        // A right naming a missing rook is dropped.
+        let none = Board::from_fen("4k3/8/8/8/8/8/8/4K3 w KQ - 0 1");
+        assert_eq!(none.castling, 0);
+    }
+
+    /// UCI move strings: standard form by default, king-takes-rook in 960
+    /// mode, and the two kinds of king move that share from/to in 960 (king
+    /// step f1g1 vs. castle with the king going f1->g1) stay distinct.
+    #[test]
+    fn chess960_uci_castle_strings() {
+        init();
+        let b = Board::from_fen("r4k1r/8/8/8/8/8/8/R4K1R w HAha - 0 1");
+        let legal = generate_legal_moves(&b);
+        let mut castle_ks = NO_MOVE;
+        let mut step = NO_MOVE;
+        for i in 0..legal.len {
+            let m = legal.get(i);
+            if move_flags(m) == FLAG_CASTLE && move_to(m) == 6 { castle_ks = m; }
+            if move_flags(m) == FLAG_NONE && move_from(m) == 5 && move_to(m) == 6 { step = m; }
+        }
+        assert!(castle_ks != NO_MOVE && step != NO_MOVE);
+        assert_eq!(b.uci_move_mode(castle_ks, true), "f1h1");
+        assert_eq!(b.uci_move_mode(castle_ks, false), "f1g1");
+        assert_eq!(b.uci_move_mode(step, true), "f1g1");
+        assert!(!crate::types::move_matches(step, castle_ks));
+        assert!(!crate::types::move_matches(castle_ks, step));
+        // Standard position, 960 mode: e1h1 / e1a1.
+        let s = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1");
+        assert_eq!(s.uci_move_mode(make_move(4, 6, FLAG_CASTLE), true), "e1h1");
+        assert_eq!(s.uci_move_mode(make_move(4, 2, FLAG_CASTLE), true), "e1a1");
+        assert_eq!(s.uci_move_mode(make_move(4, 6, FLAG_CASTLE), false), "e1g1");
     }
 }
