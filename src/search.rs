@@ -1273,6 +1273,16 @@ struct TmDbg {
     adjusted_soft: u64,
 }
 
+/// One completed main-thread iteration, recorded when `SearchInfo::iter_log` is Some.
+#[derive(Clone, Copy, Debug)]
+pub struct IterRecord {
+    pub depth: i32,
+    pub best_move: Move,
+    pub score: i32,
+    pub nodes: u64,
+    pub time_ms: u64,
+}
+
 pub struct SearchInfo {
     pub nodes: u64,
     /// Interior Syzygy WDL probe hits this search, aggregated across SMP
@@ -1296,6 +1306,9 @@ pub struct SearchInfo {
     /// Cell because should_stop takes &self.
     last_flushed_nodes: std::cell::Cell<u64>,
     pub silent: bool,  // suppress UCI output (for datagen)
+    /// When Some, the main ID loop appends one record per completed iteration
+    /// (`coda epd` uses it to report the depth a solution was first found).
+    pub iter_log: Option<Vec<IterRecord>>,
     /// SMP defers search-end output until helpers have been collected and the
     /// winning thread and aggregate counters are final.
     defer_final_info: bool,
@@ -1615,6 +1628,7 @@ impl SearchInfo {
             num_threads: 1,
             last_flushed_nodes: std::cell::Cell::new(0),
             silent: false,
+            iter_log: None,
             defer_final_info: false,
             stats: PruneStats::default(),
             stats_tt_static_eval_hits: 0,
@@ -4378,6 +4392,9 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 global, nps, elapsed,
                 info.tt.hashfull(), info.tb_hits, pv_str
             );
+        }
+        if let Some(log) = info.iter_log.as_mut() {
+            log.push(IterRecord { depth, best_move, score, nodes: global, time_ms: elapsed as u64 });
         }
 
         // Nothing can beat a mate in one, and nothing avoids being mated in

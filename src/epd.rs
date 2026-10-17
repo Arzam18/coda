@@ -13,7 +13,19 @@ pub struct EpdPosition {
     pub fen: String,
     pub best_moves: Vec<String>,  // "bm" field: correct moves in SAN or coordinate
     pub avoid_moves: Vec<String>, // "am" field: moves to avoid
+    /// "dm" field: a mate in at most this many moves must be found.
+    pub direct_mate: Option<i32>,
     pub id: String,
+}
+
+impl EpdPosition {
+    /// True when the line carries something the runner can grade. Perft
+    /// suites (`D4 23441`) and bare position lists carry no solution opcode;
+    /// they used to be counted as "trivially passing", which made a whole
+    /// file report 100% without a single move being checked.
+    pub fn is_gradable(&self) -> bool {
+        !self.best_moves.is_empty() || !self.avoid_moves.is_empty() || self.direct_mate.is_some()
+    }
 }
 
 /// Resolve the NNUE net for an EPD run.
@@ -49,67 +61,164 @@ pub(crate) fn resolve_net(info: &mut SearchInfo, nnue_path: Option<&str>) -> Res
 
 /// Parse an EPD file into positions.
 pub fn parse_epd(path: &str) -> Vec<EpdPosition> {
-    let content = fs::read_to_string(path).expect("Failed to read EPD file");
-    let mut positions = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(pos) = parse_epd_line(line) {
-            positions.push(pos);
-        }
-    }
-
-    positions
+    let bytes = fs::read(path).expect("Failed to read EPD file");
+    let content = String::from_utf8_lossy(&bytes);
+    content.lines().filter_map(parse_epd_line).collect()
 }
 
-fn parse_epd_line(line: &str) -> Option<EpdPosition> {
-    // EPD format: <FEN without move counters> <operations>
-    // FEN has 4 fields: position, side, castling, ep
-    // Then operations like: bm Rg3; id "WAC.003";
+/// Opcodes recognised when an operation is not `;`-terminated, e.g.
+/// `... w - - 0 1 bm Rc8+ dm 26`. Only these start a new operation inside a
+/// `;`-less run; anything else is an operand of the current one. None of them
+/// can be a SAN move (SAN pieces are KQRBN, squares are lowercase) or a UCI
+/// move, so a move is never mistaken for an opcode. (`c0`..`c9` can be — see
+/// `is_comment_opcode`.)
+fn is_opcode(tok: &str) -> bool {
+    matches!(
+        tok,
+        "bm" | "am" | "dm" | "id" | "ce" | "pv" | "pm" | "sm" | "acd" | "acn" | "acs"
+            | "hmvc" | "fmvn" | "draw_reject" | "noop" | "eco" | "nic" | "tcgs" | "tcri" | "tcsi"
+    ) || is_numbered_opcode(tok, 'D')
+}
 
-    let parts: Vec<&str> = line.splitn(5, ' ').collect();
-    if parts.len() < 4 {
+/// Comment opcodes `c0`..`c9` collide with pawn moves to the c-file (`bm c5`),
+/// so inside a `;`-less run they only open an operation when a quoted comment
+/// follows, which is how comments are always written.
+fn is_comment_opcode(tok: &str, next: Option<&String>) -> bool {
+    is_numbered_opcode(tok, 'c') && next.map_or(false, |n| n.starts_with('"'))
+}
+
+/// `c0`..`c9`, `v0`..`v9`, and perft depths `D1`, `D12`, ...
+fn is_numbered_opcode(tok: &str, prefix: char) -> bool {
+    tok.strip_prefix(prefix)
+        .map_or(false, |n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Split the text after the position into `(opcode, operands)` pairs.
+///
+/// Standard EPD terminates each operation with `;`, but real suites also
+/// omit the semicolons, put a stray `;` straight after the FEN, quote ids,
+/// and annotate moves (`Qd1 +`, `Nxb6 + ?`). Quoted strings are kept whole
+/// so a `;` inside an id or comment doesn't split it.
+fn split_operations(ops: &str) -> Vec<(String, Vec<String>)> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quote = false;
+    for ch in ops.chars() {
+        match ch {
+            '"' => { in_quote = !in_quote; cur.push(ch); }
+            ';' if !in_quote => {
+                if !cur.is_empty() { tokens.push(std::mem::take(&mut cur)); }
+                tokens.push(";".to_string());
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if !cur.is_empty() { tokens.push(std::mem::take(&mut cur)); }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() { tokens.push(cur); }
+
+    let mut result: Vec<(String, Vec<String>)> = Vec::new();
+    // After a `;` the next token is an opcode by definition; inside a
+    // `;`-less run only a recognised opcode opens a new operation.
+    let mut expect_opcode = true;
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok == ";" {
+            expect_opcode = true;
+            continue;
+        }
+        if expect_opcode || is_opcode(tok) || is_comment_opcode(tok, tokens.get(i + 1)) || result.is_empty() {
+            result.push((tok.clone(), Vec::new()));
+            expect_opcode = false;
+        } else if let Some(last) = result.last_mut() {
+            last.1.push(tok.clone());
+        }
+    }
+    result
+}
+
+/// Normalise a move operand: drop check/mate/annotation suffixes (`Rc8+`,
+/// `Qxf7#`, `Nf3!?`). Returns None for operands that are only annotation
+/// (`+`, `?`) — some suites write `bm Qd1 +` with the check sign spaced off.
+fn clean_move(tok: &str) -> Option<String> {
+    let m = tok.trim_end_matches(|c: char| matches!(c, '+' | '#' | '!' | '?'));
+    if m.is_empty() { None } else { Some(m.to_string()) }
+}
+
+fn parse_epd_line(raw: &str) -> Option<EpdPosition> {
+    // Some suites are NUL-padded or CRLF-terminated.
+    let line = raw.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+    if line.is_empty() || line.starts_with('#') {
         return None;
     }
 
-    // The FEN is the first 4 fields + default move counters
-    let fen = format!("{} {} {} {} 0 1", parts[0], parts[1], parts[2], parts[3]);
+    let mut fields = line.split_whitespace();
+    let first = fields.next()?;
+    let (fen_base, rest): (String, String) = if first == "startpos" {
+        (
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -".to_string(),
+            fields.collect::<Vec<_>>().join(" "),
+        )
+    } else {
+        let side = fields.next()?;
+        let castle = fields.next()?;
+        // The EP field may carry a glued `;` (`-;`) when the ops start at once.
+        let ep_tok = fields.next()?;
+        let (ep, ep_tail) = match ep_tok.find(';') {
+            Some(i) => (&ep_tok[..i], &ep_tok[i..]),
+            None => (ep_tok, ""),
+        };
+        let mut rest: Vec<&str> = Vec::new();
+        if !ep_tail.is_empty() { rest.push(ep_tail); }
+        rest.extend(fields);
+        (format!("{} {} {} {}", first, side, castle, ep), rest.join(" "))
+    };
 
-    // Parse operations (everything after the 4th field)
-    let ops_str = if parts.len() > 4 { parts[4] } else { "" };
+    // Optional FEN move counters (`0 1`) between the position and the ops.
+    let mut rest_tokens: Vec<&str> = rest.split_whitespace().collect();
+    let mut halfmove = 0u32;
+    let mut fullmove = 1u32;
+    if ep_tail_is_empty(&rest_tokens) && rest_tokens.len() >= 2 {
+        if let (Ok(h), Ok(f)) = (rest_tokens[0].parse::<u32>(), rest_tokens[1].trim_end_matches(';').parse::<u32>()) {
+            halfmove = h;
+            fullmove = f;
+            let glued_semi = rest_tokens[1].ends_with(';');
+            rest_tokens.drain(..2);
+            if glued_semi { rest_tokens.insert(0, ";"); }
+        }
+    }
+    let ops_str = rest_tokens.join(" ");
 
     let mut best_moves = Vec::new();
     let mut avoid_moves = Vec::new();
+    let mut direct_mate = None;
     let mut id = String::new();
 
-    // Split by semicolon for separate operations
-    for op in ops_str.split(';') {
-        let op = op.trim();
-        if op.is_empty() { continue; }
-
-        if let Some(moves_str) = op.strip_prefix("bm ") {
-            for m in moves_str.split_whitespace() {
-                best_moves.push(m.trim_end_matches(';').to_string());
-            }
-        } else if let Some(moves_str) = op.strip_prefix("am ") {
-            for m in moves_str.split_whitespace() {
-                avoid_moves.push(m.trim_end_matches(';').to_string());
-            }
-        } else if op.starts_with("id ") {
-            id = op[3..].trim_matches('"').to_string();
+    for (opcode, operands) in split_operations(&ops_str) {
+        match opcode.as_str() {
+            "bm" => best_moves.extend(operands.iter().filter_map(|m| clean_move(m))),
+            "am" => avoid_moves.extend(operands.iter().filter_map(|m| clean_move(m))),
+            "dm" => direct_mate = operands.first().and_then(|n| n.parse::<i32>().ok()).filter(|&n| n > 0),
+            "id" => id = operands.join(" ").trim_matches('"').trim().to_string(),
+            "hmvc" => if let Some(n) = operands.first().and_then(|n| n.parse().ok()) { halfmove = n },
+            "fmvn" => if let Some(n) = operands.first().and_then(|n| n.parse().ok()) { fullmove = n },
+            _ => {}
         }
     }
 
     Some(EpdPosition {
-        fen,
+        fen: format!("{} {} {}", fen_base, halfmove, fullmove),
         best_moves,
         avoid_moves,
+        direct_mate,
         id,
     })
+}
+
+/// The move counters may only be read when the ops haven't already started
+/// with a `;` glued to the EP field.
+fn ep_tail_is_empty(rest: &[&str]) -> bool {
+    rest.first().map_or(true, |t| !t.starts_with(';'))
 }
 
 /// Convert a move to SAN notation for comparison with EPD best moves.
@@ -215,25 +324,35 @@ pub fn move_to_san(board: &Board, mv: Move) -> String {
 
 /// Run an EPD test suite.
 pub fn run_epd(path: &str, time_per_pos: u64, max_positions: usize, nnue_path: Option<&str>) {
-    let positions = parse_epd(path);
-    let total = if max_positions > 0 { max_positions.min(positions.len()) } else { positions.len() };
+    let all = parse_epd(path);
+    let gradable: Vec<&EpdPosition> = all.iter().filter(|p| p.is_gradable()).collect();
+    let ungradable = all.len() - gradable.len();
+    let total = if max_positions > 0 { max_positions.min(gradable.len()) } else { gradable.len() };
 
     println!("Running {} positions from {}", total, path);
+    if ungradable > 0 {
+        println!("Skipping {} line(s) with no bm/am/dm operation (nothing to grade)", ungradable);
+    }
+    if total == 0 {
+        println!("\nNo gradable positions: this file has no bm/am/dm operations \
+                  (a perft or position list?).");
+        return;
+    }
     println!("Time per position: {}ms", time_per_pos);
     println!();
+    // One summary line per position instead of every iteration's info line.
 
     let mut info = SearchInfo::new(64);
     if let Err(e) = resolve_net(&mut info, nnue_path) {
         eprintln!("FATAL: {}", e);
         std::process::exit(2);
     }
+    info.silent = true;
     let mut passed = 0;
     let mut failed = 0;
     let suite_start = Instant::now();
 
-    for (i, pos) in positions.iter().enumerate() {
-        if i >= total { break; }
-
+    for (i, pos) in gradable.iter().take(total).enumerate() {
         let mut board = Board::from_fen(&pos.fen);
         info.nodes = 0;
         // `search()` deliberately does NOT reset global_nodes (see its comment:
@@ -260,50 +379,44 @@ pub fn run_epd(path: &str, time_per_pos: u64, max_positions: usize, nnue_path: O
             ..SearchLimits::new()
         };
 
+        info.iter_log = Some(Vec::new());
         let best = search(&mut board, &mut info, &limits);
+        let log = info.iter_log.take().unwrap_or_default();
+        let score = info.last_score;
         let best_san = move_to_san(&board, best);
         let best_uci = move_to_uci(best);
 
-        // Move match helper: compare SAN (ignoring +/#) or UCI.
-        let matches_move = |mv: &str| {
-            let mv_clean = mv.trim_end_matches('+').trim_end_matches('#');
-            let san_clean = best_san.trim_end_matches('+').trim_end_matches('#');
-            mv_clean == san_clean || mv == best_uci
+        let verdict = grade(pos, &best_san, &best_uci, mate_in_moves(score));
+
+        // "Found at": the first iteration from which every later iteration
+        // would also have passed, i.e. when the answer settled — not the first
+        // lucky hit that a deeper iteration then abandoned.
+        let iter_ok = |r: &IterRecord| {
+            let san = move_to_san(&board, r.best_move);
+            grade(pos, &san, &move_to_uci(r.best_move), mate_in_moves(r.score)).is_ok()
         };
+        let settled_from = log.iter().rposition(|r| !iter_ok(r)).map_or(0, |i| i + 1);
+        let last = log.last();
+        let label = if pos.id.is_empty() { format!("#{}", i + 1) } else { pos.id.clone() };
+        let shown = format_score(score);
 
-        // A position is solved when:
-        //   - bm set: the engine played one of the best moves
-        //   - am set: the engine did NOT play any of the avoid moves
-        //   - both set: must satisfy both (strictest)
-        //   - neither set: trivially passing (rare in practice)
-        let matches_bm = pos.best_moves.iter().any(|bm| matches_move(bm));
-        let matches_am = pos.avoid_moves.iter().any(|am| matches_move(am));
-
-        let bm_ok = pos.best_moves.is_empty() || matches_bm;
-        let am_ok = pos.avoid_moves.is_empty() || !matches_am;
-        let is_correct = bm_ok && am_ok;
-
-        if is_correct {
-            passed += 1;
-            print!(".");
-        } else {
-            failed += 1;
-            print!("X");
-            // Print details for failures — include both bm and am so the
-            // classifier is obvious (e.g., "played avoid-move" vs "missed best").
-            let mut reason = String::new();
-            if !bm_ok { reason.push_str(&format!("not in bm {:?}", pos.best_moves)); }
-            if !am_ok {
-                if !reason.is_empty() { reason.push_str(" and "); }
-                reason.push_str(&format!("matched am {:?}", pos.avoid_moves));
+        match verdict {
+            Ok(()) => {
+                passed += 1;
+                let found = log.get(settled_from).copied();
+                let (d, n, t) = match found {
+                    Some(r) => (r.depth, r.nodes, r.time_ms),
+                    None => (info.completed_depth, info.global_nodes.load(std::sync::atomic::Ordering::Relaxed), 0),
+                };
+                println!("ok    {}: {} -> {} ({}), found at depth {}, {} nodes, {} ms",
+                    label, expectation(pos), best_san, shown, d, fmt_nodes(n), t);
             }
-            eprint!("\n  {} FAIL: played {} ({}) — {}",
-                pos.id, best_san, best_uci, reason);
-        }
-
-        // Flush periodically
-        if (i + 1) % 50 == 0 {
-            println!(" [{}/{}]", i + 1, total);
+            Err(reason) => {
+                failed += 1;
+                let (d, n) = last.map_or((info.completed_depth, 0), |r| (r.depth, r.nodes));
+                println!("FAIL  {}: {} -> {} ({}), depth {}, {} nodes — {}",
+                    label, expectation(pos), best_san, shown, d, fmt_nodes(n), reason);
+            }
         }
     }
 
@@ -312,6 +425,61 @@ pub fn run_epd(path: &str, time_per_pos: u64, max_positions: usize, nnue_path: O
         passed, passed + failed,
         100.0 * passed as f64 / (passed + failed) as f64);
     println!("Total time: {:.1}s", elapsed.as_secs_f64());
+}
+
+/// The operations being tested, as the line states them: `bm Qc7`, `dm 26`.
+fn expectation(pos: &EpdPosition) -> String {
+    let mut parts = Vec::new();
+    if let Some(n) = pos.direct_mate { parts.push(format!("dm {}", n)); }
+    if !pos.best_moves.is_empty() { parts.push(format!("bm {}", pos.best_moves.join(" "))); }
+    if !pos.avoid_moves.is_empty() { parts.push(format!("am {}", pos.avoid_moves.join(" "))); }
+    parts.join(", ")
+}
+
+/// Display score as a GUI would see it (`cp 76`, `mate 12`).
+fn format_score(score: i32) -> String {
+    let s = crate::tt::format_uci_score(score);
+    s.strip_prefix("score ").unwrap_or(&s).to_string()
+}
+
+fn fmt_nodes(n: u64) -> String {
+    if n < 10_000 { n.to_string() } else { format!("{}k", n / 1000) }
+}
+
+/// Moves to mate for the side to move, if `score` is a winning mate score.
+fn mate_in_moves(score: i32) -> Option<i32> {
+    if crate::tt::is_mate_score(score) && score > 0 {
+        Some((crate::tt::MATE_SCORE - score + 1) / 2)
+    } else {
+        None
+    }
+}
+
+/// Grade one search result against a position's operations.
+///
+/// - `dm N`: the search must report a mate in at most N moves. Any move that
+///   delivers it counts — a mate suite asks for the mate, and many positions
+///   have several mating first moves while `bm` lists only one.
+/// - otherwise `bm`: the move played must be one of the best moves.
+/// - `am`: the move played must not be an avoid move (checked in both cases).
+fn grade(pos: &EpdPosition, best_san: &str, best_uci: &str, found_mate_in: Option<i32>) -> Result<(), String> {
+    let san_clean = best_san.trim_end_matches(|c: char| matches!(c, '+' | '#'));
+    let matches_move = |mv: &str| mv == san_clean || mv == best_uci;
+
+    let mut reasons: Vec<String> = Vec::new();
+    if let Some(n) = pos.direct_mate {
+        match found_mate_in {
+            Some(m) if m <= n => {}
+            Some(m) => reasons.push(format!("found mate in {} (dm {})", m, n)),
+            None => reasons.push(format!("no mate found (dm {})", n)),
+        }
+    } else if !pos.best_moves.is_empty() && !pos.best_moves.iter().any(|m| matches_move(m)) {
+        reasons.push(format!("not in bm {:?}", pos.best_moves));
+    }
+    if pos.avoid_moves.iter().any(|m| matches_move(m)) {
+        reasons.push(format!("matched am {:?}", pos.avoid_moves));
+    }
+    if reasons.is_empty() { Ok(()) } else { Err(reasons.join(" and ")) }
 }
 
 fn reset_epd_position_state(info: &mut SearchInfo) {
@@ -366,5 +534,85 @@ mod tests {
 
         info.assert_persistent_histories_clear_for_test();
         assert!(!info.tt.probe(hash).hit, "EPD reset must clear TT between positions");
+    }
+
+    fn parse(line: &str) -> EpdPosition {
+        parse_epd_line(line).expect("line should parse")
+    }
+
+    /// The formats below are all taken from real public suites. Each one used
+    /// to be mis-parsed into an empty `bm`, which the runner then counted as a
+    /// pass, so whole files reported 100% without a move being checked.
+    #[test]
+    fn epd_parses_full_fen_with_unterminated_ops() {
+        // Move counters present and no `;` between operations.
+        let p = parse("7R/2k1p2P/r2rP3/8/3p1R2/8/2P2p2/2K5 w - - 0 1 bm Rc8+ dm 26");
+        assert_eq!(p.fen, "7R/2k1p2P/r2rP3/8/3p1R2/8/2P2p2/2K5 w - - 0 1");
+        assert_eq!(p.best_moves, vec!["Rc8"]);
+        assert_eq!(p.direct_mate, Some(26));
+
+        let p = parse("5N1r/5n1n/ppp3R1/5K2/7k/6p1/6PN/8 w - - 0 1 bm g6g4");
+        assert_eq!(p.best_moves, vec!["g6g4"]);
+
+        let p = parse("kqq5/qq6/q7/8/8/5RRR/5RRR/5RRK w - - 0 143 bm Rf8");
+        assert!(p.fen.ends_with(" 0 143"));
+        assert_eq!(p.best_moves, vec!["Rf8"]);
+    }
+
+    #[test]
+    fn epd_parses_semicolon_and_padding_variants() {
+        // Stray `;` straight after the FEN, spaced check sign, NUL padding.
+        let p = parse("1k1r4/pp1b1R2/3q2pp/4p3/2B5/4Q3/PPP2B2/2K5 b - - ; bm Qd1 + ; id BK.01\0");
+        assert_eq!(p.best_moves, vec!["Qd1"]);
+        assert_eq!(p.id, "BK.01");
+
+        // `;` glued to the EP field, annotated avoid move.
+        let p = parse("2k5/2p5/1q1p4/pPpPp1p1/N1P1Pp1p/P4PbP/KQ4P1/8 w - -; am Nxb6 + ? ; c1 diff=10");
+        assert_eq!(p.avoid_moves, vec!["Nxb6"]);
+        assert!(p.best_moves.is_empty());
+
+        // Counters followed by `;`, quoted id containing a space.
+        let p = parse("rn1qkb1r/pp2pppp/5n2/3p1b2/3P4/2N1P3/PP3PPP/R1BQKBNR w KQkq - 0 1 ; bm Qb3; id \"Kaufman 1\"");
+        assert_eq!(p.best_moves, vec!["Qb3"]);
+        assert_eq!(p.id, "Kaufman 1");
+
+        let p = parse("startpos ; bm e4");
+        assert!(p.fen.starts_with("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"));
+        assert_eq!(p.best_moves, vec!["e4"]);
+    }
+
+    #[test]
+    fn epd_c_file_pawn_moves_are_not_comment_opcodes() {
+        // `c5` is a move here, not the `c5` comment opcode.
+        let p = parse("r2r2k1/p1pnqpp1/1p2p2p/3b4/3P4/3BPN2/PP3PPP/2RQR1K1 b - - ; bm c5; id  sbd.095");
+        assert_eq!(p.best_moves, vec!["c5"]);
+        let p = parse("8/8/8/8/8/8/2P5/K6k w - - 0 1 bm c4 c3");
+        assert_eq!(p.best_moves, vec!["c4", "c3"]);
+        // ...while a real comment still opens its own operation.
+        let p = parse("8/8/8/8/8/8/2P5/K6k w - - 0 1 bm c4 c0 \"note\"");
+        assert_eq!(p.best_moves, vec!["c4"]);
+    }
+
+    #[test]
+    fn epd_lines_without_solution_ops_are_not_gradable() {
+        assert!(!parse("8/5kpp/8/8/1p3P2/6PP/r3KP2/1R1q4 w - -  0 1; D4 23441").is_gradable());
+        assert!(!parse("5rkq/3r1p1p/5RpP/2p3P1/2B2Q2/p7/P4PK1/8 w - - 0 1; draw").is_gradable());
+        assert!(parse("8/8/8/8/8/8/2P5/K6k w - - am c4").is_gradable());
+    }
+
+    #[test]
+    fn epd_grading_rules() {
+        let mut p = parse("8/8/8/8/8/8/2P5/K6k w - - 0 1 bm Rc8+ dm 3");
+        // dm: any move that mates in time passes, even if it isn't the bm.
+        assert!(grade(&p, "Qh7+", "g8h7", Some(3)).is_ok());
+        assert!(grade(&p, "Rc8+", "c1c8", Some(4)).is_err());
+        assert!(grade(&p, "Rc8+", "c1c8", None).is_err());
+        // bm: SAN with check suffix, or UCI.
+        p.direct_mate = None;
+        assert!(grade(&p, "Rc8+", "c1c8", None).is_ok());
+        assert!(grade(&p, "Rc7", "c1c7", None).is_err());
+        // am applies alongside bm.
+        p.avoid_moves = vec!["Rc8".to_string()];
+        assert!(grade(&p, "Rc8+", "c1c8", None).is_err());
     }
 }
