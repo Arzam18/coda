@@ -401,6 +401,8 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 info.clear_correction_history();
                 info.clear_pawn_hist(); // was missing — stale data leaked between games
                 info.tm_cross_prev_score = i32::MIN; // no prev move in a fresh game
+                info.tm_predicted_from = 0; // ... and no reply prediction
+                info.tm_predicted_reply = crate::types::NO_MOVE;
                 // A `stop` that ended the previous game's ponder marks a
                 // ponder-miss; without this reset the min-think floor lands
                 // on the first move of the next game (Zeus, probcut/ponder
