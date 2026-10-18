@@ -288,6 +288,25 @@ tunables!(
     (TM_SUBTREE_MULT_100, 140, 90, 200, 4.0, false),      // (base-frac) * N/100
     (TM_FORCED_MARGIN_WEAK, 170, 80, 320, 8.0, false),    // weak-forced cp margin
     (TM_FORCED_MARGIN_STRONG, 400, 200, 620, 12.0, false),// strong-forced cp margin
+    // Behind-on-clock damp (idea from another engine's public design notes;
+    // the shape and every constant here are Coda's own). When our clock is
+    // behind the opponent's, scale the optimum budget DOWN by
+    //   factor = clamp(1 - SLOPE/100 * ((1 - 1/TM_DEFAULT_MTG) - ours/theirs),
+    //                  FLOOR/100, 1)
+    // and leave it at 1.0 when we are level or ahead. See
+    // `behind_on_clock_factor` for the derivations:
+    //   * dead zone 1/TM_DEFAULT_MTG: one base move-share of the clock (~4%),
+    //     the deficit a single above-average think creates on its own — no new
+    //     constant;
+    //   * SLOPE 100: unit elasticity, "spend x% less when x% behind" — the
+    //     parameter-free choice;
+    //   * FLOOR 73 = the live TM_OPT_WINDOW_PCT default: the opt window is
+    //     Coda's measured discount of the raw per-move share to a healthy
+    //     target, so the deficit rule may cut the target by at most that same
+    //     proportion again and a large deficit can never starve the search.
+    // Bench-invariant (TM is never consulted at fixed depth).
+    (TM_BEHIND_SLOPE_PCT, 100, 0, 300, 15.0, false),
+    (TM_BEHIND_FLOOR_PCT, 73, 45, 100, 3.0, false),
     (LMR_HIST_DIV, 23496, 2000, 100000, 4900.0, true),
     // Capture-LMR history divisor. Separate from the quiet divisor above:
     // capture history is single-source, so it needs a smaller divisor than
@@ -1402,6 +1421,9 @@ pub struct SearchInfo {
     /// Our remaining clock (ms, post-overhead) for the current search — feeds
     /// the inc-relative-to-budget ceiling discriminator.
     tm_time_left: u64,
+    /// Behind-on-clock damp applied to this search's optimum (1.0 = neutral).
+    /// Diagnostic only — read by the TMDebug summary line.
+    tm_behind_dbg: f64,
     /// Per-root-move node counts for node-based time management. The fifth
     /// bucket distinguishes ordinary moves from the four promotion choices.
     /// Reset each search.
@@ -1658,6 +1680,7 @@ impl SearchInfo {
             tm_max_time: 0,
             tm_our_inc: 0,
             tm_time_left: 0,
+            tm_behind_dbg: 1.0,
             root_move_nodes: alloc_zeroed_box(),
             ponderhit_time: std::sync::Arc::new(AtomicU64::new(0)),
             ponderhit_soft: std::sync::Arc::new(AtomicU64::new(0)),
@@ -3033,6 +3056,48 @@ fn bmc_instability_factor(window: u32, num_threads: usize) -> f64 {
     base + mult * (window as f64) / (num_threads as f64)
 }
 
+/// Behind-on-clock budget damp: a multiplier in [TM_BEHIND_FLOOR_PCT/100, 1.0]
+/// on the optimum budget, below 1.0 only when our clock trails the
+/// opponent's by more than the dead zone. `opp_time == 0` means the GUI did
+/// not supply the opponent's clock — neutral.
+///
+/// Why spend LESS when behind: the base budget already scales with our own
+/// clock, so two sides spending the same fraction per move keep their clock
+/// RATIO constant and a deficit never closes. Trailing the opponent means the
+/// late game, where the time-dependent errors happen, will be played with the
+/// smaller clock; banking a little now trades a sliver of middlegame depth for
+/// not being the side in time trouble later.
+///
+/// Derivations (no foreign constants; all from Coda's own TM quantities):
+///   * Dead zone 1/TM_DEFAULT_MTG (~4.2% at the default 24): the base budget
+///     is clock/mtg, so a deficit of one base move-share is what a single
+///     above-average think (the factor product routinely gives 1.5-2x) leaves
+///     behind on its own. Below that the "deficit" is per-move noise, and it
+///     also absorbs the turn-order offset in the two clocks.
+///   * SLOPE 100%: unit elasticity past the dead zone, "x% further behind,
+///     x% less spend" — the parameter-free starting point.
+///   * FLOOR = the TM_OPT_WINDOW_PCT default (73%): see the tunable comment.
+///     With the unit slope the floor binds at ours/theirs ~0.69, i.e. the
+///     rule saturates once we hold under ~70% of the opponent's clock.
+///
+/// Only `opt` is scaled. hard/max stay keyed on our own clock, so a position
+/// that genuinely needs time can still get it through the factor product,
+/// and the forfeit guard is untouched.
+pub fn behind_on_clock_factor(our_time: u64, opp_time: u64) -> f64 {
+    if our_time == 0 || opp_time == 0 || our_time >= opp_time {
+        return 1.0;
+    }
+    let ratio = our_time as f64 / opp_time as f64;
+    let dead_zone = 1.0 / tp(&TM_DEFAULT_MTG).max(2) as f64;
+    let deficit = (1.0 - dead_zone) - ratio;
+    if deficit <= 0.0 {
+        return 1.0;
+    }
+    let slope = tp(&TM_BEHIND_SLOPE_PCT).max(0) as f64 / 100.0;
+    let floor = (tp(&TM_BEHIND_FLOOR_PCT) as f64 / 100.0).clamp(0.0, 1.0);
+    (1.0 - slope * deficit).clamp(floor, 1.0)
+}
+
 /// Compute time-management budgets from clock state. Returns
 /// (soft, hard, max, soft_floor) all in milliseconds.
 ///
@@ -3048,6 +3113,8 @@ fn bmc_instability_factor(window: u32, num_threads: usize) -> f64 {
 /// MoveOverhead UCI option (default 100ms). `ponder_on` is the `Ponder`
 /// UCI option state (callers pass `ponder_enabled()`): when true the
 /// optimum gets the +25% ponder pre-funding bump (see PONDER_OPT_BUMP_PCT).
+/// `opp_time` is the opponent's clock in ms (0 = not supplied): it feeds the
+/// behind-on-clock damp on the optimum (see `behind_on_clock_factor`).
 pub fn compute_tm_budgets(
     our_time: u64,
     our_inc: u64,
@@ -3055,6 +3122,7 @@ pub fn compute_tm_budgets(
     overhead: u64,
     fullmove: u16,
     ponder_on: bool,
+    opp_time: u64,
 ) -> (u64, u64, u64, u64) {
     // TM windows: opt/hard/max model with a multiplicative factor product —
     // the structure common to modern engines (SF, Obsidian, Hobbes and
@@ -3206,6 +3274,18 @@ pub fn compute_tm_budgets(
     } else {
         let phase_mult = 0.22 + 0.78 * (1.0 - (-0.045 * fullmove as f64).exp());
         ((opt_time_base as f64) * phase_mult.clamp(0.22, 1.0)) as u64
+    };
+    // Behind-on-clock damp: spend less when our clock trails the opponent's.
+    // Applied to opt only, before the ponder bump, on every clock path
+    // (movestogo included — the deficit argument does not depend on how the
+    // base share was paced). Neutral when level/ahead or opp_time unknown.
+    let opt_time = {
+        let behind = behind_on_clock_factor(our_time, opp_time);
+        if behind < 1.0 {
+            ((opt_time as f64) * behind) as u64
+        } else {
+            opt_time
+        }
     };
     // +25% optimum when the Ponder UCI option is on — SF's ponder-optimum
     // pre-funding semantics, applied on EVERY move when pondering is enabled.
@@ -3835,6 +3915,8 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     } else {
         (limits.btime, limits.binc)
     };
+    // Opponent's clock (0 when the GUI sent only ours) — behind-on-clock damp.
+    let opp_time = if board.side_to_move == WHITE { limits.btime } else { limits.wtime };
 
     // SearchInfo persists across `go` commands.
     // Without explicit reset, stale soft_limit/hard_limit from a prior
@@ -3859,6 +3941,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     // the group; the branches that need it set it.
     info.tm_our_inc = 0;
     info.tm_time_left = 0;
+    info.tm_behind_dbg = 1.0;
 
     if limits.infinite {
         // No budget is in force: soft/hard/floor stay zero from the reset
@@ -3903,12 +3986,13 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     } else if our_time > 0 {
         let (soft, hard, max_time, soft_floor) =
             compute_tm_budgets(our_time, our_inc, limits.movestogo, info.move_overhead,
-                               board.fullmove, ponder_enabled());
+                               board.fullmove, ponder_enabled(), opp_time);
         info.soft_limit = soft;
         info.hard_limit = hard;
         info.tm_max_time = max_time;
         info.tm_our_inc = our_inc;
         info.tm_time_left = our_time.saturating_sub(info.move_overhead).max(1);
+        info.tm_behind_dbg = behind_on_clock_factor(our_time, opp_time);
         info.soft_floor = soft_floor;
         // Apply ponder-miss min-think floor (set by uci.rs when the prior
         // search was an abandoned ponder). Caps at hard_limit so we never
@@ -4956,7 +5040,8 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                  tm_baseline={} stab={} bmc={} asp_fl={} asp_fh={} forced={:?} \
                  cross_prev={} \
                  stabf={:.2} flf={:.2} forcedf={:.3} subf={:.2} subfrac={:.3} \
-                 trendf={:.2} mult={:.2} adjsoft={} overshoot={}",
+                 trendf={:.2} mult={:.2} adjsoft={} overshoot={} \
+                 behindf={:.3}",
                 info.completed_depth,
                 move_to_uci(best_move),
                 info.last_score,
@@ -4982,6 +5067,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 info.tm_dbg.product,
                 info.tm_dbg.adjusted_soft,
                 overshoot,
+                info.tm_behind_dbg,
             );
         }
     }
@@ -9343,7 +9429,7 @@ mod tests {
         // seconds — a 1ms ponder must lead to a full normal think via the
         // elapsed >= soft condition alone.
         let (soft, _hard, _max, _floor) =
-            compute_tm_budgets(60_000, 10_000, 0, 100, 20, true);
+            compute_tm_budgets(60_000, 10_000, 0, 100, 20, true, 0);
         assert!(soft >= 1000,
             "test premise: big-inc soft should be seconds, got {}ms", soft);
         assert!(!should_instant_reply(1, soft, 64, false, 4),
@@ -9388,6 +9474,32 @@ mod tests {
         assert!(!should_instant_reply(5000, 3000, MIN_PONDER_DEPTH_FOR_INSTANT - 1, false, 4));
     }
 
+    /// Behind-on-clock damp: neutral when level, ahead, inside the one-share
+    /// dead zone, or with no opponent clock; monotone in the deficit; floored;
+    /// and it touches opt only.
+    #[test]
+    fn behind_on_clock_damp_shape() {
+        assert_eq!(behind_on_clock_factor(60_000, 0), 1.0);
+        assert_eq!(behind_on_clock_factor(60_000, 60_000), 1.0);
+        assert_eq!(behind_on_clock_factor(60_000, 50_000), 1.0);
+        // 2% behind is inside the 1/TM_DEFAULT_MTG dead zone.
+        assert_eq!(behind_on_clock_factor(58_800, 60_000), 1.0);
+        let mild = behind_on_clock_factor(50_000, 60_000);
+        let deep = behind_on_clock_factor(40_000, 60_000);
+        assert!(mild < 1.0 && deep < mild, "mild={} deep={}", mild, deep);
+        let floor = tp(&TM_BEHIND_FLOOR_PCT) as f64 / 100.0;
+        assert_eq!(behind_on_clock_factor(1_000, 60_000), floor);
+
+        let (opt_lvl, hard_lvl, max_lvl, _) =
+            compute_tm_budgets(30_000, 300, 0, 100, 30, false, 30_000);
+        let (opt_bh, hard_bh, max_bh, _) =
+            compute_tm_budgets(30_000, 300, 0, 100, 30, false, 60_000);
+        assert_eq!(hard_lvl, hard_bh);
+        assert_eq!(max_lvl, max_bh);
+        assert!(opt_bh < opt_lvl && opt_bh >= (opt_lvl as f64 * floor) as u64 - 1,
+            "opt level={} behind={}", opt_lvl, opt_bh);
+    }
+
     /// P3 — the Ponder-on +25% optimum bump: applied to opt only (hard/max/
     /// floor identical), clamped to hard, and OFF by default (no-ponder
     /// behavior bit-identical).
@@ -9401,9 +9513,9 @@ mod tests {
             (60_000, 0, 40, 15),   // movestogo
         ] {
             let (opt_np, hard_np, max_np, floor_np) =
-                compute_tm_budgets(t, inc, mtg, 100, fm, false);
+                compute_tm_budgets(t, inc, mtg, 100, fm, false, 0);
             let (opt_p, hard_p, max_p, floor_p) =
-                compute_tm_budgets(t, inc, mtg, 100, fm, true);
+                compute_tm_budgets(t, inc, mtg, 100, fm, true, 0);
             assert_eq!(hard_np, hard_p, "hard must be ponder-independent");
             assert_eq!(max_np, max_p, "max must be ponder-independent");
             assert_eq!(floor_np, floor_p, "floor must be ponder-independent");
@@ -9546,7 +9658,7 @@ mod tests {
         let our_inc = 1_000u64;
         let overhead = 100u64;
         let (soft, hard, _max, stockpile) =
-            compute_tm_budgets(our_time, our_inc, 0, overhead, 20, true);
+            compute_tm_budgets(our_time, our_inc, 0, overhead, 20, true, 0);
         // A short ponder, charged in full: the slice is nearly the whole soft.
         let elapsed = 200u64;
         let slice = soft.saturating_sub(elapsed)
