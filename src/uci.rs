@@ -1474,12 +1474,11 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 }
                 info.threat_stack.invalidate();
                 // Report what SEARCH sees, by going through the same function
-                // search does: net output + material scaling + the saturation
-                // tiebreak. This used to call `evaluate_nnue` directly, which
-                // reported the bare net output and so silently drifted from the
-                // search's view every time `SearchInfo::eval` gained a term —
-                // it was already missing MAT_SCALE_BASE before the tiebreak was
-                // added. `eval verbose` still dumps the raw net output.
+                // search does: net output + material scaling. This used to call
+                // `evaluate_nnue` directly, which reported the bare net output
+                // and so silently drifted from the search's view every time
+                // `SearchInfo::eval` gained a term — it was missing
+                // MAT_SCALE_BASE. `eval verbose` still dumps the raw net output.
                 //
                 // Halfmove scaling is deliberately absent: `SearchInfo::eval`
                 // returns the halfmove-INDEPENDENT score and callers apply
