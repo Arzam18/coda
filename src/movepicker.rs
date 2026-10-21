@@ -1720,7 +1720,7 @@ mod cont_hist_symmetry_tests {
         let ply = 7usize;
         for plane in 1..CONT_PLANES {
             for &prior_to in &[0usize, 27, 63] {
-                let mut h = History::boxed_zeroed();
+                let h = History::boxed_zeroed();
                 let c = ContHist::shared_zeroed();
                 // Sentinel unique per (plane, prior_to) so a mis-derived pointer
                 // reads the wrong number rather than coincidentally matching.
