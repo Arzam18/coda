@@ -288,6 +288,41 @@ tunables!(
     (TM_SUBTREE_MULT_100, 140, 90, 200, 4.0, false),      // (base-frac) * N/100
     (TM_FORCED_MARGIN_WEAK, 170, 80, 320, 8.0, false),    // weak-forced cp margin
     (TM_FORCED_MARGIN_STRONG, 400, 200, 620, 12.0, false),// strong-forced cp margin
+    // Behind-on-clock damp (idea from another engine's public design notes;
+    // the shape and every constant here are Coda's own). When our clock is
+    // behind the opponent's, scale the optimum budget DOWN by
+    //   factor = clamp(1 - SLOPE/100 * ((1 - 1/TM_DEFAULT_MTG) - ours/theirs),
+    //                  FLOOR/100, 1)
+    // and leave it at 1.0 when we are level or ahead. See
+    // `behind_on_clock_factor` for the derivations:
+    //   * dead zone 1/TM_DEFAULT_MTG: one base move-share of the clock (~4%),
+    //     the deficit a single above-average think creates on its own — no new
+    //     constant;
+    //   * SLOPE 100: unit elasticity, "spend x% less when x% behind" — the
+    //     parameter-free choice;
+    //   * FLOOR 73 = the live TM_OPT_WINDOW_PCT default: the opt window is
+    //     Coda's measured discount of the raw per-move share to a healthy
+    //     target, so the deficit rule may cut the target by at most that same
+    //     proportion again and a large deficit can never starve the search.
+    // Bench-invariant (TM is never consulted at fixed depth).
+    (TM_BEHIND_SLOPE_PCT, 100, 0, 300, 15.0, false),
+    (TM_BEHIND_FLOOR_PCT, 73, 45, 100, 3.0, false),
+    // Surprise reply (idea from another engine's public design notes; the
+    // form and constant are Coda's own). When the opponent did NOT play the
+    // reply our previous search predicted (its pv[1]), this move's search is
+    // treated as having lost N/100 steps of best-move stability: the
+    // stability factor is read at index min(stable, 4) - N/100 (linear
+    // between table entries) instead of min(stable, 4). Derivation: the
+    // stability table is Coda's own measured price of "how many iterations
+    // has the best move held"; a surprise means the plan that held last move
+    // was built on a reply that did not happen, i.e. exactly one fewer
+    // confirmation than the table thinks. Default 100 = one step. At the live
+    // table that is 1.75/1.22 = 1.43x at stable=1, 1.22/0.90 = 1.36x at 2,
+    // 0.90/0.80 = 1.13x at 3 and 0.80/0.74 = 1.08x at 4+; stable=0 is already
+    // the top of the table and is unchanged. The product's caps all still bind.
+    // Off when Ponder is enabled — see `reply_was_surprise`.
+    // Bench-invariant (TM is never consulted at fixed depth).
+    (TM_SURPRISE_STAB_STEPS_100, 100, 0, 300, 15.0, false),
     (LMR_HIST_DIV, 23496, 2000, 100000, 4900.0, true),
     // Capture-LMR history divisor. Separate from the quiet divisor above:
     // capture history is single-source, so it needs a smaller divisor than
@@ -908,11 +943,6 @@ pub static FEAT_TT_STORE: AtomicBool = AtomicBool::new(true);
 // Ablate (NO_TT_STATIC_EVAL=1) to test whether skipping evals hurts more
 // than it helps via deeper lazy-replay gaps (fatter threat/finny applies).
 pub static FEAT_TT_STATIC_EVAL: AtomicBool = AtomicBool::new(true);
-/// Saturation material tiebreak (issue #18). Deliberately NOT cleared by
-/// `disable_all_features()`: it is an eval-correctness term, not a search
-/// heuristic, and letting DISABLE_ALL switch it off would fold an eval change
-/// into every pruning ablation.
-pub static FEAT_SAT_TIEBREAK: AtomicBool = AtomicBool::new(true);
 pub static FEAT_QS_CAPTURES: AtomicBool = AtomicBool::new(true); // false = QS returns eval immediately
 pub static FEAT_SINGULAR: AtomicBool = AtomicBool::new(true); // singular extensions specifically
 pub static FEAT_CUCKOO: AtomicBool = AtomicBool::new(true);
@@ -952,17 +982,6 @@ pub fn enable_all_features() {
 }
 
 // Correction history constants
-// --- Saturation material tiebreak (issue #18) ---------------------------
-// Ramp start, in SEE units: the measured knee is a 4-pawn imbalance, so the
-// term is exactly zero for anything less lopsided than that.
-const SAT_MAT_KNEE: i32 = 400;
-// Ramp reaches full weight a queen's worth of material past the knee.
-const SAT_MAT_FULL: i32 = 900;
-// Weight per pawn (100 SEE units) at full ramp. Three times the measured
-// -13 cp/pawn inversion, so ordering is monotone with margin while the term
-// stays a tiebreak rather than a second material eval.
-const SAT_TIEBREAK_W: i32 = 40;
-
 const CORR_HIST_SIZE: usize = 16384;
 
 /// The four correction-history tables. One instance is shared by every
@@ -1376,6 +1395,18 @@ pub struct SearchInfo {
     /// Feeds the cross-MOVE score-trend TM term (game-horizon deterioration),
     /// distinct from `tm_prev_score` which is within-search iteration trend.
     pub(crate) tm_cross_prev_score: i32,
+    /// Reply prediction from the previous PLAYED-move search: the hash of the
+    /// position after our move (`tm_predicted_from`) and the opponent reply
+    /// our PV expected there (`tm_predicted_reply`, NO_MOVE = none). Persists
+    /// across `go`; cleared on ucinewgame. Feeds the surprise TM term.
+    pub(crate) tm_predicted_from: u64,
+    pub(crate) tm_predicted_reply: Move,
+    /// This search's root was reached by an unpredicted reply (surprise term).
+    tm_surprise: bool,
+    /// Set by `search()` when this search produced a played game move (same
+    /// gate as the cross-move score publish) — `search_smp` then publishes the
+    /// reply prediction from the final (post-SMP-selection) PV.
+    tm_publish_prediction: bool,
     soft_limit: u64,  // ms — can be extended/shortened dynamically
     hard_limit: u64,  // ms — absolute maximum
     /// Minimum think time per move: the increment we're about to gain, minus
@@ -1402,6 +1433,9 @@ pub struct SearchInfo {
     /// Our remaining clock (ms, post-overhead) for the current search — feeds
     /// the inc-relative-to-budget ceiling discriminator.
     tm_time_left: u64,
+    /// Behind-on-clock damp applied to this search's optimum (1.0 = neutral).
+    /// Diagnostic only — read by the TMDebug summary line.
+    tm_behind_dbg: f64,
     /// Per-root-move node counts for node-based time management. The fifth
     /// bucket distinguishes ordinary moves from the four promotion choices.
     /// Reset each search.
@@ -1651,6 +1685,10 @@ impl SearchInfo {
             tm_asp_fail_high: 0,
             tm_has_data: false,
             tm_cross_prev_score: i32::MIN,
+            tm_predicted_from: 0,
+            tm_predicted_reply: NO_MOVE,
+            tm_surprise: false,
+            tm_publish_prediction: false,
             soft_limit: 0,
             hard_limit: 0,
             soft_floor: 0,
@@ -1658,6 +1696,7 @@ impl SearchInfo {
             tm_max_time: 0,
             tm_our_inc: 0,
             tm_time_left: 0,
+            tm_behind_dbg: 1.0,
             root_move_nodes: alloc_zeroed_box(),
             ponderhit_time: std::sync::Arc::new(AtomicU64::new(0)),
             ponderhit_soft: std::sync::Arc::new(AtomicU64::new(0)),
@@ -2088,8 +2127,8 @@ impl SearchInfo {
 
     /// Evaluate using NNUE. A net is required to run — shipped/bench builds
     /// always embed one, so the no-net branch below is never hit in practice.
-    /// The eval as SEARCH sees it: net output, material scaling, and the
-    /// saturation tiebreak. `pub(crate)` so the UCI `eval` command reports
+    /// The eval as SEARCH sees it: net output and material scaling.
+    /// `pub(crate)` so the UCI `eval` command reports
     /// this same number instead of re-deriving a raw net output that drifts
     /// every time a term is added here.
     pub(crate) fn eval(&mut self, board: &Board) -> i32 {
@@ -2245,80 +2284,7 @@ impl SearchInfo {
         // formula) that bakes in gross errors and wipes out the correction —
         // worth about -8 Elo. The fix is structural: keep TT storage
         // halfmove-independent, and apply the scale freshly on read.
-        let mut final_score = score * (tp(&MAT_SCALE_BASE) + material) / 32 / 1024;
-
-        // Signed material balance in SEE units, white-positive. Shared by the
-        // saturation tiebreak below and the dispatch instrumentation.
-        let signed_material = {
-            let w = board.colors[WHITE as usize];
-            let b = board.colors[BLACK as usize];
-            let mut m = 0i32;
-            for pt in 0..5u8 {
-                let d = (board.pieces[pt as usize] & w).count_ones() as i32
-                    - (board.pieces[pt as usize] & b).count_ones() as i32;
-                m += crate::eval::see_value(pt) * d;
-            }
-            m
-        };
-
-        // Saturation material tiebreak (issue #18).
-        //
-        // Measured on this tree with net-1EB961AF by stripping material from
-        // the start position one piece at a time and reading `go depth 14`
-        // (ScoreScale 100, i.e. internal units):
-        //
-        //   deficit    0    -1    -2    -3    -4    -5   -12   -22   -31
-        //   eval      +49   -67  -460  -810 -1079 -1079 -1247 -1120 -1017
-        //
-        // The net tracks material closely out to about 4 pawns (|eval| ~1080)
-        // and then stops. Past that knee the slope collapses from ~250 cp per
-        // pawn to about -13 -- i.e. slightly INVERTED: shedding material
-        // *raises* the eval. The mirror ladder stripping White is the same
-        // shape, so this is an output-range ceiling of the net, not a
-        // losing-side pathology.
-        //
-        // Consequence: inside that band the search sees no cost to giving
-        // pieces away, and does. Issue #18 reports exactly this -- the eval
-        // pinned at the plateau while a queen, two knights, a bishop and two
-        // rooks came off the board.
-        //
-        // So restore a monotone material ordering past the knee. The ramp is
-        // zero at the knee and reaches full weight at the measured floor, so
-        // the calibrated band below is untouched and there is no step at the
-        // boundary for the search to oscillate across.
-        //
-        // NET-DEPENDENT: the knee is a property of the net's output range.
-        // Re-measure these three constants whenever the production net
-        // changes; the ladder probe lives in the research repo.
-        // The ramp keys off MATERIAL, not off |eval|. Keying it off the eval
-        // is the obvious first cut and it is wrong: as material is shed the
-        // saturated eval drifts back *toward* zero, which shrinks the ramp and
-        // fades the correction out exactly where it is needed. Measured on the
-        // first attempt -- the -12 -> -31 band stayed inverted. Material is
-        // monotone by construction, so there is no feedback loop.
-        //
-        // A net with the raw L1 readout carries its own unclamped route from
-        // material to the output, so it is already monotone past the knee and
-        // the tiebreak would count material twice. It is skipped for such nets,
-        // which is the configuration they were tested in (tiebreak off); older
-        // nets keep it, also as tested.
-        let net_has_raw_readout = self.nnue_net.as_ref().map_or(false, |n| n.has_l1_raw);
-        if FEAT_SAT_TIEBREAK.load(Ordering::Relaxed) && !net_has_raw_readout {
-            // stm-relative, to match the point of view of `final_score`
-            let mat = if board.side_to_move == WHITE {
-                signed_material
-            } else {
-                -signed_material
-            };
-            let excess = mat.abs() - SAT_MAT_KNEE;
-            if excess > 0 {
-                let span = SAT_MAT_FULL - SAT_MAT_KNEE;
-                let ramp = excess.min(span);
-                final_score += mat * SAT_TIEBREAK_W * ramp / (100 * span);
-            }
-        }
-
-        final_score
+        score * (tp(&MAT_SCALE_BASE) + material) / 32 / 1024
     }
 
     #[inline]
@@ -2777,7 +2743,6 @@ pub(crate) fn init_feature_flags() {
             if std::env::var("NO_TT_NEARMISS").is_ok() { FEAT_TT_NEARMISS.store(false, Ordering::Relaxed); }
             if std::env::var("NO_TT_STORE").is_ok() { FEAT_TT_STORE.store(false, Ordering::Relaxed); }
             if std::env::var("NO_TT_STATIC_EVAL").is_ok() { FEAT_TT_STATIC_EVAL.store(false, Ordering::Relaxed); }
-            if std::env::var("NO_SAT_TIEBREAK").is_ok() { FEAT_SAT_TIEBREAK.store(false, Ordering::Relaxed); }
             if std::env::var("NO_QS_CAPTURES").is_ok() { FEAT_QS_CAPTURES.store(false, Ordering::Relaxed); }
             if std::env::var("NO_SINGULAR").is_ok() { FEAT_SINGULAR.store(false, Ordering::Relaxed); }
             if std::env::var("NO_CUCKOO").is_ok() { FEAT_CUCKOO.store(false, Ordering::Relaxed); }
@@ -3033,6 +2998,48 @@ fn bmc_instability_factor(window: u32, num_threads: usize) -> f64 {
     base + mult * (window as f64) / (num_threads as f64)
 }
 
+/// Behind-on-clock budget damp: a multiplier in [TM_BEHIND_FLOOR_PCT/100, 1.0]
+/// on the optimum budget, below 1.0 only when our clock trails the
+/// opponent's by more than the dead zone. `opp_time == 0` means the GUI did
+/// not supply the opponent's clock — neutral.
+///
+/// Why spend LESS when behind: the base budget already scales with our own
+/// clock, so two sides spending the same fraction per move keep their clock
+/// RATIO constant and a deficit never closes. Trailing the opponent means the
+/// late game, where the time-dependent errors happen, will be played with the
+/// smaller clock; banking a little now trades a sliver of middlegame depth for
+/// not being the side in time trouble later.
+///
+/// Derivations (no foreign constants; all from Coda's own TM quantities):
+///   * Dead zone 1/TM_DEFAULT_MTG (~4.2% at the default 24): the base budget
+///     is clock/mtg, so a deficit of one base move-share is what a single
+///     above-average think (the factor product routinely gives 1.5-2x) leaves
+///     behind on its own. Below that the "deficit" is per-move noise, and it
+///     also absorbs the turn-order offset in the two clocks.
+///   * SLOPE 100%: unit elasticity past the dead zone, "x% further behind,
+///     x% less spend" — the parameter-free starting point.
+///   * FLOOR = the TM_OPT_WINDOW_PCT default (73%): see the tunable comment.
+///     With the unit slope the floor binds at ours/theirs ~0.69, i.e. the
+///     rule saturates once we hold under ~70% of the opponent's clock.
+///
+/// Only `opt` is scaled. hard/max stay keyed on our own clock, so a position
+/// that genuinely needs time can still get it through the factor product,
+/// and the forfeit guard is untouched.
+pub fn behind_on_clock_factor(our_time: u64, opp_time: u64) -> f64 {
+    if our_time == 0 || opp_time == 0 || our_time >= opp_time {
+        return 1.0;
+    }
+    let ratio = our_time as f64 / opp_time as f64;
+    let dead_zone = 1.0 / tp(&TM_DEFAULT_MTG).max(2) as f64;
+    let deficit = (1.0 - dead_zone) - ratio;
+    if deficit <= 0.0 {
+        return 1.0;
+    }
+    let slope = tp(&TM_BEHIND_SLOPE_PCT).max(0) as f64 / 100.0;
+    let floor = (tp(&TM_BEHIND_FLOOR_PCT) as f64 / 100.0).clamp(0.0, 1.0);
+    (1.0 - slope * deficit).clamp(floor, 1.0)
+}
+
 /// Compute time-management budgets from clock state. Returns
 /// (soft, hard, max, soft_floor) all in milliseconds.
 ///
@@ -3048,6 +3055,8 @@ fn bmc_instability_factor(window: u32, num_threads: usize) -> f64 {
 /// MoveOverhead UCI option (default 100ms). `ponder_on` is the `Ponder`
 /// UCI option state (callers pass `ponder_enabled()`): when true the
 /// optimum gets the +25% ponder pre-funding bump (see PONDER_OPT_BUMP_PCT).
+/// `opp_time` is the opponent's clock in ms (0 = not supplied): it feeds the
+/// behind-on-clock damp on the optimum (see `behind_on_clock_factor`).
 pub fn compute_tm_budgets(
     our_time: u64,
     our_inc: u64,
@@ -3055,6 +3064,7 @@ pub fn compute_tm_budgets(
     overhead: u64,
     fullmove: u16,
     ponder_on: bool,
+    opp_time: u64,
 ) -> (u64, u64, u64, u64) {
     // TM windows: opt/hard/max model with a multiplicative factor product —
     // the structure common to modern engines (SF, Obsidian, Hobbes and
@@ -3207,6 +3217,18 @@ pub fn compute_tm_budgets(
         let phase_mult = 0.22 + 0.78 * (1.0 - (-0.045 * fullmove as f64).exp());
         ((opt_time_base as f64) * phase_mult.clamp(0.22, 1.0)) as u64
     };
+    // Behind-on-clock damp: spend less when our clock trails the opponent's.
+    // Applied to opt only, before the ponder bump, on every clock path
+    // (movestogo included — the deficit argument does not depend on how the
+    // base share was paced). Neutral when level/ahead or opp_time unknown.
+    let opt_time = {
+        let behind = behind_on_clock_factor(our_time, opp_time);
+        if behind < 1.0 {
+            ((opt_time as f64) * behind) as u64
+        } else {
+            opt_time
+        }
+    };
     // +25% optimum when the Ponder UCI option is on — SF's ponder-optimum
     // pre-funding semantics, applied on EVERY move when pondering is enabled.
     // The average move is refunded by the pondered time itself (full-charge
@@ -3292,6 +3314,63 @@ fn select_smp_candidate(cands: &[SmpCandidate], allow_helper: bool) -> Option<us
 
 /// Run Lazy SMP search: main thread + N-1 helper threads.
 pub fn search_smp(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits, threads: usize) -> Move {
+    info.tm_publish_prediction = false;
+    let mv = search_smp_inner(board, info, limits, threads);
+    if info.tm_publish_prediction {
+        publish_reply_prediction(board, info, mv);
+    }
+    mv
+}
+
+/// Record the opponent reply our final PV expects (pv[1]) and the position it
+/// is expected in, for the next search's surprise check. Runs after SMP
+/// thread selection so the PV is the one that goes with the played move. A
+/// played move with no usable pv[1] clears the prediction: a stale one from
+/// an earlier move must not be compared against this move's reply.
+fn publish_reply_prediction(board: &Board, info: &mut SearchInfo, best: Move) {
+    info.tm_predicted_from = 0;
+    info.tm_predicted_reply = NO_MOVE;
+    if best == NO_MOVE
+        || info.pv_len[0] < 2
+        || info.pv_table[0][0] != best
+        || info.pv_table[0][1] == NO_MOVE
+    {
+        return;
+    }
+    let mut after = board.clone();
+    after.generate_threat_deltas = false;
+    after.generate_pawn_pair_deltas = false;
+    if after.make_move(best) {
+        info.tm_predicted_from = after.hash;
+        info.tm_predicted_reply = info.pv_table[0][1];
+    }
+}
+
+/// Surprise check at search start: true when the root was reached from the
+/// position after our previous played move by a reply OTHER than the one that
+/// search's PV predicted. Unrelated roots (new game, `position fen` without
+/// moves, analysis jumps) fail the hash match and are never "surprises".
+///
+/// Not applied when the Ponder option is on. With pondering, our previous PV's
+/// reply is the move we pondered, so a surprise is exactly a ponder miss —
+/// which already has its own handling (the ponder-miss min-think floor) and
+/// sits on top of the +25% ponder opt pre-funding. Ponder TM cannot be
+/// measured on OB (no pondering there), so stacking a bonus onto that path
+/// would be untestable; keeping ponder-mode budgets identical to before is the
+/// conservative choice. (A ponderhit never reaches this check anyway: the
+/// pondered root's last move IS the predicted reply, and no new search starts.)
+fn reply_was_surprise(board: &Board, info: &SearchInfo) -> bool {
+    if ponder_enabled() || info.tm_predicted_reply == NO_MOVE {
+        return false;
+    }
+    match board.undo_stack.last() {
+        Some(u) => u.hash == info.tm_predicted_from
+            && move_to_uci(u.mv) != move_to_uci(info.tm_predicted_reply),
+        None => false,
+    }
+}
+
+fn search_smp_inner(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits, threads: usize) -> Move {
     // Advance the TT generation HERE, before spawning helpers — not inside
     // search(). Otherwise helpers write TT entries with the old generation in
     // the microsecond window between spawn and main's new_search() call, and
@@ -3835,6 +3914,8 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     } else {
         (limits.btime, limits.binc)
     };
+    // Opponent's clock (0 when the GUI sent only ours) — behind-on-clock damp.
+    let opp_time = if board.side_to_move == WHITE { limits.btime } else { limits.wtime };
 
     // SearchInfo persists across `go` commands.
     // Without explicit reset, stale soft_limit/hard_limit from a prior
@@ -3859,6 +3940,8 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     // the group; the branches that need it set it.
     info.tm_our_inc = 0;
     info.tm_time_left = 0;
+    info.tm_behind_dbg = 1.0;
+    info.tm_surprise = false;
 
     if limits.infinite {
         // No budget is in force: soft/hard/floor stay zero from the reset
@@ -3903,12 +3986,14 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     } else if our_time > 0 {
         let (soft, hard, max_time, soft_floor) =
             compute_tm_budgets(our_time, our_inc, limits.movestogo, info.move_overhead,
-                               board.fullmove, ponder_enabled());
+                               board.fullmove, ponder_enabled(), opp_time);
         info.soft_limit = soft;
         info.hard_limit = hard;
         info.tm_max_time = max_time;
         info.tm_our_inc = our_inc;
         info.tm_time_left = our_time.saturating_sub(info.move_overhead).max(1);
+        info.tm_behind_dbg = behind_on_clock_factor(our_time, opp_time);
+        info.tm_surprise = reply_was_surprise(board, info);
         info.soft_floor = soft_floor;
         // Apply ponder-miss min-think floor (set by uci.rs when the prior
         // search was an abandoned ponder). Caps at hard_limit so we never
@@ -4658,7 +4743,19 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 tp(&TM_STAB_4_100) as f64 / 100.0,
             ];
             let stability_idx = (info.tm_best_stable as usize).min(4);
-            let stability_multiplier = stability_table[stability_idx];
+            // Surprise term: an unpredicted reply reads the table N/100 steps
+            // less stable (linear between entries; index floored at 0). See
+            // TM_SURPRISE_STAB_STEPS_100. Non-surprise path is the plain lookup.
+            let stability_multiplier = if info.tm_surprise {
+                let steps = tp(&TM_SURPRISE_STAB_STEPS_100).max(0) as f64 / 100.0;
+                let x = (stability_idx as f64 - steps).max(0.0);
+                let lo = x.floor() as usize;
+                let hi = (lo + 1).min(4);
+                let t = x - lo as f64;
+                stability_table[lo] + (stability_table[hi] - stability_table[lo]) * t
+            } else {
+                stability_table[stability_idx]
+            };
 
             // Factor 2: Aspiration fail-low bonus.
             // Formula: 1.0 + 0.34 × min(2, count), range [1.00, 1.68]
@@ -4885,6 +4982,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
             || (limits.movetime > 0 && limits.abs_clock > 0))
     {
         info.tm_cross_prev_score = info.last_score;
+        info.tm_publish_prediction = true;
     }
 
     // Don't stockpile: if the ID loop finished below the soft_floor (e.g. all
@@ -4956,7 +5054,8 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                  tm_baseline={} stab={} bmc={} asp_fl={} asp_fh={} forced={:?} \
                  cross_prev={} \
                  stabf={:.2} flf={:.2} forcedf={:.3} subf={:.2} subfrac={:.3} \
-                 trendf={:.2} mult={:.2} adjsoft={} overshoot={}",
+                 trendf={:.2} mult={:.2} adjsoft={} overshoot={} \
+                 behindf={:.3} surprise={}",
                 info.completed_depth,
                 move_to_uci(best_move),
                 info.last_score,
@@ -4982,6 +5081,8 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
                 info.tm_dbg.product,
                 info.tm_dbg.adjusted_soft,
                 overshoot,
+                info.tm_behind_dbg,
+                info.tm_surprise as u8,
             );
         }
     }
@@ -9343,7 +9444,7 @@ mod tests {
         // seconds — a 1ms ponder must lead to a full normal think via the
         // elapsed >= soft condition alone.
         let (soft, _hard, _max, _floor) =
-            compute_tm_budgets(60_000, 10_000, 0, 100, 20, true);
+            compute_tm_budgets(60_000, 10_000, 0, 100, 20, true, 0);
         assert!(soft >= 1000,
             "test premise: big-inc soft should be seconds, got {}ms", soft);
         assert!(!should_instant_reply(1, soft, 64, false, 4),
@@ -9388,6 +9489,32 @@ mod tests {
         assert!(!should_instant_reply(5000, 3000, MIN_PONDER_DEPTH_FOR_INSTANT - 1, false, 4));
     }
 
+    /// Behind-on-clock damp: neutral when level, ahead, inside the one-share
+    /// dead zone, or with no opponent clock; monotone in the deficit; floored;
+    /// and it touches opt only.
+    #[test]
+    fn behind_on_clock_damp_shape() {
+        assert_eq!(behind_on_clock_factor(60_000, 0), 1.0);
+        assert_eq!(behind_on_clock_factor(60_000, 60_000), 1.0);
+        assert_eq!(behind_on_clock_factor(60_000, 50_000), 1.0);
+        // 2% behind is inside the 1/TM_DEFAULT_MTG dead zone.
+        assert_eq!(behind_on_clock_factor(58_800, 60_000), 1.0);
+        let mild = behind_on_clock_factor(50_000, 60_000);
+        let deep = behind_on_clock_factor(40_000, 60_000);
+        assert!(mild < 1.0 && deep < mild, "mild={} deep={}", mild, deep);
+        let floor = tp(&TM_BEHIND_FLOOR_PCT) as f64 / 100.0;
+        assert_eq!(behind_on_clock_factor(1_000, 60_000), floor);
+
+        let (opt_lvl, hard_lvl, max_lvl, _) =
+            compute_tm_budgets(30_000, 300, 0, 100, 30, false, 30_000);
+        let (opt_bh, hard_bh, max_bh, _) =
+            compute_tm_budgets(30_000, 300, 0, 100, 30, false, 60_000);
+        assert_eq!(hard_lvl, hard_bh);
+        assert_eq!(max_lvl, max_bh);
+        assert!(opt_bh < opt_lvl && opt_bh >= (opt_lvl as f64 * floor) as u64 - 1,
+            "opt level={} behind={}", opt_lvl, opt_bh);
+    }
+
     /// P3 — the Ponder-on +25% optimum bump: applied to opt only (hard/max/
     /// floor identical), clamped to hard, and OFF by default (no-ponder
     /// behavior bit-identical).
@@ -9401,9 +9528,9 @@ mod tests {
             (60_000, 0, 40, 15),   // movestogo
         ] {
             let (opt_np, hard_np, max_np, floor_np) =
-                compute_tm_budgets(t, inc, mtg, 100, fm, false);
+                compute_tm_budgets(t, inc, mtg, 100, fm, false, 0);
             let (opt_p, hard_p, max_p, floor_p) =
-                compute_tm_budgets(t, inc, mtg, 100, fm, true);
+                compute_tm_budgets(t, inc, mtg, 100, fm, true, 0);
             assert_eq!(hard_np, hard_p, "hard must be ponder-independent");
             assert_eq!(max_np, max_p, "max must be ponder-independent");
             assert_eq!(floor_np, floor_p, "floor must be ponder-independent");
@@ -9523,6 +9650,45 @@ mod tests {
         assert_eq!(analysis.tm_time_left, 0);
     }
 
+    /// Surprise check: predicted reply -> no surprise; a different reply from
+    /// the predicted-from position -> surprise; an unrelated root -> never.
+    /// A played search publishes its pv[1] as the next prediction.
+    #[test]
+    fn reply_surprise_detection() {
+        use crate::board::Board;
+        use crate::uci::parse_uci_move;
+        crate::init();
+        let mut info = SearchInfo::new(1);
+        let mut root = Board::startpos();
+        let ours = parse_uci_move(&root, "e2e4").unwrap();
+        let mut after = root.clone();
+        assert!(after.make_move(ours));
+        let predicted = parse_uci_move(&after, "e7e5").unwrap();
+        info.pv_table[0][0] = ours;
+        info.pv_table[0][1] = predicted;
+        info.pv_len[0] = 2;
+        publish_reply_prediction(&root, &mut info, ours);
+        assert_eq!(info.tm_predicted_from, after.hash);
+        assert_eq!(info.tm_predicted_reply, predicted);
+
+        let mut hit = after.clone();
+        assert!(hit.make_move(predicted));
+        assert!(!reply_was_surprise(&hit, &info));
+        let mut miss = after.clone();
+        assert!(miss.make_move(parse_uci_move(&after, "c7c5").unwrap()));
+        assert!(reply_was_surprise(&miss, &info));
+        // Unrelated root (one ply, different position) never matches.
+        assert!(root.make_move(parse_uci_move(&root, "d2d4").unwrap()));
+        assert!(!reply_was_surprise(&root, &info));
+        assert!(!reply_was_surprise(&Board::startpos(), &info));
+
+        // A played move without pv[1] clears any older prediction.
+        info.pv_len[0] = 1;
+        publish_reply_prediction(&Board::startpos(), &mut info, ours);
+        assert_eq!(info.tm_predicted_reply, NO_MOVE);
+        assert!(!reply_was_surprise(&miss, &info));
+    }
+
     /// DEFECT A regression — on the armed post-ponderhit path `soft_floor`
     /// must be the small anti-stockpile floor, NOT the whole post-hit slice.
     ///
@@ -9546,7 +9712,7 @@ mod tests {
         let our_inc = 1_000u64;
         let overhead = 100u64;
         let (soft, hard, _max, stockpile) =
-            compute_tm_budgets(our_time, our_inc, 0, overhead, 20, true);
+            compute_tm_budgets(our_time, our_inc, 0, overhead, 20, true, 0);
         // A short ponder, charged in full: the slice is nearly the whole soft.
         let elapsed = 200u64;
         let slice = soft.saturating_sub(elapsed)

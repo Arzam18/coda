@@ -401,6 +401,8 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 info.clear_correction_history();
                 info.clear_pawn_hist(); // was missing — stale data leaked between games
                 info.tm_cross_prev_score = i32::MIN; // no prev move in a fresh game
+                info.tm_predicted_from = 0; // ... and no reply prediction
+                info.tm_predicted_reply = crate::types::NO_MOVE;
                 // A `stop` that ended the previous game's ponder marks a
                 // ponder-miss; without this reset the min-think floor lands
                 // on the first move of the next game (Zeus, probcut/ponder
@@ -1140,9 +1142,25 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                         // saved go-ponder clocks is equivalent to computing
                         // them at `go ponder` time). ponder_enabled() passes
                         // the P3 +25% optimum bump through.
+                        // Opponent's clock for the behind-on-clock damp. The
+                        // go-ponder value is stale by exactly the ponder: the
+                        // opponent's clock ran while we pondered and then
+                        // collected their increment on moving. Without the
+                        // correction the opponent looks richer than they are
+                        // and the damp over-fires on every ponderhit.
+                        let (opp_clock, opp_inc) = if ponder_stm == crate::types::WHITE {
+                            (pl.btime, pl.binc)
+                        } else {
+                            (pl.wtime, pl.winc)
+                        };
+                        let opp_time = if opp_clock > 0 {
+                            opp_clock.saturating_sub(elapsed).saturating_add(opp_inc).max(1)
+                        } else {
+                            0
+                        };
                         let (soft, hard, _max_time, floor) = crate::search::compute_tm_budgets(
                             our_time, our_inc, pl.movestogo, overhead, board.fullmove,
-                            crate::search::ponder_enabled());
+                            crate::search::ponder_enabled(), opp_time);
 
                         // Instant-reply gate inputs (P1): the ponder search's
                         // completed root depth, its best-move stability, and
@@ -1474,12 +1492,11 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 }
                 info.threat_stack.invalidate();
                 // Report what SEARCH sees, by going through the same function
-                // search does: net output + material scaling + the saturation
-                // tiebreak. This used to call `evaluate_nnue` directly, which
-                // reported the bare net output and so silently drifted from the
-                // search's view every time `SearchInfo::eval` gained a term —
-                // it was already missing MAT_SCALE_BASE before the tiebreak was
-                // added. `eval verbose` still dumps the raw net output.
+                // search does: net output + material scaling. This used to call
+                // `evaluate_nnue` directly, which reported the bare net output
+                // and so silently drifted from the search's view every time
+                // `SearchInfo::eval` gained a term — it was missing
+                // MAT_SCALE_BASE. `eval verbose` still dumps the raw net output.
                 //
                 // Halfmove scaling is deliberately absent: `SearchInfo::eval`
                 // returns the halfmove-INDEPENDENT score and callers apply
