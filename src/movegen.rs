@@ -560,6 +560,21 @@ pub fn generate_evasions(board: &Board, checkers: Bitboard, pinned: Bitboard) ->
     let checker_bb = 1u64 << checker_sq;
     let empty = !occ_full;
 
+    // En passant resolves a single check in two ways: by capturing the
+    // checking pawn itself, or by landing on the EP square when that square
+    // lies on the checking slider's ray (an interposition). generate_legal_moves
+    // accepts both through is_legal, so the evasion generator must too. EP
+    // candidates are drawn from ALL our pawns, pinned ones included, and every
+    // one goes through the full is_legal oracle: the pinned-piece argument
+    // above does not cover EP, whose captured pawn is not on `to`, and the
+    // removed pawn can open a discovered attack.
+    let ep_resolves = board.ep_square != NO_SQUARE && {
+        let ep_bb = 1u64 << board.ep_square;
+        let captured_sq = if us == WHITE { board.ep_square - 8 } else { board.ep_square + 8 };
+        captured_sq as u32 == checker_sq || block_target & ep_bb != 0
+    };
+    let ep_pawns = board.pieces[PAWN as usize] & our_pieces;
+
     if us == WHITE {
         let promo_rank = RANK_8;
 
@@ -608,24 +623,21 @@ pub fn generate_evasions(board: &Board, checkers: Bitboard, pinned: Bitboard) ->
             list.push(make_move(to - 16, to, FLAG_DOUBLE_PUSH));
         }
 
-        // En passant: only if the captured pawn IS the checking piece
-        if board.ep_square != NO_SQUARE {
-            let captured_pawn_sq = board.ep_square - 8;
-            if captured_pawn_sq as u32 == checker_sq {
-                let ep_bb = 1u64 << board.ep_square;
-                let ep_l = ((pawns & NOT_FILE_A) << 7) & ep_bb;
-                let ep_r = ((pawns & NOT_FILE_H) << 9) & ep_bb;
-                if ep_l != 0 {
-                    let m = make_move(board.ep_square - 7, board.ep_square, FLAG_EN_PASSANT);
-                    if board.is_legal(m, pinned, checkers) {
-                        list.push(m);
-                    }
+        // En passant: captures the checking pawn or interposes (see above).
+        if ep_resolves {
+            let ep_bb = 1u64 << board.ep_square;
+            let ep_l = ((ep_pawns & NOT_FILE_A) << 7) & ep_bb;
+            let ep_r = ((ep_pawns & NOT_FILE_H) << 9) & ep_bb;
+            if ep_l != 0 {
+                let m = make_move(board.ep_square - 7, board.ep_square, FLAG_EN_PASSANT);
+                if board.is_legal(m, pinned, checkers) {
+                    list.push(m);
                 }
-                if ep_r != 0 {
-                    let m = make_move(board.ep_square - 9, board.ep_square, FLAG_EN_PASSANT);
-                    if board.is_legal(m, pinned, checkers) {
-                        list.push(m);
-                    }
+            }
+            if ep_r != 0 {
+                let m = make_move(board.ep_square - 9, board.ep_square, FLAG_EN_PASSANT);
+                if board.is_legal(m, pinned, checkers) {
+                    list.push(m);
                 }
             }
         }
@@ -676,24 +688,21 @@ pub fn generate_evasions(board: &Board, checkers: Bitboard, pinned: Bitboard) ->
             list.push(make_move(to + 16, to, FLAG_DOUBLE_PUSH));
         }
 
-        // En passant
-        if board.ep_square != NO_SQUARE {
-            let captured_pawn_sq = board.ep_square + 8;
-            if captured_pawn_sq as u32 == checker_sq {
-                let ep_bb = 1u64 << board.ep_square;
-                let ep_l = ((pawns & NOT_FILE_A) >> 9) & ep_bb;
-                let ep_r = ((pawns & NOT_FILE_H) >> 7) & ep_bb;
-                if ep_l != 0 {
-                    let m = make_move(board.ep_square + 9, board.ep_square, FLAG_EN_PASSANT);
-                    if board.is_legal(m, pinned, checkers) {
-                        list.push(m);
-                    }
+        // En passant: captures the checking pawn or interposes (see above).
+        if ep_resolves {
+            let ep_bb = 1u64 << board.ep_square;
+            let ep_l = ((ep_pawns & NOT_FILE_A) >> 9) & ep_bb;
+            let ep_r = ((ep_pawns & NOT_FILE_H) >> 7) & ep_bb;
+            if ep_l != 0 {
+                let m = make_move(board.ep_square + 9, board.ep_square, FLAG_EN_PASSANT);
+                if board.is_legal(m, pinned, checkers) {
+                    list.push(m);
                 }
-                if ep_r != 0 {
-                    let m = make_move(board.ep_square + 7, board.ep_square, FLAG_EN_PASSANT);
-                    if board.is_legal(m, pinned, checkers) {
-                        list.push(m);
-                    }
+            }
+            if ep_r != 0 {
+                let m = make_move(board.ep_square + 7, board.ep_square, FLAG_EN_PASSANT);
+                if board.is_legal(m, pinned, checkers) {
+                    list.push(m);
                 }
             }
         }
@@ -1054,6 +1063,19 @@ mod tests {
         init();
         // Pawn gives check, EP can capture the checking pawn
         verify_evasions_match("8/8/8/2k5/3Pp3/8/8/4K3 b - d3 0 1");
+    }
+
+    /// EP that interposes on a slider's check ray (the captured pawn is not
+    /// the checker) is legal, so the evasion generator must produce it just
+    /// as generate_legal_moves does. Unreachable from a legal double push,
+    /// but the two generators must still agree on any board they are given.
+    #[test]
+    fn test_evasions_ep_interposes_slider_check() {
+        init();
+        // White: Ka6 checked along the 6th rank by Rh6; a5xb6 e.p. blocks.
+        verify_evasions_match("4k3/8/K6r/Pp6/8/8/8/8 w - b6 0 1");
+        // Black mirror: Ka3 checked along the 3rd rank by Rh3; a4xb3 e.p. blocks.
+        verify_evasions_match("4K3/8/8/8/pP6/k6R/8/8 b - b3 0 1");
     }
 
     #[test]
