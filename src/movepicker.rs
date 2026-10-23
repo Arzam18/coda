@@ -1089,6 +1089,13 @@ pub fn is_pseudo_legal(board: &Board, mv: Move) -> bool {
         let from_rank = from >> 3;
         let required_rank = if us == WHITE { 4 } else { 3 }; // 5th rank = index 4
         if from_rank != required_rank { return false; }
+        // `to` must be on the EP-target rank (6th for White, 3rd for Black)
+        // and empty. A malformed ep_square can otherwise name a square
+        // behind an enemy pawn on the wrong rank, or an occupied one, and
+        // make_move would overwrite whatever stands there.
+        let target_rank = if us == WHITE { 5 } else { 2 };
+        if to >> 3 != target_rank { return false; }
+        if board.occupied() & to_bb != 0 { return false; }
         let from_file = from & 7;
         let to_file = to & 7;
         if (from_file as i8 - to_file as i8).abs() != 1 { return false; }
@@ -1762,5 +1769,41 @@ mod cont_hist_symmetry_tests {
             Default::default(), &mps, &mts,
         );
         assert!(mp.cont_hist_subs[0].is_none(), "null sentinel must not select a plane");
+    }
+}
+
+#[cfg(test)]
+mod ep_pseudo_legal_tests {
+    use super::*;
+    use crate::board::Board;
+
+    /// A TT-collision EP move must not pass when the EP square on the board
+    /// is malformed: `to` has to be on the EP-target rank (6th for White,
+    /// 3rd for Black) and empty. The ep_square is set by hand here so the
+    /// check is exercised independently of FEN-parse normalisation.
+    #[test]
+    fn ep_requires_target_rank_and_empty_target() {
+        crate::init();
+        // Wrong rank: EP target b7 with a black pawn on b6 behind it.
+        let mut b = Board::from_fen("4k3/8/1p6/P7/8/8/8/4K3 w - - 0 1");
+        b.ep_square = 49; // b7
+        let a5b7 = make_move(32, 49, FLAG_EN_PASSANT);
+        assert!(!is_pseudo_legal(&b, a5b7), "EP onto the 7th rank accepted");
+
+        // Black-side mirror: EP target b2, white pawn on b3.
+        let mut b = Board::from_fen("4k3/8/8/8/p7/1P6/8/4K3 b - - 0 1");
+        b.ep_square = 9; // b2
+        let a4b2 = make_move(24, 9, FLAG_EN_PASSANT);
+        assert!(!is_pseudo_legal(&b, a4b2), "EP onto the 2nd rank accepted");
+
+        // Occupied target: b6 holds a knight, b5 the pawn to be taken.
+        let mut b = Board::from_fen("4k3/8/1n6/Pp6/8/8/8/4K3 w - - 0 1");
+        b.ep_square = 41; // b6
+        let a5b6 = make_move(32, 41, FLAG_EN_PASSANT);
+        assert!(!is_pseudo_legal(&b, a5b6), "EP onto an occupied square accepted");
+
+        // Control: the well-formed EP is still accepted.
+        let b = Board::from_fen("4k3/8/8/Pp6/8/8/8/4K3 w - b6 0 1");
+        assert!(is_pseudo_legal(&b, a5b6), "well-formed EP rejected");
     }
 }

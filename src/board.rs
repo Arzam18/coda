@@ -655,7 +655,13 @@ impl Board {
 
         // En passant. Bounds-check f and r to avoid wrapping into a
         // huge ep_square that later overflows `1u64 << ep_square`
-        // (board.rs / movegen.rs).
+        // (board.rs / movegen.rs). Then keep the square only if it could
+        // be the result of the opponent's last move being a double push:
+        // on the 6th rank with White to move (3rd with Black), the target
+        // and the pushed pawn's origin both empty, and the pusher's pawn
+        // standing just past the target. Anything else is corrupt input
+        // and is dropped, so movegen, is_pseudo_legal and make_move never
+        // see an EP square they would have to second-guess.
         self.ep_square = NO_SQUARE;
         if parts.len() > 3 && parts[3] != "-" {
             let bytes = parts[3].as_bytes();
@@ -663,7 +669,19 @@ impl Board {
                 let f = bytes[0].wrapping_sub(b'a');
                 let r = bytes[1].wrapping_sub(b'1');
                 if f < 8 && r < 8 {
-                    self.ep_square = square(f, r);
+                    let ep = square(f, r);
+                    let stm = self.side_to_move;
+                    let target_rank = if stm == WHITE { 5 } else { 2 };
+                    if r == target_rank {
+                        let (pushed, origin) = if stm == WHITE { (ep - 8, ep + 8) } else { (ep + 8, ep - 8) };
+                        let occ = self.colors[0] | self.colors[1];
+                        let pusher_pawns = self.pieces[PAWN as usize] & self.colors[flip_color(stm) as usize];
+                        if occ & ((1u64 << ep) | (1u64 << origin)) == 0
+                            && pusher_pawns & (1u64 << pushed) != 0
+                        {
+                            self.ep_square = ep;
+                        }
+                    }
                 }
             }
         }
@@ -2041,6 +2059,29 @@ mod tests {
             let bare = Board::from_fen(&fen.replace(" KQkq ", " - ").replace(" HAha ", " - "));
             assert_eq!(b.hash ^ bare.hash, crate::zobrist::castle_key(b.castling), "{}", fen);
         }
+    }
+
+    /// FEN parse keeps an EP square only if it could follow a double push:
+    /// target on the right rank for the side to move, target and the pushed
+    /// pawn's origin empty, and the pusher's pawn standing in front.
+    #[test]
+    fn fen_ep_square_is_validated() {
+        init();
+        let ep = |fen: &str| Board::from_fen(fen).ep_square;
+        // Well-formed (capturable or not): kept.
+        assert_eq!(ep("4k3/8/8/Pp6/8/8/8/4K3 w - b6 0 1"), 41);
+        assert_eq!(ep("4k3/8/8/1p6/8/8/8/4K3 w - b6 0 1"), 41);
+        assert_eq!(ep("4k3/8/8/8/pP6/8/8/4K3 b - b3 0 1"), 17);
+        // Wrong rank for the side to move.
+        assert_eq!(ep("4k3/8/1p6/P7/8/8/8/4K3 w - b7 0 1"), NO_SQUARE);
+        assert_eq!(ep("4k3/8/8/Pp6/8/8/8/4K3 b - b6 0 1"), NO_SQUARE);
+        // Occupied target.
+        assert_eq!(ep("4k3/8/1n6/Pp6/8/8/8/4K3 w - b6 0 1"), NO_SQUARE);
+        // No pawn of the pusher in front of the target.
+        assert_eq!(ep("4k3/8/8/P7/8/8/8/4K3 w - b6 0 1"), NO_SQUARE);
+        assert_eq!(ep("4k3/8/8/PP6/8/8/8/4K3 w - b6 0 1"), NO_SQUARE);
+        // The pushed pawn's origin square is occupied.
+        assert_eq!(ep("4k3/1p6/8/Pp6/8/8/8/4K3 w - b6 0 1"), NO_SQUARE);
     }
 
     /// Recompute the four auxiliary Zobrist keys (pawn_hash, non_pawn_key,
