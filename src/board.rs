@@ -135,18 +135,26 @@ pub fn standard_castle_mask() -> [u8; 64] {
     build_castle_mask([4, 60], &STANDARD_CASTLE_ROOKS)
 }
 
-/// Returns true if `ep_sq` is an EP target that `capturing_side` can actually
-/// reach with a pawn — i.e., `capturing_side` has a pawn on a file-adjacent
-/// square on the same rank as the just-double-pushed pawn.
+/// Returns true if `capturing_side` has a LEGAL en-passant capture onto
+/// `ep_sq`: one of its pawns stands file-adjacent to the just-double-pushed
+/// enemy pawn, and making that capture does not leave its own king attacked.
 ///
 /// The double-pushed pawn's square is implied by `ep_sq`:
 ///   - if capturing_side == BLACK, white just pushed; pushed pawn = ep_sq + 8
 ///   - if capturing_side == WHITE, black just pushed; pushed pawn = ep_sq - 8
 ///
-/// The Zobrist hash must XOR `ep_key(file_of(ep_sq))` iff this returns true.
-/// Otherwise two physically identical positions — one reached via a double
-/// push with no adjacent enemy pawn, one reached any other way — would hash
-/// differently, silently breaking threefold-repetition detection.
+/// The Zobrist hash must XOR `ep_key(file_of(ep_sq))` iff this returns true,
+/// and every hash path (`compute_hash`, `make_move`, `make_null_move`) calls
+/// this one function so they cannot disagree. Testing only adjacency is not
+/// enough: a pinned capturer — the ordinary pin, or the rank case where the
+/// capturing and captured pawns both leave the rank and expose the king to a
+/// rook/queen — has no EP right, so the position is the same as without the
+/// EP square and must hash the same, or a genuine threefold is missed.
+///
+/// Legality is decided by replaying the capture on a scratch occupancy: the
+/// capturer leaves its square, the pushed pawn disappears, `ep_sq` fills, and
+/// the king must then be attacked by nothing. A kingless (test) position
+/// falls back to plain adjacency.
 pub fn ep_capture_available(
     pieces: &[Bitboard; 6],
     colors: &[Bitboard; 2],
@@ -164,11 +172,36 @@ pub fn ep_capture_available(
     };
     if pushed_sq >= 64 { return false; }
     let pushed_bb = 1u64 << pushed_sq;
+    let them = flip_color(capturing_side);
+    if pieces[PAWN as usize] & colors[them as usize] & pushed_bb == 0 { return false; }
     // Enemy (capturing_side) pawns that could EP-capture sit on files adjacent
     // to pushed_sq on the same rank.
     let adj = ((pushed_bb << 1) & NOT_FILE_A) | ((pushed_bb >> 1) & NOT_FILE_H);
-    let capturing_pawns = pieces[PAWN as usize] & colors[capturing_side as usize];
-    adj & capturing_pawns != 0
+    let mut capturers = adj & pieces[PAWN as usize] & colors[capturing_side as usize];
+    if capturers == 0 { return false; }
+
+    let kings = pieces[KING as usize] & colors[capturing_side as usize];
+    if kings == 0 { return true; }
+    let ksq = lsb(kings);
+    // The pushed pawn is captured, so it never counts as an attacker.
+    let theirs = colors[them as usize] & !pushed_bb;
+    // A knight/pawn/king attack on the king survives any EP capture (the
+    // capture neither removes nor blocks it).
+    let leapers = (knight_attacks(ksq) & pieces[KNIGHT as usize])
+        | (pawn_attacks(capturing_side, ksq) & pieces[PAWN as usize])
+        | (king_attacks(ksq) & pieces[KING as usize]);
+    if leapers & theirs != 0 { return false; }
+    let diag = (pieces[BISHOP as usize] | pieces[QUEEN as usize]) & theirs;
+    let orth = (pieces[ROOK as usize] | pieces[QUEEN as usize]) & theirs;
+    let occ = colors[0] | colors[1];
+    while capturers != 0 {
+        let from = pop_lsb(&mut capturers);
+        let occ_after = (occ ^ (1u64 << from) ^ pushed_bb) | (1u64 << ep_sq);
+        if bishop_attacks(ksq, occ_after) & diag == 0 && rook_attacks(ksq, occ_after) & orth == 0 {
+            return true;
+        }
+    }
+    false
 }
 
 impl Board {
@@ -454,7 +487,7 @@ impl Board {
             }
         }
 
-        // Only hash ep_square if an enemy pawn can actually make the EP capture.
+        // Only hash ep_square if the side to move can legally make the EP capture.
         // Without this guard, the same physical position reached with or without
         // a recent double-push would hash differently, breaking rep detection
         // (Stockfish pattern).
@@ -1719,6 +1752,9 @@ mod tests {
             // Dead-EP position: double push available with no adjacent enemy pawn
             "4k3/p7/8/8/8/8/1P6/4K3 w - - 0 1",
             "4k3/8/8/8/8/8/PPPPPPPP/4K3 w - - 0 1",
+            // Pinned-EP positions: vertical pin and the shared-rank pin.
+            "4r1k1/3p4/8/4P3/8/8/8/4K3 b - - 0 1",
+            "8/2p1p3/8/K2P3r/8/8/8/7k b - - 0 1",
         ];
 
         fn next_u32(state: &mut u32) -> u32 {
@@ -1877,6 +1913,59 @@ mod tests {
         // in both cases (hash invariant).
         assert_eq!(fen_after_double.hash, fen_after_double.compute_hash());
         assert_eq!(ep_legal_pos.hash, ep_legal_pos.compute_hash());
+    }
+
+    /// Regression: an EP target whose only capturer is pinned (the capture
+    /// would leave its own king in check) is not a real EP right, so it must
+    /// not reach the hash. Otherwise the position right after the double push
+    /// and the same position one king shuffle later hash differently and a
+    /// genuine threefold is missed.
+    #[test]
+    fn zobrist_ep_ignores_illegal_capture() {
+        use crate::uci::parse_uci_move;
+        init();
+
+        // e5 is pinned on the e-file by the e8 rook: e5xd6 is illegal.
+        let start = "4r1k1/8/8/3pP3/8/8/8/4K3 w - d6 0 1";
+        let mut b = Board::from_fen(start);
+        let no_ep = Board::from_fen("4r1k1/8/8/3pP3/8/8/8/4K3 w - - 0 1");
+        assert_eq!(b.hash, no_ep.hash, "pinned EP capturer must not hash the EP file");
+
+        let shuffle = ["e1f1", "g8h8", "f1e1", "h8g8"];
+        for _ in 0..2 {
+            for m in shuffle {
+                let mv = parse_uci_move(&b, m).expect("legal shuffle move");
+                b.make_move(mv);
+                assert_eq!(b.hash, b.compute_hash());
+            }
+        }
+        // Start, after 4 plies, after 8 plies: the same legal position 3 times.
+        assert!(b.is_repetition_draw(0), "threefold through a pinned-EP start position missed");
+
+        // Rank case: both pawns leave the 5th rank, exposing the a5 king to h5.
+        let rank_pin = Board::from_fen("8/8/8/K2pP2r/8/8/8/7k w - d6 0 1");
+        let rank_no_ep = Board::from_fen("8/8/8/K2pP2r/8/8/8/7k w - - 0 1");
+        assert_eq!(rank_pin.hash, rank_no_ep.hash, "rank-pinned EP must not hash the EP file");
+
+        // Same rank layout but a second capturer on c5 whose capture leaves
+        // the e5 pawn as a shield: EP is legal and must stay hashed.
+        let rank_ok = Board::from_fen("8/8/8/K1PpP2r/8/8/8/7k w - d6 0 1");
+        let rank_ok_no_ep = Board::from_fen("8/8/8/K1PpP2r/8/8/8/7k w - - 0 1");
+        assert_eq!(rank_ok.hash ^ rank_ok_no_ep.hash, crate::zobrist::ep_key(3));
+
+        // Incremental path: the double push itself must agree with the
+        // no-EP position and with a from-scratch hash.
+        let mut pushed = Board::from_fen("4r1k1/3p4/8/4P3/8/8/8/4K3 b - - 0 1");
+        pushed.make_move(parse_uci_move(&pushed, "d7d5").unwrap());
+        assert_eq!(pushed.hash, pushed.compute_hash());
+        assert_eq!(pushed.hash, no_ep.hash);
+        let mut rank_pushed = Board::from_fen("8/3p4/8/K3P2r/8/8/8/7k b - - 0 1");
+        rank_pushed.make_move(parse_uci_move(&rank_pushed, "d7d5").unwrap());
+        assert_eq!(rank_pushed.hash, rank_pushed.compute_hash());
+        assert_eq!(rank_pushed.hash, rank_no_ep.hash);
+        // ... and unmaking restores the incremental hash exactly.
+        rank_pushed.unmake_move();
+        assert_eq!(rank_pushed.hash, rank_pushed.compute_hash());
     }
 
     /// Recompute the four auxiliary Zobrist keys (pawn_hash, non_pawn_key,
