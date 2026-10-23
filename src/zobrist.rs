@@ -12,6 +12,8 @@ static mut EP_KEYS: [u64; 8] = [0; 8];
 static mut CASTLE_KEYS_4: [u64; 4] = [0; 4];
 /// Side to move key
 static mut SIDE_KEY: u64 = 0;
+/// Chess960 castling-rook keys: [right WK=0,WQ=1,BK=2,BQ=3][rook file]
+static mut CASTLE_ROOK_KEYS: [[u64; 8]; 4] = [[0; 8]; 4];
 
 #[inline(always)]
 pub fn piece_key(piece: Piece, sq: Square) -> u64 {
@@ -41,6 +43,16 @@ pub fn castle_key(rights: u8) -> u64 {
     h
 }
 
+/// Key naming which rook a held castling right belongs to, for boards whose
+/// castling geometry is non-standard (Chess960). In 960 two rooks can stand
+/// on the same side of the king, so the right flags alone don't identify the
+/// castling rook. The rank is implied by the right, so the file suffices.
+#[inline(always)]
+pub fn castle_rook_key(right: usize, rook_sq: u8) -> u64 {
+    debug_assert!(right < 4);
+    unsafe { CASTLE_ROOK_KEYS[right][(rook_sq & 7) as usize] }
+}
+
 #[inline(always)]
 pub fn side_key() -> u64 {
     unsafe { SIDE_KEY }
@@ -57,6 +69,7 @@ pub fn init_zobrist() {
         SIDE_KEY = SIDE_KEY_INIT;
         CASTLE_KEYS_4 = CASTLE_KEYS_4_INIT;
         EP_KEYS = EP_KEYS_INIT;
+        CASTLE_ROOK_KEYS = CASTLE_ROOK_KEYS_INIT;
     }
 }
 

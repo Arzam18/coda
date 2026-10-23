@@ -72,6 +72,11 @@ pub struct Board {
     /// Per right: the squares that must not be attacked — the king's start,
     /// transit and destination squares.
     pub castle_king_path: [Bitboard; 4],
+    /// True when every castling rook stands on its standard a/h-file square
+    /// (set at FEN parse, fixed for the game): the fast path in
+    /// `castle_hash`, where no right can carry a rook-identity key, so every
+    /// standard-chess hash is exactly the four right keys.
+    pub std_castling: bool,
 }
 
 /// Standard-chess castling rook start squares, indexed by right bit position
@@ -216,6 +221,7 @@ impl Board {
             castle_mask: standard_castle_mask(),
             castle_path: [0; 4],
             castle_king_path: [0; 4],
+            std_castling: true,
             ep_square: NO_SQUARE,
             halfmove: 0,
             fullmove: 1,
@@ -473,6 +479,32 @@ impl Board {
         false
     }
 
+    /// Zobrist contribution of the castling rights `rights`: the per-right
+    /// keys, plus a key naming the rook of each held right whose rook is NOT
+    /// on its standard a/h-file square (only possible in Chess960). Without
+    /// the rook term, 960 positions whose rights name different rooks on the
+    /// same side of the king (Shredder `F` vs `H` with rooks on f1 and h1)
+    /// hash identically despite having different legal moves.
+    ///
+    /// Deciding per right rather than per board keeps the hash a function of
+    /// the position alone: a 960 game whose remaining rights happen to use
+    /// a/h rooks hashes the same as that position parsed from its FEN, and
+    /// standard chess never sees a rook key. Every hash path goes through
+    /// here, so the incremental and from-scratch hashes cannot disagree.
+    #[inline(always)]
+    pub fn castle_hash(&self, rights: u8) -> u64 {
+        let mut h = castle_key(rights);
+        if !self.std_castling {
+            for i in 0..4 {
+                let rook = self.castle_rooks[i];
+                if rights & (1u8 << i) != 0 && rook != STANDARD_CASTLE_ROOKS[i] {
+                    h ^= castle_rook_key(i, rook);
+                }
+            }
+        }
+        h
+    }
+
     /// Compute the full Zobrist hash from scratch.
     pub fn compute_hash(&self) -> u64 {
         let mut h = 0u64;
@@ -497,7 +529,7 @@ impl Board {
             h ^= ep_key(file_of(self.ep_square));
         }
 
-        h ^= castle_key(self.castling);
+        h ^= self.castle_hash(self.castling);
 
         if self.side_to_move == BLACK {
             h ^= side_key();
@@ -619,6 +651,7 @@ impl Board {
         }
         self.castle_mask = build_castle_mask(king_start, &self.castle_rooks);
         self.rebuild_castle_paths(king_start);
+        self.std_castling = self.castle_rooks == STANDARD_CASTLE_ROOKS;
 
         // En passant. Bounds-check f and r to avoid wrapping into a
         // huge ep_square that later overflows `1u64 << ep_square`
@@ -1133,7 +1166,7 @@ impl Board {
         }
 
         // Remove old castling hash
-        self.hash ^= castle_key(self.castling);
+        self.hash ^= self.castle_hash(self.castling);
 
         // Clear threat deltas for this move
         let gen_threats = self.generate_threat_deltas;
@@ -1208,7 +1241,7 @@ impl Board {
         }
 
         // Update castling hash
-        self.hash ^= castle_key(self.castling);
+        self.hash ^= self.castle_hash(self.castling);
 
         // Update halfmove clock
         if pt == PAWN || captured != NO_PIECE_TYPE {
@@ -1755,6 +1788,10 @@ mod tests {
             // Pinned-EP positions: vertical pin and the shared-rank pin.
             "4r1k1/3p4/8/4P3/8/8/8/4K3 b - - 0 1",
             "8/2p1p3/8/K2P3r/8/8/8/7k b - - 0 1",
+            // Chess960: two rooks per side of the king, rights naming the
+            // inner ones, so castling, rook moves and rook captures all
+            // change rights whose rook keys are hashed.
+            "1r1k1rr1/pp1ppp1p/8/2p3p1/2P3P1/8/PP1PPP1P/1R1K1RR1 w FBfb - 0 1",
         ];
 
         fn next_u32(state: &mut u32) -> u32 {
@@ -1966,6 +2003,44 @@ mod tests {
         // ... and unmaking restores the incremental hash exactly.
         rank_pushed.unmake_move();
         assert_eq!(rank_pushed.hash, rank_pushed.compute_hash());
+    }
+
+    /// Regression: in Chess960 two rooks can stand on the same side of the
+    /// king, so the right flags alone don't say which rook castles. Positions
+    /// whose rights name different rooks have different legal moves and must
+    /// hash differently; standard-chess hashes must not change at all.
+    #[test]
+    fn zobrist_castling_includes_960_rook_identity() {
+        use crate::uci::parse_uci_move;
+        init();
+
+        let f_rook = Board::from_fen("4k3/8/8/8/8/8/8/4KR1R w F - 0 1");
+        let h_rook = Board::from_fen("4k3/8/8/8/8/8/8/4KR1R w H - 0 1");
+        assert_eq!(f_rook.castling, h_rook.castling);
+        assert_ne!(f_rook.castle_rooks, h_rook.castle_rooks);
+        assert_ne!(f_rook.hash, h_rook.hash, "960 rights naming different rooks must hash differently");
+        // Losing the right makes the two positions identical again.
+        let none = Board::from_fen("4k3/8/8/8/8/8/8/4KR1R w - - 0 1");
+        let mut f_moved = f_rook.clone();
+        f_moved.make_move(parse_uci_move(&f_moved, "f1g1").unwrap());
+        f_moved.make_move(parse_uci_move(&f_moved, "e8d8").unwrap());
+        f_moved.make_move(parse_uci_move(&f_moved, "g1f1").unwrap());
+        f_moved.make_move(parse_uci_move(&f_moved, "d8e8").unwrap());
+        assert_eq!(f_moved.castling, 0);
+        assert_eq!(f_moved.hash, f_moved.compute_hash());
+        assert_eq!(f_moved.hash, none.hash);
+
+        // Standard geometry: the hash is exactly pieces ^ side ^ the four
+        // right keys, unchanged by the 960 rook keys.
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/8/8/8/8/8/8/R3K2R w HAha - 0 1",
+        ] {
+            let b = Board::from_fen(fen);
+            let bare = Board::from_fen(&fen.replace(" KQkq ", " - ").replace(" HAha ", " - "));
+            assert_eq!(b.hash ^ bare.hash, crate::zobrist::castle_key(b.castling), "{}", fen);
+        }
     }
 
     /// Recompute the four auxiliary Zobrist keys (pawn_hash, non_pawn_key,

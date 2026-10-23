@@ -815,3 +815,49 @@ static EP_KEYS_INIT: [u64; 8] = [
     0x7bcb8bb2783f1cd6,
     0xdb5fc13412b8c2b9,
 ];
+
+// Chess960 castling-rook keys: the same math/rand stream (seed
+// 0x1234567890ABCDEF) continued past the 781 draws above (pieces, side,
+// castling, ep): 32 more draws in [right WK,WQ,BK,BQ][rook file a..h] order.
+static CASTLE_ROOK_KEYS_INIT: [[u64; 8]; 4] = [
+  [ // WK rook on file a..h
+    0x182302b0ec6a4ba6,
+    0x32c4436009551e9d,
+    0xb91b90b96fe3dd57,
+    0x92156b637aa7201f,
+    0xdaaa549ac1b564c6,
+    0x31c6b746efbcdba8,
+    0x42e7fd0b95aaabca,
+    0x839bd7e9375773f2,
+  ],
+  [ // WQ rook on file a..h
+    0xff898d074a226bcb,
+    0x2330a8970144e6fb,
+    0x01a870bd8cdd4ed5,
+    0x69253e02f5ff9612,
+    0xc1278fc7ce4f1b91,
+    0x5bbf745e8ae8a16f,
+    0x412b0b9f80ad366e,
+    0x2c8ae1c8edf372cf,
+  ],
+  [ // BK rook on file a..h
+    0x2d9bd4cc78446ed4,
+    0x57c9e0d40481dce8,
+    0xe84bfb777ff28f91,
+    0xacaec36a39fd5453,
+    0x1833dd1cae61cd3e,
+    0xa4e97f23242a06a9,
+    0x0ce1c558923b2548,
+    0xb13943e51f3a2edc,
+  ],
+  [ // BQ rook on file a..h
+    0x4812b496a689d0fd,
+    0xec45e362977d6d9f,
+    0x24a59050eacffd17,
+    0x7b18d69ab3e58fd0,
+    0xb282fe316485e33e,
+    0x1a34a61eca0254a8,
+    0xe2be0b97b8aae988,
+    0x89d83229f08fe27f,
+  ],
+];
