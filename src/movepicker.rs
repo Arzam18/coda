@@ -1849,6 +1849,8 @@ mod quiet_check_bonus_tests {
         // A plain king step gives no check.
         let kd1 = scores.iter().find(|&&(m, _)| move_from(m) == 4 && move_to(m) == 3).unwrap();
         assert_eq!(kd1.1, 0);
+    }
+}
 
 #[cfg(test)]
 mod ep_pseudo_legal_tests {
