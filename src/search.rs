@@ -7797,8 +7797,12 @@ fn quiescence_with_depth(
         return draw_score;
     }
 
-    // Limit quiescence depth to prevent stack overflow
-    if qs_depth >= 32 {
+    // Limit quiescence depth to prevent stack overflow, and stop at the same
+    // ABSOLUTE horizon negamax enforces. Without the MAX_PLY bound, qsearch
+    // entered near the negamax limit recursed to ply ~190, and a checkmate there
+    // returned -MATE_SCORE + ply below MATE_IN_MAX_PLY: outside the mate band,
+    // so it was treated (and TT-stored) as an ordinary huge eval.
+    if qs_depth >= 32 || ply as usize >= MAX_PLY {
         return apply_halfmove_scale(info.eval(board), board.halfmove);
     }
 
