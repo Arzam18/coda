@@ -491,6 +491,8 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
+    // The only test is Linux-specific; on other targets the import is unused.
+    #[cfg(target_os = "linux")]
     use super::*;
 
     #[cfg(target_os = "linux")]
