@@ -342,6 +342,8 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                 println!("option name TBHash type spin default 16 min 0 max 1024");
                 println!("option name SyzygyProbeDepth type spin default 1 min 1 max 100");
                 println!("option name ScoreScale type spin default 39 min 25 max 200");
+                println!("option name NormalizeScore type check default true");
+                println!("option name UCI_ShowWDL type check default false");
                 // Internal/dev options — available only in tuning builds
                 // (`make openbench` / `--features tune`) so they don't clutter GUI
                 // option lists in normal/release builds.
@@ -608,7 +610,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                             }
                             if tb_valid {
                                 let score_str =
-                                    crate::tt::format_uci_score(root_tb_report_score(wdl));
+                                    crate::tt::format_uci_score(root_tb_report_score(wdl), crate::tt::wdl_material(&board));
                                 let pv_str = tb_pv.join(" ");
                                 let depth = tb_pv.len().max(1);
                                 println!("info depth {} seldepth {} {} tbhits 1 pv {}",
@@ -1105,7 +1107,7 @@ pub fn uci_loop_with_nnue(nnue_path: Option<&str>, book_path: Option<&str>) {
                                     }
                                 }
                                 let score_str =
-                                    crate::tt::format_uci_score(root_tb_report_score(wdl));
+                                    crate::tt::format_uci_score(root_tb_report_score(wdl), crate::tt::wdl_material(&board));
                                 println!("info depth 1 seldepth 1 {} tbhits 1 pv {}", score_str, tb_move_str);
                                 println!("bestmove {}", tb_move_str);
                                 continue;
@@ -1834,8 +1836,21 @@ fn parse_option(tokens: &[&str], info: &mut SearchInfo, num_threads: &mut usize,
             if let Ok(v) = value.parse::<i32>() {
                 let v = v.clamp(25, 200);
                 crate::tt::REPORT_SCALE_PCT.store(v, std::sync::atomic::Ordering::Relaxed);
-                println!("info string ScoreScale = {}", v);
+                // An explicit ScoreScale means "use this fixed scale": it turns
+                // off win-rate normalisation, so tooling that pins
+                // ScoreScale=100 to read internal units is unaffected.
+                crate::tt::NORMALIZE_SCORE.store(false, std::sync::atomic::Ordering::Relaxed);
+                println!("info string ScoreScale = {} (NormalizeScore off)", v);
             }
+        }
+        "NormalizeScore" => {
+            let on = value.eq_ignore_ascii_case("true");
+            crate::tt::NORMALIZE_SCORE.store(on, std::sync::atomic::Ordering::Relaxed);
+            println!("info string NormalizeScore = {}", on);
+        }
+        "UCI_ShowWDL" => {
+            let on = value.eq_ignore_ascii_case("true");
+            crate::tt::SHOW_WDL.store(on, std::sync::atomic::Ordering::Relaxed);
         }
         "SyzygyProbeDepth" => {
             if let Ok(d) = value.parse::<i32>() {

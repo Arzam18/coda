@@ -398,7 +398,7 @@ pub fn run_epd(path: &str, time_per_pos: u64, max_positions: usize, nnue_path: O
         let settled_from = log.iter().rposition(|r| !iter_ok(r)).map_or(0, |i| i + 1);
         let last = log.last();
         let label = if pos.id.is_empty() { format!("#{}", i + 1) } else { pos.id.clone() };
-        let shown = format_score(score);
+        let shown = format_score(score, crate::tt::wdl_material(&board));
 
         match verdict {
             Ok(()) => {
@@ -437,8 +437,8 @@ fn expectation(pos: &EpdPosition) -> String {
 }
 
 /// Display score as a GUI would see it (`cp 76`, `mate 12`).
-fn format_score(score: i32) -> String {
-    let s = crate::tt::format_uci_score(score);
+fn format_score(score: i32, material: i32) -> String {
+    let s = crate::tt::format_uci_score(score, material);
     s.strip_prefix("score ").unwrap_or(&s).to_string()
 }
 
