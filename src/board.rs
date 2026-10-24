@@ -808,38 +808,40 @@ impl Board {
     /// Get pinned pieces (our pieces pinned to our king by opponent sliders).
     pub fn pinned(&self) -> Bitboard {
         let us = self.side_to_move;
-        let them = flip_color(us);
-        let ksq = self.king_sq(us) as u32;
+        self.sole_slider_blockers(self.king_sq(us) as u32, flip_color(us), us)
+    }
+
+    /// Discovered-check candidates: side-to-move pieces that are the only
+    /// piece between one of our own sliders and the enemy king. Moving one
+    /// off that line uncovers check. The same sole-blocker scan as
+    /// `pinned`, aimed at the other king.
+    pub fn discovered_check_candidates(&self) -> Bitboard {
+        let us = self.side_to_move;
+        self.sole_slider_blockers(self.king_sq(flip_color(us)) as u32, us, us)
+    }
+
+    /// Pieces of `blocker_color` that are the sole occupant of the line
+    /// between the king on `ksq` and an aligned slider of `slider_color`.
+    fn sole_slider_blockers(&self, ksq: u32, slider_color: Color, blocker_color: Color) -> Bitboard {
         let occ = self.occupied();
 
-        let their_bishops = (self.pieces[BISHOP as usize] | self.pieces[QUEEN as usize]) & self.colors[them as usize];
-        let their_rooks = (self.pieces[ROOK as usize] | self.pieces[QUEEN as usize]) & self.colors[them as usize];
+        let diag_sliders = (self.pieces[BISHOP as usize] | self.pieces[QUEEN as usize]) & self.colors[slider_color as usize];
+        let orth_sliders = (self.pieces[ROOK as usize] | self.pieces[QUEEN as usize]) & self.colors[slider_color as usize];
 
-        let mut pinned = 0u64;
+        let mut result = 0u64;
 
-        // Bishop/queen pinners
-        let mut potential = bishop_attacks(ksq, 0) & their_bishops;
-        while potential != 0 {
-            let pinner_sq = pop_lsb(&mut potential);
-            let between_bb = between(ksq, pinner_sq);
-            let blockers = between_bb & occ;
-            if popcount(blockers) == 1 && blockers & self.colors[us as usize] != 0 {
-                pinned |= blockers;
+        // Bishop/queen lines, then rook/queen lines.
+        for mut potential in [bishop_attacks(ksq, 0) & diag_sliders, rook_attacks(ksq, 0) & orth_sliders] {
+            while potential != 0 {
+                let slider_sq = pop_lsb(&mut potential);
+                let blockers = between(ksq, slider_sq) & occ;
+                if popcount(blockers) == 1 && blockers & self.colors[blocker_color as usize] != 0 {
+                    result |= blockers;
+                }
             }
         }
 
-        // Rook/queen pinners
-        let mut potential = rook_attacks(ksq, 0) & their_rooks;
-        while potential != 0 {
-            let pinner_sq = pop_lsb(&mut potential);
-            let between_bb = between(ksq, pinner_sq);
-            let blockers = between_bb & occ;
-            if popcount(blockers) == 1 && blockers & self.colors[us as usize] != 0 {
-                pinned |= blockers;
-            }
-        }
-
-        pinned
+        result
     }
 
     /// Is the given move legal? Assumes move is pseudo-legal.

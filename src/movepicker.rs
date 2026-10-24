@@ -643,9 +643,15 @@ impl MovePicker {
         // direct check? Computed here (not in MovePicker::new) because only
         // quiet scoring consumes it — nodes that cut off before the quiet
         // stage never pay for the attack computations.
+        // Discovered-check candidates are computed alongside, for the same
+        // reason: once per picker, and only when quiets are scored.
+        let mut dc_candidates: Bitboard = 0;
         {
             let opponent = if board.side_to_move == 0 { 1u8 } else { 0u8 };
             let their_king_bb = board.pieces[KING as usize] & board.colors[opponent as usize];
+            if their_king_bb != 0 {
+                dc_candidates = board.discovered_check_candidates();
+            }
             self.checking_sqs = if their_king_bb != 0 {
                 let their_king_sq = their_king_bb.trailing_zeros();
                 let occ = board.occupied();
@@ -746,11 +752,21 @@ impl MovePicker {
                 score += escape_bonus_by_pt[pt.min(7) as usize];
             }
 
-            // Quiet check bonus: moves that give direct check.
+            // Quiet check bonus: moves that give check.
             // SEE-gated like SF: a check that loses material by more
             // than QUIET_CHECK_SEE_MARGIN is a losing sac — don't order it first.
+            // Direct checks are the cheap checking_sqs lookup. Discovered
+            // checks (moving a sole blocker of one of our sliders) and
+            // castling checks (delivered by the rook) take the same bonus
+            // and the same SEE gate; they are confirmed with the exact
+            // pre-move test `gives_direct_check`, called only for the rare
+            // moves that can qualify: a discovered-check candidate moving,
+            // or a castle.
+            let gives_check = (pt < 6 && self.checking_sqs[pt as usize] & (1u64 << to) != 0)
+                || ((dc_candidates & (1u64 << from) != 0 || move_flags(m) == FLAG_CASTLE)
+                    && board.gives_direct_check(m));
             if piece != NO_PIECE
-                && pt < 6 && self.checking_sqs[pt as usize] & (1u64 << to) != 0
+                && gives_check
                 && see_ge(board, m, -quiet_check_see_margin) {
                 score += quiet_check_bonus;
             }
@@ -1762,5 +1778,69 @@ mod cont_hist_symmetry_tests {
             Default::default(), &mps, &mts,
         );
         assert!(mp.cont_hist_subs[0].is_none(), "null sentinel must not select a plane");
+    }
+}
+
+#[cfg(test)]
+mod quiet_check_bonus_tests {
+    use super::*;
+    use crate::board::Board;
+
+    /// Score every quiet of `fen` with zeroed history. The positions below
+    /// give the defender a bare king, so no offense/fork/escape term fires
+    /// and a quiet's score is exactly the quiet-check bonus or zero.
+    fn quiet_scores(fen: &str) -> Vec<(Move, i32)> {
+        crate::init();
+        let board = Board::from_fen(fen);
+        let h = History::boxed_zeroed();
+        let c = ContHist::shared_zeroed();
+        let mps = [0u8; 64];
+        let mts = [0u8; 64];
+        let mut mp = MovePicker::new(
+            &board, NO_MOVE, 0, board.checkers(), board.pinned(), &h, &c, NO_MOVE, None,
+            Default::default(), &mps, &mts,
+        );
+        mp.generate_and_score_quiets(&board);
+        (0..mp.moves.len)
+            .map(|i| (mp.moves.get(i), unsafe { mp.scores[i].assume_init() }))
+            .collect()
+    }
+
+    fn bonus() -> i32 {
+        crate::search::QUIET_CHECK_BONUS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Every knight move off a2 uncovers Ra1 on the a8 king: discovered
+    /// checks, none of them direct, so all must take the quiet-check bonus.
+    /// King moves give no check and must not.
+    #[test]
+    fn discovered_check_gets_quiet_check_bonus() {
+        let scores = quiet_scores("k7/8/8/8/8/8/N7/R3K3 w - - 0 1");
+        let mut knight_moves = 0;
+        for &(m, s) in &scores {
+            match move_from(m) {
+                8 => {
+                    knight_moves += 1;
+                    assert_eq!(s, bonus(), "discovered check {} missed the bonus", move_to_uci(m));
+                }
+                4 => assert_eq!(s, 0, "non-checking king move {} got a bonus", move_to_uci(m)),
+                _ => {}
+            }
+        }
+        assert_eq!(knight_moves, 3);
+    }
+
+    /// O-O lands the rook on f1, checking the f8 king down the open file.
+    #[test]
+    fn castling_check_gets_quiet_check_bonus() {
+        let scores = quiet_scores("5k2/8/8/8/8/8/8/4K2R w K - 0 1");
+        let castle = scores
+            .iter()
+            .find(|&&(m, _)| move_flags(m) == FLAG_CASTLE)
+            .expect("O-O must be generated");
+        assert_eq!(castle.1, bonus(), "castling check missed the bonus");
+        // A plain king step gives no check.
+        let kd1 = scores.iter().find(|&&(m, _)| move_from(m) == 4 && move_to(m) == 3).unwrap();
+        assert_eq!(kd1.1, 0);
     }
 }
