@@ -1,3 +1,4 @@
+
 name: Build Android
 
 on:
@@ -10,7 +11,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-android:
@@ -23,7 +24,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Set Coda UCI version
+      - name: Set Coda UCI Version
         env:
           UCI_DATE: ${{ inputs.uci_date }}
         run: |
@@ -32,7 +33,6 @@ jobs:
           from pathlib import Path
 
           uci_date = os.environ["UCI_DATE"]
-
           path = Path("build.rs")
           text = path.read_text()
 
@@ -41,17 +41,13 @@ jobs:
 
           if old not in text:
               raise SystemExit(
-                  "ERROR: Could not find CODA_VERSION stamping line in build.rs."
+                  "ERROR: CODA_VERSION stamping line not found in build.rs"
               )
 
-          text = text.replace(old, new, 1)
-          path.write_text(text)
-
-          print(f"Modified file: {path}")
-          print(f"Coda UCI version: {uci_date}")
+          path.write_text(text.replace(old, new, 1))
+          print(f"Coda UCI version set to {uci_date}")
           PY
 
-          echo "Modified CODA_VERSION line:"
           grep -n 'CODA_VERSION' build.rs
 
       - name: Setup Rust
@@ -59,41 +55,104 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      - name: Ensure Target for Active Toolchain
-        run: rustup target add aarch64-linux-android
-
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Configure Android ARM64 Build
+        run: |
+          # Remove the host-specific target-cpu=native setting.
+          # It can inject x86 CPU features into the Android build.
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [target.aarch64-linux-android]
+          rustflags = ["-C", "target-cpu=generic"]
+          EOF
+
+          echo "Android Cargo configuration:"
+          cat .cargo/config.toml
+
+          rustc --version
+          cargo --version
+          rustup target list --installed
 
       - name: Download NNUE Net
         run: |
           if [ -f net.txt ]; then
-            NET_URL=$(cat net.txt | tr -d '\r\n')
-            NET_FILE=$(basename "$NET_URL")
-            echo "Downloading NNUE net from $NET_URL..."
-            curl -fsSL --retry 3 "$NET_URL" -o "$NET_FILE"
-            echo "CODA_EVALFILE=$(pwd)/$NET_FILE" >> $GITHUB_ENV
+            NET_URL="$(tr -d '\r\n' < net.txt)"
+
+            if [ -z "$NET_URL" ]; then
+              echo "::error::net.txt is empty"
+              exit 1
+            fi
+
+            NET_FILE="$(basename "${NET_URL%%\?*}")"
+
+            echo "Downloading NNUE network..."
+            curl -fL --retry 3 \
+              "$NET_URL" \
+              -o "$NET_FILE"
+
+            test -s "$NET_FILE" || {
+              echo "::error::Downloaded network is empty"
+              exit 1
+            }
+
+            echo "CODA_EVALFILE=$PWD/$NET_FILE" >> "$GITHUB_ENV"
+            echo "Downloaded network: $NET_FILE"
+            ls -lh "$NET_FILE"
           else
-            echo "Warning: net.txt not found!"
+            echo "::error::net.txt not found"
+            exit 1
           fi
 
-      - name: Build Coda for Android
+      - name: Build Coda for Android ARM64
+        env:
+          # Override any host-specific CPU settings.
+          RUSTFLAGS: "-C target-cpu=generic"
         run: |
-          cargo ndk -t arm64-v8a --platform 24 build \
+          cargo ndk \
+            -t arm64-v8a \
+            --platform 24 \
+            build \
             --release \
             --features embedded-net \
             --bin coda
-          
-          mkdir -p dist/bin
-          cp target/aarch64-linux-android/release/coda dist/bin/coda
 
-      - name: Verify Binary
+      - name: Verify Android Binary
         run: |
-          ls -lh dist/bin/
-          file dist/bin/*
+          set -eu
+
+          BIN="target/aarch64-linux-android/release/coda"
+
+          if [ ! -f "$BIN" ]; then
+            echo "::error::Android binary was not produced"
+            exit 1
+          fi
+
+          mkdir -p dist/bin
+          cp "$BIN" dist/bin/coda
+          chmod +x dist/bin/coda
+
+          echo "Binary details:"
+          file dist/bin/coda
+
+          echo "Checking ELF architecture..."
+          readelf -h dist/bin/coda | grep -E \
+            'Class:|Data:|Machine:|Type:'
+
+          readelf -h dist/bin/coda |
+            grep -q 'Machine:.*AArch64' || {
+              echo "::error::Binary is not AArch64"
+              exit 1
+            }
+
+          echo "ARM64 binary verified."
+          ls -lh dist/bin/coda
 
       - name: Upload Android Artifact
         uses: actions/upload-artifact@v4
         with:
           name: coda-android-arm64
-          path: dist/bin/*
+          path: dist/bin/coda
+          if-no-files-found: error
+          retention-days: 14
