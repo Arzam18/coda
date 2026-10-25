@@ -3848,6 +3848,8 @@ impl NNUENet {
 
         // For bucketed nets: only compute neurons for this bucket
         let l1_off = if self.bucketed_hidden { bucket * l1_pb } else { 0 };
+        // Only the x86 sparse L1 kernels read this; other targets use the dense path.
+        #[cfg(target_arch = "x86_64")]
         let l1_sparse = &self.l1_weights_sparse[bucket * self.sparse_bucket_stride..];
         let l1 = if self.bucketed_hidden { l1_pb } else { l1_total };
 

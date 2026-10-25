@@ -1033,7 +1033,77 @@ mod targeted_tests {
 /// separately.
 pub static REPORT_SCALE_PCT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(39);
 
-/// Format a search score as a UCI `score ...` field, applying the display scale.
+/// Whether reported scores are normalised by the win-rate model (default) or by
+/// the fixed `REPORT_SCALE_PCT`. Setting `ScoreScale` explicitly switches this
+/// off, so tooling that pins `ScoreScale=100` to read internal units keeps
+/// working unchanged. Display-only.
+pub static NORMALIZE_SCORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `UCI_ShowWDL`: append `wdl W D L` (per mille) to every reported score.
+pub static SHOW_WDL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Win-rate model, fitted on Coda's own games:
+///   P(win)  = sigmoid((x - a(m)) / b(m))
+///   P(loss) = sigmoid((-x - a(m)) / b(m))
+/// where x is the side-to-move search score in internal units and m is the
+/// material on the board (P=1, N=B=3, R=5, Q=9, both sides). a(m) is the score
+/// at which Coda wins half its games, so the reported cp is 100 * x / a(m):
+/// +1.00 means a 50% winning chance.
+///
+/// Fitted 2026-10-24 by maximum likelihood on OB #4536 (main 75f3762a, net
+/// 0F08CC1B, 20,000 STC self-play games with internal-unit evals, no win/draw
+/// adjudication; 2.68M positions), per material level then smoothed as a cubic
+/// in t = m/58. Script: coda-research research/wdl_model_2026-10-24/.
+///
+/// NET-SPECIFIC: refit whenever the production net changes, as with ScoreScale.
+const WDL_A_COEF: [f64; 4] = [-219.64, 599.21, -546.76, 403.12];
+const WDL_B_COEF: [f64; 4] = [-6.83, 38.17, -5.49, 55.61];
+
+/// Material outside the range the fit saw is clamped to its edges rather than
+/// extrapolating the cubic.
+const WDL_MATERIAL_MIN: i32 = 10;
+const WDL_MATERIAL_MAX: i32 = 78;
+
+/// Material count used by the win-rate model.
+pub fn wdl_material(board: &crate::board::Board) -> i32 {
+    use crate::types::*;
+    let n = |pt: u8| (board.pieces[pt as usize]).count_ones() as i32;
+    n(PAWN) + 3 * (n(KNIGHT) + n(BISHOP)) + 5 * n(ROOK) + 9 * n(QUEEN)
+}
+
+fn wdl_params(material: i32) -> (f64, f64) {
+    let t = material.clamp(WDL_MATERIAL_MIN, WDL_MATERIAL_MAX) as f64 / 58.0;
+    let poly = |c: &[f64; 4]| ((c[0] * t + c[1]) * t + c[2]) * t + c[3];
+    (poly(&WDL_A_COEF), poly(&WDL_B_COEF))
+}
+
+/// Win/draw/loss per mille for the side to move. Always sums to 1000.
+pub fn score_to_wdl(score: i32, material: i32) -> (i32, i32, i32) {
+    if is_decisive(score) {
+        return if score > 0 { (1000, 0, 0) } else { (0, 0, 1000) };
+    }
+    let (a, b) = wdl_params(material);
+    let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
+    let x = score as f64;
+    let w = (1000.0 * sig((x - a) / b)).round() as i32;
+    let l = (1000.0 * sig((-x - a) / b)).round() as i32;
+    (w, 1000 - w - l, l)
+}
+
+/// Reported centipawns for an ordinary (non-decisive) score.
+pub fn display_cp(score: i32, material: i32) -> i32 {
+    if NORMALIZE_SCORE.load(std::sync::atomic::Ordering::Relaxed) {
+        let (a, _) = wdl_params(material);
+        (100.0 * score as f64 / a).round() as i32
+    } else {
+        let pct = REPORT_SCALE_PCT.load(std::sync::atomic::Ordering::Relaxed);
+        if pct == 100 { score } else { score * pct / 100 }
+    }
+}
+
+/// Format a search score as a UCI `score ...` field, applying the display scale,
+/// plus `wdl W D L` when `UCI_ShowWDL` is on. `material` is the root position's
+/// `wdl_material`.
 ///
 /// **Only ordinary centipawn scores are scaled.** Mate scores are a ply count,
 /// not a magnitude. Tablebase scores are the subtle case: they are stored as
@@ -1041,18 +1111,69 @@ pub static REPORT_SCALE_PCT: std::sync::atomic::AtomicI32 = std::sync::atomic::A
 /// so an `is_mate_score` guard would let them fall through to the cp branch and
 /// silently divide a tablebase win into a mid-range number. Guard with
 /// [`is_decisive`] instead, which covers both bands.
-pub fn format_uci_score(score: i32) -> String {
-    if is_mate_score(score) {
+pub fn format_uci_score(score: i32, material: i32) -> String {
+    let base = if is_mate_score(score) {
         let mate_in = if score > 0 {
             (MATE_SCORE - score + 1) / 2
         } else {
             -(MATE_SCORE + score + 1) / 2
         };
-        return format!("score mate {}", mate_in);
+        format!("score mate {}", mate_in)
+    } else if is_decisive(score) {
+        format!("score cp {}", score) // TB band: report raw
+    } else {
+        format!("score cp {}", display_cp(score, material))
+    };
+    if SHOW_WDL.load(std::sync::atomic::Ordering::Relaxed) {
+        let (w, d, l) = score_to_wdl(score, material);
+        format!("{} wdl {} {} {}", base, w, d, l)
+    } else {
+        base
     }
-    if is_decisive(score) {
-        return format!("score cp {}", score); // TB band: report raw
+}
+
+#[cfg(test)]
+mod wdl_model_tests {
+    use super::*;
+
+    #[test]
+    fn wdl_sums_to_1000_and_is_monotone() {
+        for m in [4, 16, 40, 58, 78, 90] {
+            let mut prev_w = -1;
+            for x in (-1500..=1500).step_by(50) {
+                let (w, d, l) = score_to_wdl(x, m);
+                assert_eq!(w + d + l, 1000, "x={x} m={m}");
+                assert!(w >= 0 && d >= 0 && l >= 0);
+                assert!(w >= prev_w, "win% must not fall as the score rises (x={x} m={m})");
+                prev_w = w;
+            }
+            // Symmetry: a score and its negation swap wins and losses.
+            let (w, _, l) = score_to_wdl(300, m);
+            let (w2, _, l2) = score_to_wdl(-300, m);
+            assert_eq!((w, l), (l2, w2));
+        }
     }
-    let pct = REPORT_SCALE_PCT.load(std::sync::atomic::Ordering::Relaxed);
-    format!("score cp {}", if pct == 100 { score } else { score * pct / 100 })
+
+    #[test]
+    fn plus_one_pawn_means_about_half_the_wins() {
+        // The reported +1.00 is defined as the score a(m) where P(win) = 50%.
+        for m in [16, 40, 58, 78] {
+            let (a, _) = wdl_params(m);
+            let x = a.round() as i32;
+            let (w, _, _) = score_to_wdl(x, m);
+            assert!((w - 500).abs() <= 2, "m={m}: P(win) at a(m) = {w}");
+            if NORMALIZE_SCORE.load(std::sync::atomic::Ordering::Relaxed) {
+                assert_eq!(display_cp(x, m), 100);
+            }
+        }
+    }
+
+    #[test]
+    fn decisive_scores_are_not_scaled() {
+        let tb_win = MATE_IN_MAX_PLY - 50;
+        assert_eq!(format_uci_score(tb_win, 30).split_whitespace().nth(2).unwrap(), tb_win.to_string());
+        assert!(format_uci_score(MATE_SCORE - 3, 30).starts_with("score mate 2"));
+        assert_eq!(score_to_wdl(MATE_SCORE - 3, 30), (1000, 0, 0));
+        assert_eq!(score_to_wdl(-(MATE_SCORE - 3), 30), (0, 0, 1000));
+    }
 }
