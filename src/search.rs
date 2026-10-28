@@ -4146,7 +4146,25 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
             info.tm_no_inc = our_inc == 0 && limits.movestogo == 0;
         }
     } else if limits.movetime > 0 {
-        info.time_limit = limits.movetime;
+        // `movetime` is a hard limit on the reply as the GUI measures it, so
+        // the search has to end early enough to stop, unwind and print within
+        // it. Searching the full movetime left no room: at `go movetime 250`
+        // under load (16 threads, load 21) replies arrived at median 263 ms,
+        // p99 331, max 343 -- the stop is only polled every 4096 nodes, which
+        // is several ms on a loaded core -- and a 9.7k-game st=0.25 round
+        // robin with a 100 ms tolerance lost 4% of games on time. Take
+        // MoveOverhead off, as the clock path does, but never more than a
+        // fifth of the movetime: a short movetime keeps most of its budget,
+        // and a fifth of 250 ms (50 ms) still covers the measured p99 overrun
+        // (81 ms) once added to the GUI's own tolerance. Only for a plain
+        // `go movetime`: the ponderhit fresh-search also arrives as a movetime,
+        // but it is already budgeted from the clock and carries abs_clock.
+        let margin = if limits.abs_clock == 0 {
+            info.move_overhead.min(limits.movetime / 5)
+        } else {
+            0
+        };
+        info.time_limit = (limits.movetime - margin).max(1);
         // Respect caller-supplied minimum think time (ponderhit fresh-search uses
         // this to enforce the increment floor; plain `go movetime` callers leave
         // it at 0 so they get exactly the movetime they asked for).
