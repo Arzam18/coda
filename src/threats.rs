@@ -1465,13 +1465,24 @@ fn push_threats_for_piece(
     #[cfg(feature = "profile-threats")]
     let s1_deltas_before = deltas.len() as u64;
 
+    // Step 2 needs the rook and bishop rays from `square` under this same
+    // `occ`, and those are exactly a slider's own attack set here. Computing
+    // them first lets step 1 select the piece's attacks from them instead of
+    // calling `piece_attacks_occ`, which repeated one or two of the same magic
+    // lookups behind an out-of-line call and a jump table.
+    let rook_att = rook_attacks(square, occ);
+    let bishop_att = bishop_attacks(square, occ);
+
     // No-king space: the king emits no attacker-side features, so skip the
     // enumeration rather than emitting deltas the index mapping discards.
-    let skip_king_attacks = piece_type == 5 && !king_attacker_on();
-    let my_attacks = if skip_king_attacks {
-        0
-    } else {
-        piece_attacks_occ(piece_type, piece_color, square, occ)
+    let my_attacks = match piece_type {
+        PAWN => pawn_attacks(piece_color, square),
+        KNIGHT => knight_attacks(square),
+        BISHOP => bishop_att,
+        ROOK => rook_att,
+        QUEEN => bishop_att | rook_att,
+        KING if king_attacker_on() => king_attacks(square),
+        _ => 0,
     };
     let mut attacked_occ = my_attacks & occ;
     while attacked_occ != 0 {
@@ -1529,9 +1540,6 @@ fn push_threats_for_piece(
     let s2_start = crate::threats::thr_stats::rdtsc();
     #[cfg(feature = "profile-threats")]
     let s2_deltas_before = deltas.len() as u64;
-    let rook_att = rook_attacks(square, occ);
-    let bishop_att = bishop_attacks(square, occ);
-
     let diagonal_sliders = (pieces_bb[BISHOP as usize] | pieces_bb[QUEEN as usize]) & bishop_att;
     let orthogonal_sliders = (pieces_bb[ROOK as usize] | pieces_bb[QUEEN as usize]) & rook_att;
 
