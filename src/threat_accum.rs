@@ -188,7 +188,10 @@ pub struct ThreatEntry {
     pub delta: DeltaVec,
     /// The move that produced this ply (for king mirror check)
     pub mv: Move,
-    /// Piece type that moved (for king mirror detection)
+    /// Piece type on the move's destination after it was made — the mover, or
+    /// the promoted piece (for king mirror detection, and for lazy generation,
+    /// which needs it to step back over the move without reading the scratch
+    /// state's mailbox)
     pub moved_pt: u8,
     /// Color that moved (for per-perspective king mirror check)
     pub moved_color: u8,
@@ -329,10 +332,21 @@ impl ThreatStack {
     /// which case the caller must refresh instead of replaying — the same
     /// contract `can_update`'s overflow check enforces for eager deltas.
     ///
-    /// Walks the piece state backwards from the LIVE board (which sits at
-    /// `self.index`) to just before `from_ply`, then forward again re-emitting.
-    /// The scratch state is a 128-byte copy, so the live board — which the NNUE
-    /// accumulator stack and the Zobrist keys both alias — is never touched.
+    /// Walks BACKWARDS from the LIVE board (which sits at `self.index`) down to
+    /// the lowest ply that lacks deltas: each ply's deltas come from its
+    /// post-move state, then the scratch state steps back to its pre-move state
+    /// (see `threats::emit_post_move_deltas`). The scratch state is a 132-byte
+    /// copy, so the live board — which the NNUE accumulator stack and the
+    /// Zobrist keys both alias — is never touched.
+    ///
+    /// Backwards rather than "rewind everything, then replay forward" for two
+    /// reasons. The top ply's first generation step reads the board in place,
+    /// so a quiet move at the top of the stack — most materialisations are a
+    /// single quiet ply — needs no copy and no mutation at all. And when a copy
+    /// is needed, it is made after that first step rather than immediately
+    /// before reading it back: the forward form's first read was a byte load
+    /// from the freshly written copy, which carried 28% of this function's
+    /// cycles on Zen 5.
     fn materialize_deltas(&mut self, board: &crate::board::Board, from_ply: usize) -> bool {
         let to_ply = self.index;
         if from_ply > to_ply {
@@ -341,65 +355,124 @@ impl ThreatStack {
 
         // Fast path: the span is already covered, either because generation was
         // eager or because an earlier replay over these plies already paid for
-        // it. This is the cache that makes lazy generation worth doing.
-        let mut needed = false;
+        // it. This is the cache that makes lazy generation worth doing. The scan
+        // also finds the lowest ply that needs deltas, which is as far down as
+        // the walk has to go.
+        let mut lowest = usize::MAX;
         for p in from_ply..=to_ply {
             let e = &self.stack[p];
             if e.mv != NO_MOVE && !e.deltas_valid {
-                needed = true;
+                lowest = p;
                 break;
             }
         }
-        if !needed {
+        if lowest == usize::MAX {
             return true;
         }
 
-        let mut st = crate::threats::PieceState::from_board(board);
-        for p in (from_ply..=to_ply).rev() {
-            let e = &self.stack[p];
-            if e.mv != NO_MOVE {
-                crate::threats::undo_move_state(&mut st, e.moved_color, e.mv, e.captured);
-            }
-        }
-
+        let pp_on = self.pp_features > 0;
         let mut scratch = std::mem::take(&mut self.scratch);
+        let mut pp = std::mem::take(&mut self.pp_scratch);
         let mut ok = true;
-        for p in from_ply..=to_ply {
-            let (mv, captured, color, valid) = {
+
+        // The scratch state is needed unless the whole job is one quiet ply at
+        // the top. When it is needed, copy it HERE, before the top ply's first
+        // step runs off the live board: the copy is a burst of wide stores,
+        // and stepping it back (a narrow read-modify-write of the same bytes)
+        // straight after them stalls on store forwarding. Copying first lets
+        // those stores drain behind the generator calls of the first step.
+        let top_plain_quiet = {
+            let e = &self.stack[to_ply];
+            let f = move_flags(e.mv);
+            lowest == to_ply && e.mv != NO_MOVE && !e.deltas_valid
+                && f != FLAG_CASTLE && f != FLAG_EN_PASSANT && !is_promotion(e.mv)
+                && e.captured == NO_PIECE_TYPE
+        };
+        let mut st = if top_plain_quiet {
+            crate::threats::PieceState::EMPTY
+        } else {
+            crate::threats::PieceState::from_board(board)
+        };
+        // False while the walk is at the top ply, whose post-move state is the
+        // live board itself (and equal to `st`), so its first step reads the
+        // board in place; true once `st` has been stepped below it.
+        let mut stepped = false;
+
+        for p in (lowest..=to_ply).rev() {
+            let (mv, captured, color, pt_post, valid) = {
                 let e = &self.stack[p];
-                (e.mv, e.captured, e.moved_color, e.deltas_valid)
+                (e.mv, e.captured, e.moved_color, e.moved_pt, e.deltas_valid)
             };
             if mv == NO_MOVE {
                 continue;
             }
-            // Always replayed, because even an entry whose deltas are already
-            // cached has to advance `st` past its move. Regenerating a cached
-            // entry's deltas and discarding them only happens on a partially
-            // covered span, which is rare and at most a ply or two wide.
-            // Pawn-pair deltas come from the state BEFORE the move, so they
-            // must be generated ahead of replay_move_deltas, which advances
-            // `st`. Same generator as the eager path, so the two agree by
-            // construction.
-            if self.pp_features > 0 && !valid {
-                let mut pp = std::mem::take(&mut self.pp_scratch);
-                crate::pawn_pair::push_pawn_pair_deltas(
-                    &mut pp, st.pieces[crate::types::PAWN as usize], &st.colors,
-                    color, mv, captured,
-                    st.mailbox[crate::types::move_from(mv) as usize]);
-                self.pp_delta[p].copy_from_slice(&pp);
-                self.pp_scratch = pp;
+            if valid {
+                // Cached already (a partially covered span, rare: the two
+                // perspectives' ancestors differ): only step past it.
+                crate::threats::undo_move_state(&mut st, color, mv, captured);
+                stepped = true;
+                continue;
             }
-            crate::threats::replay_move_deltas(&mut st, color, mv, captured, &mut scratch);
-            if !valid {
-                let e = &mut self.stack[p];
-                e.delta.copy_from_slice(&scratch);
-                e.deltas_valid = true;
-                if e.delta.overflowed() {
-                    ok = false;
+
+            scratch.clear();
+            let post = if stepped {
+                crate::threats::PieceView::of_state(&st)
+            } else {
+                crate::threats::PieceView::of_board(board)
+            };
+            crate::threats::emit_post_move_deltas(
+                post, &board.castle_rooks, color, mv, pt_post, &mut scratch);
+
+            if top_plain_quiet {
+                // The only ply, and quiet: fully emitted by its post-move step,
+                // so no scratch state was made. Pawn-pair deltas read the
+                // PRE-move pawn set, which differs from the board only in the
+                // moving pawn's two squares.
+                debug_assert!(p == to_ply && !stepped);
+                if pp_on {
+                    if pt_post == PAWN {
+                        let fromto = (1u64 << move_from(mv)) | (1u64 << move_to(mv));
+                        let mut colors = board.colors;
+                        colors[color as usize] ^= fromto;
+                        crate::pawn_pair::push_pawn_pair_deltas(
+                            &mut pp, board.pieces[PAWN as usize] ^ fromto, &colors,
+                            color, mv, captured, PAWN);
+                        self.pp_delta[p].copy_from_slice(&pp);
+                    } else {
+                        self.pp_delta[p].clear();
+                    }
                 }
+            } else {
+                crate::threats::unreplay_move_deltas(
+                    &mut st, color, mv, captured, pt_post, &mut scratch);
+                stepped = true;
+                // `st` is now this ply's pre-move state, which is what the
+                // pawn-pair generator reads.
+                if pp_on {
+                    let flags = move_flags(mv);
+                    let pt_pre = if flags == FLAG_CASTLE {
+                        KING
+                    } else if is_promotion(mv) {
+                        PAWN
+                    } else {
+                        pt_post
+                    };
+                    crate::pawn_pair::push_pawn_pair_deltas(
+                        &mut pp, st.pieces[PAWN as usize], &st.colors,
+                        color, mv, captured, pt_pre);
+                    self.pp_delta[p].copy_from_slice(&pp);
+                }
+            }
+
+            let e = &mut self.stack[p];
+            e.delta.copy_from_slice(&scratch);
+            e.deltas_valid = true;
+            if e.delta.overflowed() {
+                ok = false;
             }
         }
         self.scratch = scratch;
+        self.pp_scratch = pp;
         ok
     }
 
