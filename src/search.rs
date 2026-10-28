@@ -2229,6 +2229,19 @@ impl SearchInfo {
                                 }
                             },
                         );
+                        // Pawn-pair rows share the threat weight array above the
+                        // threat block; refresh appends them, so the scratch sum
+                        // must too or every pawn-pair net reads as a mismatch.
+                        if self.threat_stack.pp_features > 0 {
+                            crate::pawn_pair::enumerate_pawn_pairs(
+                                board.pieces[PAWN as usize], &board.colors, pov, mirrored,
+                                |pp_idx| {
+                                    if ni < crate::threat_accum::MAX_ACTIVE_THREAT_FEATURES {
+                                        indices[ni] = net.num_threat_features + pp_idx; ni += 1;
+                                    } else { overflow = true; }
+                                },
+                            );
+                        }
                         let mut check = [0i16; crate::threat_accum::MAX_FT_SIZE];
                         crate::threats::add_weight_rows(
                             &mut check[..h], &net.threat_weights, h, &indices[..ni]);

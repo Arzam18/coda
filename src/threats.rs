@@ -1074,9 +1074,9 @@ fn threat_index_bullet_ref(
         + tables.ray_rank[attacker][from_f][to_f] as i32
 }
 
-/// Byte-exact match of Bullet's post-C8fix-2 `map_features` (required for net interop)
-/// (`bullet/crates/bullet_lib/src/game/inputs/chess_threats.rs` lines 374-578,
-/// commit 62931d1 + a8e2c7d).
+/// Byte-exact reference for the trainer's threat-input encoding as of the
+/// C8fix-2 change (required for net interop: training and inference must
+/// enumerate identical feature indices).
 ///
 /// Bullet operates in **bf-frame** internally (bulletformat rank-flips
 /// bitboards and color-swaps when real STM = Black). It compensates for
