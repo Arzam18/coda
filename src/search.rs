@@ -8336,7 +8336,17 @@ pub const BENCH_PATHOLOGY_POSITIONS: &[&str] = &[
 
 /// Run bench: fixed-depth search on standard positions, return total nodes.
 pub fn bench(depth: i32, nnue_path: Option<&str>) -> u64 {
-    bench_inner(depth, nnue_path, true)
+    bench_inner(depth, nnue_path, true, None).0
+}
+
+/// Bench that also returns the time spent searching, excluding net load and
+/// table setup. `coda bench` reports NPS from this, so the figure is search
+/// speed and does not move with startup cost (e.g. the SharedWeights publish).
+/// With a barrier, every thread loads its net first and they start searching
+/// together, so the slowest thread's duration is the aggregate wall-clock.
+pub fn bench_timed(depth: i32, nnue_path: Option<&str>, print_stats: bool,
+                   start_together: Option<&std::sync::Barrier>) -> (u64, std::time::Duration) {
+    bench_inner(depth, nnue_path, print_stats, start_together)
 }
 
 /// Run pathology bench: per-position node + wall-clock report. Returns
@@ -8390,10 +8400,11 @@ pub fn bench_pathology(depth: i32, node_threshold: u64, nnue_path: Option<&str>)
 
 /// Run bench without printing stats (for multi-threaded bench).
 pub fn bench_silent(depth: i32, nnue_path: Option<&str>) -> u64 {
-    bench_inner(depth, nnue_path, false)
+    bench_inner(depth, nnue_path, false, None).0
 }
 
-fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
+fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool,
+               start_together: Option<&std::sync::Barrier>) -> (u64, std::time::Duration) {
     let positions = BENCH_POSITIONS;
 
     let mut info = SearchInfo::new(16);
@@ -8422,6 +8433,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         ..SearchLimits::new()
     };
 
+    if let Some(b) = start_together { b.wait(); }
+    let search_start = std::time::Instant::now();
     for fen in positions {
         let mut board = Board::from_fen(fen);
         info.nodes = 0;
@@ -8450,7 +8463,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         }
     }
 
-    if !print_stats { return total_nodes; }
+    let search_time = search_start.elapsed();
+    if !print_stats { return (total_nodes, search_time); }
 
     // Print pruning stats (accumulated across all positions)
     let s = &total_stats;
@@ -8642,7 +8656,7 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         crate::threats::refresh_stats::report();
     }
 
-    total_nodes
+    (total_nodes, search_time)
 }
 
 fn reset_bench_position_state(info: &mut SearchInfo) {

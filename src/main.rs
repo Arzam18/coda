@@ -734,35 +734,36 @@ fn main() {
             // search keeps reading the old cached table. Mirror UCI setoption
             // behavior in src/uci.rs.
             if lmr_c_changed { search::init_lmr(); }
-            let start = std::time::Instant::now();
+            // NPS is search time only: net load and table setup happen before
+            // the clock starts (see search::bench_timed), so the figure OB
+            // scales time controls by tracks in-game search speed.
             if threads <= 1 {
-                let nodes = search::bench(depth, nnue_path);
-                let elapsed = start.elapsed();
+                let (nodes, elapsed) = search::bench_timed(depth, nnue_path, true, None);
                 let nps = if elapsed.as_secs_f64() > 0.0 {
                     (nodes as f64 / elapsed.as_secs_f64()) as u64
                 } else { 0 };
                 println!("\n{} nodes {} nps", nodes, nps);
             } else {
                 let nnue_owned = nnue_path.map(|s| s.to_string());
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
                 // Thread 0 runs with stats printed (info lines, per-position
                 // progress, EBF/FMC summary); other threads run silent to
                 // avoid interleaved output. Final aggregate line printed at
                 // the end.
-                let handles: Vec<_> = (0..threads).enumerate().map(|(i, _)| {
+                let handles: Vec<_> = (0..threads).map(|i| {
                     let np = nnue_owned.clone();
+                    let b = barrier.clone();
                     std::thread::spawn(move || {
-                        if i == 0 {
-                            search::bench(depth, np.as_deref())
-                        } else {
-                            search::bench_silent(depth, np.as_deref())
-                        }
+                        search::bench_timed(depth, np.as_deref(), i == 0, Some(&b))
                     })
                 }).collect();
                 let mut total_nodes = 0u64;
+                let mut elapsed = std::time::Duration::ZERO;
                 for h in handles {
-                    total_nodes += h.join().unwrap();
+                    let (n, t) = h.join().unwrap();
+                    total_nodes += n;
+                    elapsed = elapsed.max(t);
                 }
-                let elapsed = start.elapsed();
                 let nps = if elapsed.as_secs_f64() > 0.0 {
                     (total_nodes as f64 / elapsed.as_secs_f64()) as u64
                 } else { 0 };
