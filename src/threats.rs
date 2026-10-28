@@ -586,8 +586,22 @@ impl ThreatPair {
 struct ThreatTables {
     pairs: [[ThreatPair; NUM_COLORED_PIECES]; NUM_COLORED_PIECES],
     from_offset: [[i32; 64]; NUM_COLORED_PIECES],
-    ray_rank: [[[u8; 64]; 64]; NUM_COLORED_PIECES],
+    /// Empty-board attack set per attacker and from-square; `ray_rank` derives
+    /// a target's rank from it. 6 KB, replacing a precomputed
+    /// `[cp][from][to]` rank table of 48 KB — the size of Zen 5's whole L1d —
+    /// whose loads sat between each decoded delta and its weight-row prefetch.
+    empty_attacks: [[Bitboard; 64]; NUM_COLORED_PIECES],
     num_features: usize,
+}
+
+impl ThreatTables {
+    /// Rank of `to` within the attacker's empty-board target set from `from`:
+    /// how many of its target squares are numbered below `to`.
+    #[inline(always)]
+    fn ray_rank(&self, attacker: usize, from: usize, to: usize) -> i32 {
+        let below = (1u64 << to).wrapping_sub(1);
+        (self.empty_attacks[attacker][from] & below).count_ones() as i32
+    }
 }
 
 // Two feature spaces are built at startup and the loaded net selects one:
@@ -821,7 +835,7 @@ pub fn init_threats() {
 fn build_threat_tables(king_attacker: bool) -> ThreatTables {
     let mut pairs = [[ThreatPair::default(); NUM_COLORED_PIECES]; NUM_COLORED_PIECES];
     let mut from_offset = [[0i32; 64]; NUM_COLORED_PIECES];
-    let mut ray_rank = [[[0u8; 64]; 64]; NUM_COLORED_PIECES];
+    let mut empty_attacks = [[0u64; 64]; NUM_COLORED_PIECES];
 
     // Per colored piece: `slots` = number of (from-square, attack-target)
     // slots it can occupy; `block_base` = first feature index of the piece's
@@ -874,19 +888,13 @@ fn build_threat_tables(king_attacker: bool) -> ThreatTables {
         }
     }
 
-    // Per attacker + from-square: rank of each to-square within the ray order
-    // (how many of the attacker's target squares precede it).
     for cp in 0..NUM_COLORED_PIECES {
         for from in 0..64u32 {
-            let attacks = piece_attacks_empty(cp, from);
-            for to in 0..64u32 {
-                let below = if to > 0 { (1u64 << to) - 1 } else { 0 };
-                ray_rank[cp][from as usize][to as usize] = popcount(below & attacks) as u8;
-            }
+            empty_attacks[cp][from as usize] = piece_attacks_empty(cp, from);
         }
     }
 
-    ThreatTables { pairs, from_offset, ray_rank, num_features }
+    ThreatTables { pairs, from_offset, empty_attacks, num_features }
 }
 
 /// Compute a single threat feature index.
@@ -924,7 +932,7 @@ pub fn threat_index(
 
     pair.base
         + tables.from_offset[attacker][from_f]
-        + tables.ray_rank[attacker][from_f][to_f] as i32
+        + tables.ray_rank(attacker, from_f, to_f)
 }
 
 /// Enumerate all threat features active in a position.
@@ -1071,7 +1079,7 @@ fn threat_index_bullet_ref(
     let to_f = (to_phys ^ flip) as usize;
     pair.base
         + tables.from_offset[attacker][from_f]
-        + tables.ray_rank[attacker][from_f][to_f] as i32
+        + tables.ray_rank(attacker, from_f, to_f)
 }
 
 /// Byte-exact match of Bullet's post-C8fix-2 `map_features` (required for net interop)
@@ -2140,7 +2148,7 @@ unsafe fn apply_threat_deltas_dual_body(
         let to_w = (to ^ flip_w) as usize;
         let idx_w = pair_w.base
             + tables.from_offset[attacker][from_w]
-            + tables.ray_rank[attacker][from_w][to_w] as i32;
+            + tables.ray_rank(attacker, from_w, to_w);
         debug_assert!(!pair_w.skip(from, to) && (idx_w as usize) < num_threats);
         unsafe {
             adds_w_ptr.add(n_adds_w).write(idx_w as usize);
@@ -2157,7 +2165,7 @@ unsafe fn apply_threat_deltas_dual_body(
         let to_b = (to ^ flip_b) as usize;
         let idx_b = pair_b.base
             + tables.from_offset[attacker_b][from_b]
-            + tables.ray_rank[attacker_b][from_b][to_b] as i32;
+            + tables.ray_rank(attacker_b, from_b, to_b);
         debug_assert!(!pair_b.skip(from, to) && (idx_b as usize) < num_threats);
         unsafe {
             adds_b_ptr.add(n_adds_b).write(idx_b as usize);
