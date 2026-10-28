@@ -1248,6 +1248,7 @@ prune_stats! {
     tt_cross_gen_cutoffs: u64,
     tt_cutoffs: u64,
     tt_near_miss: u64,
+    tt_bound_decays: u64,
     nmp_attempts: u64,
     nmp_cutoffs: u64,
     nmp_verify: u64,
@@ -2506,7 +2507,7 @@ fn tt_cutoff_child_disagrees(
     depth: i32,
     ply: i32,
 ) -> bool {
-    if depth < 7 || tt_move == NO_MOVE || is_decisive(tt_score) {
+    if depth < crate::tt::TT_DEEP_ENTRY_DEPTH || tt_move == NO_MOVE || is_decisive(tt_score) {
         return false;
     }
     // Full legality validation before speculatively making the move (stale TT
@@ -5730,6 +5731,20 @@ fn negamax(
                 // from the post-mate-dist window. alpha here is still
                 // alpha_orig — TT narrowing happens after this check.
                 let tt_cut_is_pv = beta - alpha > 1;
+                // Wrong-bound decay. The entry is deep enough to decide this
+                // node but bounded on the other side of beta, so it cannot
+                // cut and only takes a slot that a usable entry could hold.
+                // Lower its stored depth by one ply: an entry that keeps
+                // being reached from windows it cannot answer loses its
+                // replacement priority a ply at a time, while one that does
+                // cut is never touched. Same "stale deep entries should not
+                // be trusted at full weight" reasoning as the child check
+                // below, gated at the same node depth.
+                if !tt_cut_is_pv && !bound_matches && depth >= crate::tt::TT_DEEP_ENTRY_DEPTH
+                    && info.tt.decay_wrong_bound(board.hash, tt_depth, tt_entry.flag)
+                {
+                    info.stats.tt_bound_decays += 1;
+                }
                 // Child-consistency verification for DEEP cutoffs (concept
                 // from SF, independently re-implemented): at depth>=7,
                 // make the TT move, probe the child's entry, unmake; decline
@@ -8655,6 +8670,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool,
         s.tt_cross_gen_cutoffs,
         if s.tt_cutoffs > 0 { s.tt_cross_gen_cutoffs as f64 / s.tt_cutoffs as f64 * 100.0 } else { 0.0 });
     eprintln!("TT near-miss:   {:>8}", s.tt_near_miss);
+    eprintln!("TT bound decay: {:>8}  ({:.2}% of TT hits)", s.tt_bound_decays,
+        if s.tt_hits > 0 { s.tt_bound_decays as f64 / s.tt_hits as f64 * 100.0 } else { 0.0 });
     // Root aspiration failures. These were accumulated but never printed, so
     // nobody had seen that ~75% of windows fail their first search (2026-09-06
     // audit). Games say the narrow window is optimal regardless -- the
