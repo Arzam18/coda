@@ -1602,6 +1602,12 @@ pub struct SearchInfo {
     /// byte-identical.
     pub root_ban: Vec<Move>,
     static_evals: [i32; MAX_PLY + 1],
+    /// Checkers handed from parent to child: slot `ply` holds the hash of the
+    /// position the parent reached at that ply and its checker set, which the
+    /// parent computes anyway (`gives_check`). The child reuses it only on an
+    /// exact hash match, so a null-move child, a position the parent never
+    /// wrote, or a stale slot falls back to `Board::checkers`.
+    checkers_hint: [(u64, Bitboard); MAX_PLY + 1],
     /// Per-ply tt_pv, so a child can inherit its parent's PV-region flag.
     tt_pv_stack: [bool; MAX_PLY + 1],
     /// LMR reduction applied at each ply (for hindsight reduction gating)
@@ -1739,6 +1745,7 @@ impl SearchInfo {
             trace_line_mv: Vec::new(),
             nmp_min_ply: 0,
             static_evals: [0; MAX_PLY + 1],
+            checkers_hint: [(0, 0); MAX_PLY + 1],
             tt_pv_stack: [false; MAX_PLY + 1],
             reductions: [0; MAX_PLY + 1],
             excluded_move: [NO_MOVE; MAX_PLY + 1],
@@ -2584,6 +2591,65 @@ fn cont_corr_value(info: &SearchInfo, ply: usize) -> i64 {
     sum
 }
 
+/// Prefetch the five correction-history rows `correction_value` will read
+/// for this position. Every index derives from board state (and the move
+/// stacks) available at node entry, so the fetch overlaps the TT probe and
+/// the NNUE eval that precede the read. Prefetch-only: never a correctness
+/// path. No-op off x86_64.
+#[inline(always)]
+fn prefetch_corr_rows(info: &SearchInfo, board: &Board, ply: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let stm = board.side_to_move as usize;
+        unsafe {
+            let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
+            _mm_prefetch(&info.corr.pawn[stm][pawn_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+            let wnp_idx = (board.non_pawn_key[WHITE as usize] as usize) & (CORR_HIST_SIZE - 1);
+            _mm_prefetch(&info.corr.np[stm][WHITE as usize][wnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+            let bnp_idx = (board.non_pawn_key[BLACK as usize] as usize) & (CORR_HIST_SIZE - 1);
+            _mm_prefetch(&info.corr.np[stm][BLACK as usize][bnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+            if let Some(last) = board.undo_stack.last() {
+                if last.mv != NO_MOVE {
+                    let trans_idx = ((board.hash ^ last.hash) as usize) & (CORR_HIST_SIZE - 1);
+                    _mm_prefetch(&info.corr.trans[stm][trans_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+                }
+            }
+            // cont_corr rows: same index derivation as cont_corr_value.
+            if ply >= 2 {
+                let cur_p = info.moved_piece_stack[ply - 1] as usize;
+                let cur_t = info.moved_to_stack[ply - 1] as usize;
+                if cur_p != 0 && cur_p < 13 && cur_t < 64 {
+                    for off in [2usize, 4] {
+                        if ply >= off {
+                            let pp = info.moved_piece_stack[ply - off] as usize;
+                            let pt = info.moved_to_stack[ply - off] as usize;
+                            if pp != 0 && pp < crate::movepicker::CONT_PLANES && pt < 64 {
+                                _mm_prefetch(&info.corr.cont[pp][pt][cur_p][cur_t] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (info, board, ply);
+}
+
+/// This node's checker set: the parent's hint when it is for this exact
+/// position (see `SearchInfo::checkers_hint`), else computed fresh.
+#[inline(always)]
+fn checkers_for_node(info: &SearchInfo, board: &Board, ply: usize) -> Bitboard {
+    match info.checkers_hint.get(ply) {
+        Some(&(key, chk)) if key == board.hash => {
+            debug_assert_eq!(chk, board.checkers(), "stale checkers hint at ply {}", ply);
+            chk
+        }
+        _ => board.checkers(),
+    }
+}
+
 /// Compute the correction value alone (the centipawn delta corrhist would apply
 /// to raw eval). Used by SE-margin formulas to gate extension confidence on
 /// |correction| — a larger correction lowers the double-extension margin,
@@ -2604,9 +2670,25 @@ fn correction_value(info: &SearchInfo, board: &Board, ply: usize) -> i32 {
             info.corr.trans[stm][trans_idx].load(Ordering::Relaxed) as i64
         } else { 0 }
     } else { 0 };
-    let total_corr = (pawn_corr * tp(&CORR_W_PAWN) as i64 + white_np_corr * tp(&CORR_W_NP) as i64 + black_np_corr * tp(&CORR_W_NP) as i64
-        + cont_corr * tp(&CORR_W_CONT) as i64 + trans_corr * tp(&CORR_W_TRANS) as i64) / tp(&CORR_HIST_DIV) as i64;
-    (total_corr as i32) / tp(&CORR_HIST_GRAIN_T)
+    // i32 throughout, one divide by DIV * GRAIN. Bit-identical to the former
+    // i64 sum followed by two divides in series:
+    // - truncating division with positive divisors satisfies
+    //   (x / a) / b == x / (a * b);
+    // - every entry is bounded by CORR_HIST_LIMIT (cont contributes two) and
+    //   setoption clamps each weight to its tunable range, so |sum| stays far
+    //   below i32::MAX (`corr_blend_fits_i32` checks the bound from the live
+    //   ranges).
+    // Why it matters: LLVM guarded the i64 divide with a "fits in 32 bits?"
+    // test that every NEGATIVE correction fails, a ~50/50 data-dependent
+    // branch that also sent half the calls down the slow 64-bit divide, and
+    // the second divide was serial behind it on the static-eval chain.
+    let weighted = pawn_corr as i32 * tp(&CORR_W_PAWN)
+        + white_np_corr as i32 * tp(&CORR_W_NP)
+        + black_np_corr as i32 * tp(&CORR_W_NP)
+        + cont_corr as i32 * tp(&CORR_W_CONT)
+        + trans_corr as i32 * tp(&CORR_W_TRANS);
+    let divisor = tp(&CORR_HIST_DIV).max(1) * tp(&CORR_HIST_GRAIN_T).max(1);
+    weighted / divisor
 }
 
 /// Apply correction history to raw static eval.
@@ -3606,6 +3688,7 @@ pub(crate) fn search_helper(board: &mut Board, info: &mut SearchInfo, _limits: &
     // NOT clear it here. Reset only per-search scratch state.
     info.stats = PruneStats::default();
     info.static_evals = [0; MAX_PLY + 1];
+    info.checkers_hint = [(0, 0); MAX_PLY + 1];
     info.reductions = [0; MAX_PLY + 1];
     info.excluded_move = [NO_MOVE; MAX_PLY + 1];
     info.moved_piece_stack = [0; MAX_PLY + 1];
@@ -3950,6 +4033,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     }
     // Clear static evals, excluded moves, depth tracking
     info.static_evals = [0; MAX_PLY + 1];
+    info.checkers_hint = [(0, 0); MAX_PLY + 1];
     info.depth_nodes = [0; MAX_PLY + 1];
     info.completed_depth = 0;
     // Reset the shared instant-reply gate inputs for THIS search. The UCI
@@ -5486,41 +5570,7 @@ fn negamax(
     // All indices derive from board state available right now. Wasted on
     // TT-cutoff / in-check exits — measured +0.5% median cycles, 63/100
     // positive pairs, sign-test p=0.006 (same-binary toggle protocol).
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        let stm = board.side_to_move as usize;
-        unsafe {
-            let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.corr.pawn[stm][pawn_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-            let wnp_idx = (board.non_pawn_key[WHITE as usize] as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.corr.np[stm][WHITE as usize][wnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-            let bnp_idx = (board.non_pawn_key[BLACK as usize] as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.corr.np[stm][BLACK as usize][bnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-            if let Some(last) = board.undo_stack.last() {
-                if last.mv != NO_MOVE {
-                    let trans_idx = ((board.hash ^ last.hash) as usize) & (CORR_HIST_SIZE - 1);
-                    _mm_prefetch(&info.corr.trans[stm][trans_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-                }
-            }
-            // cont_corr rows: same index derivation as cont_corr_value.
-            if ply_u >= 2 {
-                let cur_p = info.moved_piece_stack[ply_u - 1] as usize;
-                let cur_t = info.moved_to_stack[ply_u - 1] as usize;
-                if cur_p != 0 && cur_p < 13 && cur_t < 64 {
-                    for off in [2usize, 4] {
-                        if ply_u >= off {
-                            let pp = info.moved_piece_stack[ply_u - off] as usize;
-                            let pt = info.moved_to_stack[ply_u - off] as usize;
-                            if pp != 0 && pp < crate::movepicker::CONT_PLANES && pt < 64 {
-                                _mm_prefetch(&info.corr.cont[pp][pt][cur_p][cur_t] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    prefetch_corr_rows(info, board, ply_u);
     let tt_cur_gen = info.tt.current_generation();
     let tt_cross_gen = tt_hit && tt_entry.generation != tt_cur_gen;
     info.stats.tt_probes += 1;
@@ -5767,9 +5817,10 @@ fn negamax(
 
     // (Leaf-node quiescence dispatch happens at the top of negamax.)
 
-    // Compute pinned, checkers, in_check
-    let pinned = board.pinned();
-    let checkers = board.checkers();
+    // Compute checkers, in_check. `pinned` is computed later, just before
+    // ProbCut: only the move loops read it, so the RFP / NMP / razoring exits
+    // above that point never pay for the pin scan.
+    let checkers = checkers_for_node(info, board, ply_u);
     let in_check = checkers != 0;
 
     // Compute static eval for pruning and LMR improving detection.
@@ -6189,6 +6240,11 @@ fn negamax(
 
     // (RFP moved above NMP — see pre-NMP site.)
 
+    // First reader of `pinned` (ProbCut, then the main move loop). The board
+    // is back in this node's position after NMP / razoring, so this equals the
+    // value it would have had at node entry.
+    let pinned = board.pinned();
+
     // ProbCut: at moderate+ depths, if a shallow search of captures with
     // raised beta confirms the position is winning, prune the node.
     //
@@ -6430,8 +6486,10 @@ fn negamax(
             continue;
         }
 
-        // Legality check: evasion picker returns legal moves, non-evasion needs explicit check
-        if !in_check && !board.is_legal(mv, pinned, checkers) {
+        // Legality check: evasion picker returns legal moves, non-evasion needs explicit check.
+        // Not in check here, so king moves are tested against the enemy-attack
+        // map this node already holds (exact without checkers; see the method).
+        if !in_check && !board.is_legal_unchecked_side(mv, pinned, enemy_attacks) {
             continue;
         }
 
@@ -6745,8 +6803,14 @@ let singular_beta = tt_score_local - depth;
             info.threat_stack.absorb_deltas(board);
         }
 
-        // Check if move gives check (opponent is now in check after make_move)
-        let gives_check = board.in_check();
+        // Check if move gives check (opponent is now in check after make_move).
+        // The child at ply + 1 reads the same checker set from the hint slot
+        // instead of recomputing it.
+        let child_checkers = board.checkers();
+        let gives_check = child_checkers != 0;
+        if ply_u + 1 <= MAX_PLY {
+            info.checkers_hint[ply_u + 1] = (board.hash, child_checkers);
+        }
 
         let extension = 0;
         // `extension` is 0: there is no promotion-imminent (7th-rank pawn
@@ -7806,7 +7870,9 @@ fn quiescence_with_depth(
         return apply_halfmove_scale(info.eval(board), board.halfmove);
     }
 
-    // Prefetch TT bucket early
+    // Prefetch TT bucket early. (No correction-row prefetch here, unlike
+    // negamax: measured no gain on the stand-pat read, and it would fetch
+    // five lines at every TT-cutoff and in-check QS node.)
     info.tt.prefetch(board.hash);
 
     info.nodes += 1;
@@ -7874,14 +7940,16 @@ fn quiescence_with_depth(
         }
     }
 
-    // Check detection
-    let qs_pinned = board.pinned();
-    let qs_checkers = board.checkers();
+    // Check detection. The pin scan is deferred to the two move loops below
+    // (evasions, captures): most quiescence nodes leave at stand-pat and never
+    // read it.
+    let qs_checkers = checkers_for_node(info, board, ply as usize);
     let qs_in_check = qs_checkers != 0;
 
     // When in check, generate all evasion moves using main MovePicker
     // Full history scoring for quiet evasions
     if qs_in_check {
+        let qs_pinned = board.pinned();
         let qs_prev_move = if !board.undo_stack.is_empty() {
             board.undo_stack[board.undo_stack.len() - 1].mv
         } else {
@@ -8115,6 +8183,8 @@ fn quiescence_with_depth(
     if !FEAT_QS_CAPTURES.load(Ordering::Relaxed) {
         return best_score;
     }
+
+    let qs_pinned = board.pinned();
 
     // Use main MovePicker in quiescence mode.
     // This partitions captures into good (SEE>=0) and bad, and uses staged ordering.
@@ -8682,6 +8752,27 @@ pub(crate) fn test_net_path() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `correction_value` blends in i32. That is exact only while the largest
+    /// possible weighted sum fits: every entry at CORR_HIST_LIMIT (the cont
+    /// source sums two entries) and every weight at the top of its tunable
+    /// range, which is the most setoption can store. Also checks the fused
+    /// divisor. Fails if a range is widened past what i32 can hold.
+    #[test]
+    fn corr_blend_fits_i32() {
+        let max_of = |name: &str| -> i64 {
+            tunable_params().into_iter().find(|t| t.0 == name)
+                .unwrap_or_else(|| panic!("tunable {} missing", name)).4 as i64
+        };
+        let lim = CORR_HIST_LIMIT as i64;
+        let worst = lim * max_of("CORR_W_PAWN")
+            + 2 * lim * max_of("CORR_W_NP")
+            + 2 * lim * max_of("CORR_W_CONT")
+            + lim * max_of("CORR_W_TRANS");
+        assert!(worst < i32::MAX as i64, "corr blend can overflow i32: {}", worst);
+        let div = max_of("CORR_HIST_DIV") * max_of("CORR_HIST_GRAIN_T");
+        assert!(div < i32::MAX as i64, "fused corr divisor overflows i32: {}", div);
+    }
 
     // Supply WDL through the real cache, and raw eval through the TT. These
     // tests need neither tablebase files nor an NNUE net. Any unexpected

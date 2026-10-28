@@ -999,6 +999,42 @@ impl Board {
         true
     }
 
+    /// `is_legal` for a side to move that is NOT in check, reusing the
+    /// enemy-attack map the caller already holds (`attacks_by_color(them)`,
+    /// computed with the full occupancy). Assumes `mv` is pseudo-legal.
+    ///
+    /// Why the map is exact for king moves here: `is_legal` tests the king's
+    /// destination with the king lifted from the occupancy, so that a king
+    /// stepping back along a checking slider's ray is caught. Lifting the king
+    /// can only extend a slider ray that currently ENDS on the king, i.e. a
+    /// slider giving check. With no checkers, every enemy attack set is the
+    /// same with or without our king on the board, so `to` is attacked after
+    /// the move iff it is in `enemy_attacks` now. Leaper attacks never depend
+    /// on occupancy. The move-loop in `negamax` already holds this map for
+    /// history indexing, so the king test costs one AND instead of a full
+    /// `attackers_to` (two slider lookups plus four leaper tables).
+    ///
+    /// Everything else mirrors `is_legal` with `checkers == 0`: en passant
+    /// and castling keep their full special-case tests, and a pinned piece may
+    /// only move along its pin line.
+    #[inline(always)]
+    pub fn is_legal_unchecked_side(&self, mv: Move, pinned: Bitboard, enemy_attacks: Bitboard) -> bool {
+        let from = move_from(mv) as u32;
+        let to = move_to(mv) as u32;
+        let flags = move_flags(mv);
+        if flags == FLAG_EN_PASSANT || flags == FLAG_CASTLE {
+            return self.is_legal(mv, pinned, 0);
+        }
+        let king_bb = self.pieces[KING as usize] & self.colors[self.side_to_move as usize];
+        if king_bb & (1u64 << from) != 0 {
+            return enemy_attacks & (1u64 << to) == 0;
+        }
+        if pinned & (1u64 << from) != 0 {
+            return line(from, self.king_sq(self.side_to_move) as u32) & (1u64 << to) != 0;
+        }
+        true
+    }
+
     /// Precompute `castle_path` / `castle_king_path` from the kings' start
     /// squares and `castle_rooks` (fixed for the game, so this runs once per
     /// FEN). Entries for rights not held are filled but never consulted.
@@ -2376,6 +2412,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `is_legal_unchecked_side` must agree with `is_legal` on every
+    /// pseudo-legal move of every position whose side to move is not in
+    /// check, and both must agree with the ground truth (make the move, is
+    /// the mover's king attacked?). Walks full trees to depth 3 from
+    /// positions rich in pins, king walks next to sliders, en passant
+    /// discovered checks and (Chess960) castling, then random playouts for
+    /// breadth.
+    #[test]
+    fn legality_from_enemy_attack_map_matches_is_legal() {
+        use crate::movegen::{generate_all_moves, generate_legal_moves};
+        init();
+
+        fn check_node(b: &mut Board) -> usize {
+            if b.checkers() != 0 { return 0; }
+            let pinned = b.pinned();
+            let them = flip_color(b.side_to_move);
+            let enemy_attacks = b.attacks_by_color(them);
+            let moves = generate_all_moves(b);
+            let mut n = 0;
+            for i in 0..moves.len {
+                let mv = moves.get(i);
+                let fast = b.is_legal_unchecked_side(mv, pinned, enemy_attacks);
+                let slow = b.is_legal(mv, pinned, 0);
+                assert_eq!(fast, slow, "fast/slow legality differ: fen={} mv={}", b.to_fen(), b.uci_move(mv));
+                let us = b.side_to_move;
+                let truth = if b.make_move(mv) {
+                    let ksq = b.king_sq(us) as u32;
+                    let ok = b.attackers_to(ksq, b.occupied()) & b.colors[flip_color(us) as usize] == 0;
+                    b.unmake_move();
+                    ok
+                } else { false };
+                // Castling legality also forbids passing through check, which
+                // the post-make king test cannot see; is_legal is the oracle there.
+                if move_flags(mv) != FLAG_CASTLE {
+                    assert_eq!(fast, truth, "legality wrong vs ground truth: fen={} mv={}", b.to_fen(), b.uci_move(mv));
+                }
+                n += 1;
+            }
+            n
+        }
+        fn walk(b: &mut Board, depth: u32) -> usize {
+            let mut n = check_node(b);
+            if depth == 0 { return n; }
+            let legal = generate_legal_moves(b);
+            for i in 0..legal.len {
+                b.make_move(legal.get(i));
+                n += walk(b, depth - 1);
+                b.unmake_move();
+            }
+            n
+        }
+
+        const FENS: &[&str] = &[
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            // Horizontal en-passant pin and kings in mutual opposition.
+            "8/8/8/K1pP3r/8/8/8/7k w - c6 0 2",
+            "8/8/3k4/8/3K4/8/8/8 w - - 0 1",
+            // King beside a long diagonal / file with pinned defenders.
+            "4k3/8/8/1b6/8/3N4/4K3/4r3 w - - 0 1",
+            "q3k3/8/8/8/4B3/8/6K1/8 w - - 0 1",
+            // Chess960 castling with the rook shielding the king path.
+            "1r2k1r1/pppppppp/8/8/8/8/PPPPPPPP/1R2K1R1 w GBgb - 0 1",
+        ];
+        let mut total = 0;
+        for fen in FENS {
+            let mut b = Board::from_fen(fen);
+            total += walk(&mut b, 3);
+        }
+
+        fn next_u32(state: &mut u32) -> u32 {
+            let mut x = *state;
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            *state = x; x
+        }
+        let mut rng = 0x1E6A1u32;
+        for fen in FENS {
+            for _ in 0..20 {
+                let mut b = Board::from_fen(fen);
+                for _ in 0..60 {
+                    total += check_node(&mut b);
+                    let legal = generate_legal_moves(&b);
+                    if legal.len == 0 { break; }
+                    b.make_move(legal.get((next_u32(&mut rng) as usize) % legal.len));
+                }
+            }
+        }
+        assert!(total > 100_000, "too few moves checked: {}", total);
     }
 
     /// A second occurrence at/before the root is not yet a draw claim.
