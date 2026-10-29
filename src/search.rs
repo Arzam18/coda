@@ -266,6 +266,25 @@ tunables!(
     // the full derivation.
     (NO_INC_MTG_BASE, 34, 20, 80, 4.0, false),
     (NO_INC_MTG_GROWTH_PCT, 94, 0, 200, 10.0, false),
+    // Cap on that growing divisor: never assume more moves left than a
+    // quarter of Coda's games still have. Fitted to the 75th percentile of
+    // moves remaining in Coda's own no-increment lichess games (both bots,
+    // June-October 2026, 3,898 games): fullmove 10/20/30/40/50/60/80 ->
+    // 61/52/46/42/40/36/31, i.e. cap = max(31, 64 - 0.5 * fullmove). The
+    // growth alone reached ~58 by move 60 (the 90th percentile there), and
+    // games ended with 40-53% of the clock unused at every no-increment TC;
+    // the cap first binds around move 43, so the opening and early
+    // middlegame are paced exactly as before.
+    (NO_INC_CAP_START, 64, 40, 90, 3.0, false),
+    (NO_INC_CAP_SLOPE_100, 50, 20, 100, 5.0, false),
+    (NO_INC_CAP_FLOOR, 31, 20, 50, 2.0, false),
+    // Clock held back from no-increment pacing once the cap binds, in ms.
+    // Every move costs ~10-16 ms of wall time however small its budget
+    // (measured in local 10+0 games, where pacing with no reserve flagged
+    // eight games past move 110 on that cost alone), so the reserve has to
+    // carry the long tail: 15 ms x 110 moves, the 99th percentile of moves
+    // still to play at fullmove 40-60 in the same lichess games = 1650 ms.
+    (NO_INC_RESERVE_MS, 1650, 0, 4000, 100.0, false),
     // TM window + factor constants. Coda's own parameters, tuned and validated
     // on Coda's own search and net; provenance in
     // docs/license_analysis_2026-07-13.md. All non-core, for the reason given
@@ -3349,9 +3368,24 @@ pub fn compute_tm_budgets(
     // Any change here needs both a forfeit count and a non-regression SPRT.
     let no_inc_mtg_base = tp(&NO_INC_MTG_BASE).max(1) as u64;
     let no_inc_growth_pct = tp(&NO_INC_MTG_GROWTH_PCT).max(0) as u64;
-    let no_inc_effective_mtg = no_inc_mtg_base
+    let no_inc_grown_mtg = no_inc_mtg_base
         + (fullmove as u64).saturating_sub(no_inc_mtg_base) * no_inc_growth_pct / 100;
+    // ...capped at the 75th percentile of moves actually left (NO_INC_CAP_*).
+    let no_inc_cap = (tp(&NO_INC_CAP_START) as i64
+        - tp(&NO_INC_CAP_SLOPE_100) as i64 * fullmove as i64 / 100)
+        .max(tp(&NO_INC_CAP_FLOOR).max(2) as i64) as u64;
+    let no_inc_effective_mtg = no_inc_grown_mtg.min(no_inc_cap);
     let mtg_divisor = if no_inc_sd { no_inc_effective_mtg.max(1) } else { default_moves_to_go };
+    // Once the cap binds, no-increment pacing never touches the last
+    // NO_INC_RESERVE_MS of the clock (at most half of it), so per-move latency
+    // in a very long game cannot drain it. Before that the growing divisor
+    // already holds far more back, and the early game stays exactly as it was.
+    let paced_time = if no_inc_sd && no_inc_cap < no_inc_grown_mtg {
+        let reserve = (tp(&NO_INC_RESERVE_MS).max(0) as u64).min(time_left / 2);
+        (time_left - reserve).max(1)
+    } else {
+        time_left
+    };
 
     let opt_time_base = if movestogo > 0 {
         // Movestogo: divisor is clamped to [2, default_mtg]. The increment
@@ -3363,7 +3397,8 @@ pub fn compute_tm_budgets(
         (computed.min(max_time) * opt_window_pct / 100).max(1)
     } else {
         // Sudden death (or with inc). Add 94% of inc to base computed window.
-        let computed = time_left / mtg_divisor + our_inc * inc_frac_pct / 100;
+        // paced_time == time_left except on the capped no-increment path.
+        let computed = paced_time / mtg_divisor + our_inc * inc_frac_pct / 100;
         ((computed.min(max_time) * opt_window_pct / 100).min(hard_time)).max(1)
     };
 
@@ -9760,6 +9795,42 @@ mod tests {
                 "ponder-on opt at t={} inc={} mtg={} fm={}: got {}, want {}",
                 t, inc, mtg, fm, opt_p, expected);
             assert!(opt_p >= opt_np);
+        }
+    }
+
+    /// Play a game where every move spends exactly its opt budget (factor
+    /// product 1.0, no ponder, a fixed per-move latency). Returns our clock in
+    /// ms after each move.
+    fn simulate_clock(base_ms: u64, inc_ms: u64, moves: u16, latency_ms: u64) -> Vec<u64> {
+        let mut clock = base_ms;
+        let mut out = Vec::new();
+        for fm in 1..=moves {
+            let (opt, _, _, _) = compute_tm_budgets(clock, inc_ms, 0, 100, fm, false, 0);
+            clock = clock.saturating_sub(opt + latency_ms) + inc_ms;
+            out.push(clock);
+        }
+        out
+    }
+
+    /// Without increment, a 200-move 1+0 game (the longest in Coda's lichess
+    /// history) with 15 ms of latency on every move must not flag.
+    #[test]
+    fn no_increment_long_game_never_flags() {
+        let clk = simulate_clock(60_000, 0, 200, 15);
+        assert!(clk.iter().all(|&c| c > 0), "1+0 clock ran out: last {:?}", &clk[200..]);
+    }
+
+    /// The no-increment cap leaves the opening and early middlegame exactly as
+    /// the growing divisor paced them: identical budgets up to move 40.
+    #[test]
+    fn no_increment_cap_leaves_early_game_unchanged() {
+        let (cap0, cap1, floor) = (tp(&NO_INC_CAP_START), tp(&NO_INC_CAP_SLOPE_100), tp(&NO_INC_CAP_FLOOR));
+        let base = tp(&NO_INC_MTG_BASE) as i64;
+        let growth = tp(&NO_INC_MTG_GROWTH_PCT) as i64;
+        for fm in 1..=40i64 {
+            let grown = base + (fm - base).max(0) * growth / 100;
+            let cap = (cap0 as i64 - cap1 as i64 * fm / 100).max(floor as i64);
+            assert!(cap >= grown, "cap binds at fm {}: {} < {}", fm, cap, grown);
         }
     }
 
