@@ -452,6 +452,19 @@ tunables!(
     (LMR_ROOT_THRESH, 15, 6, 30, 1.5, false),
     (LMR_ROOT_COEF_10X, 4, 0, 800, 40.0, true),
     (BAD_NOISY_MARGIN, 87, 30, 150, 6.0, true),
+    // BNFP optimistic-gain credit. The bound credits the captured piece at
+    // VICTIM_PCT% of its eval-unit value, i.e. see_value(victim) bridged by
+    // SEE_MATERIAL_SCALE exactly as the QS delta prune does, so the term is in
+    // the same units as static_eval and BAD_NOISY_MARGIN. (A June test credited
+    // raw see_value, which at SEE_MATERIAL_SCALE=211 is under half the victim's
+    // eval-unit worth.) Seeded at 100 = the full optimistic gain.
+    (BNFP_VICTIM_PCT, 100, 0, 150, 10.0, true),
+    // BNFP capture-history credit: capt_hist / DIV. Derivation: capt_hist is
+    // bounded by MAX_HISTORY = 16384, and one minor in eval units is
+    // see_value(KNIGHT) * SEE_MATERIAL_SCALE / 100 = 420 * 2.11 = 886, so
+    // 16384 / 886 = 18.5 -> 18 makes a maxed-out history worth about one minor
+    // (and a fully negative one take about one minor off the bound).
+    (BNFP_CAPT_HIST_DIV, 18, 6, 60, 3.0, true),
     (PROBCUT_MARGIN, 162, 80, 300, 11.0, true),
     // ProbCut margin reduction when improving (Stockfish/Alexandria shape):
     // improving positions verify against a lower beta, non-improving nodes
@@ -6829,11 +6842,20 @@ let singular_beta = tt_score_local - depth;
         // earlier still, right after the skip_quiets check — SF Step-14 order.)
 
         // Bad noisy pruning: skip losing captures when eval is far below alpha.
+        // The optimistic bound credits what the capture could gain: the
+        // victim's eval-unit value plus a capture-history term, so a losing
+        // QxR is not judged by the same bound as a losing QxP, and captures
+        // that have historically produced cutoffs keep a wider bound (the same
+        // signal the SEE-capture gate above already uses).
         // Applied before MakeMove. Direct-check carve-out: don't prune moves
         // that give direct check.
         if FEAT_BAD_NOISY.load(Ordering::Relaxed) && is_cap && !in_check && ply > 0 && depth <= tp10(&BAD_NOISY_DEPTH_10X) && mv != tt_move
             && !is_promo && !is_loss(best_score)
-            && static_eval > -INFINITY && static_eval + depth * tp(&BAD_NOISY_MARGIN) <= alpha
+            && static_eval > -INFINITY
+            && static_eval + depth * tp(&BAD_NOISY_MARGIN)
+                + see_value(captured_pt) * tp(&SEE_MATERIAL_SCALE) / 100 * tp(&BNFP_VICTIM_PCT) / 100
+                + crate::movepicker::capt_hist_score_static(board, &info.history, mv) / tp(&BNFP_CAPT_HIST_DIV).max(1)
+                <= alpha
             && !see_ge(board, mv, 0)
             && !board.gives_direct_check(mv)
         {
