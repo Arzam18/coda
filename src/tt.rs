@@ -1050,14 +1050,16 @@ pub static SHOW_WDL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// at which Coda wins half its games, so the reported cp is 100 * x / a(m):
 /// +1.00 means a 50% winning chance.
 ///
-/// Fitted 2026-10-24 by maximum likelihood on OB #4536 (main 75f3762a, net
-/// 0F08CC1B, 20,000 STC self-play games with internal-unit evals, no win/draw
-/// adjudication; 2.68M positions), per material level then smoothed as a cubic
-/// in t = m/58. Script: coda-research research/wdl_model_2026-10-24/.
+/// Fitted 2026-10-29 by maximum likelihood on OB #4689 (main ab2526b9, net
+/// FCEDBEFC, 20,000 STC self-play games with internal-unit evals, no win/draw
+/// adjudication; 2.67M positions), per material level then smoothed as a cubic
+/// in t = m/58. Within ~3% of the previous fit (#4536, net 0F08CC1B) at every
+/// material level. Script and refit runbook: coda-research
+/// research/wdl_model_2026-10-24/ (README.md).
 ///
 /// NET-SPECIFIC: refit whenever the production net changes, as with ScoreScale.
-const WDL_A_COEF: [f64; 4] = [-219.64, 599.21, -546.76, 403.12];
-const WDL_B_COEF: [f64; 4] = [-6.83, 38.17, -5.49, 55.61];
+const WDL_A_COEF: [f64; 4] = [-158.27, 449.76, -436.53, 374.61];
+const WDL_B_COEF: [f64; 4] = [56.34, -117.70, 108.86, 33.00];
 
 /// Material outside the range the fit saw is clamped to its edges rather than
 /// extrapolating the cubic.
