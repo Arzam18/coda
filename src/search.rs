@@ -635,7 +635,8 @@ tunables!(
     // Reduce later moves more once this node has already raised alpha N times
     // (alpha_raises reduction, a known LMR refinement). Fixed-point ×10: reduction += raises *
     // VALUE/10. Only fires at PV nodes (cut nodes break on the first fail-high
-    // before alpha is raised). Default 5 = +0.5 reduction per prior alpha-raise.
+    // before alpha is raised). Default 10 = +1.0 ply (LMR_SCALE centi-ply) per
+    // prior alpha-raise.
     (LMR_ALPHA_RAISE_10X, 10, 0, 40, 5.0, false),
     (FUT_THREATS_MARGIN, 42, 0, 200, 10.0, true),
     // Continuation-history weight in quiet move ordering. Range runs to 0 so
@@ -7024,8 +7025,11 @@ let singular_beta = tt_score_local - depth;
                     reduction += LMR_SCALE;
                 }
 
-                // Reduce less when moving a piece away from a pawn-attacked square
-                if enemy_attacks & (1u64 << from) != 0 {
+                // Reduce less when moving a piece away from a pawn-attacked square.
+                // Pawn attacks only, as originally measured: the term was written
+                // against enemy pawn attacks and silently widened to every enemy
+                // attack when `enemy_attacks` was broadened for history indexing.
+                if enemy_pawn_attacks & (1u64 << from) != 0 {
                     reduction -= LMR_SCALE;
                 }
 
