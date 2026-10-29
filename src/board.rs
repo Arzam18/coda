@@ -1328,7 +1328,8 @@ impl Board {
     /// rook's start square, or the king or the rook doesn't move) the rook is
     /// lifted first, then the king moves, then the rook is put down, so no
     /// step ever targets an occupied square or "moves" a piece onto itself.
-    /// `threats::replay_move_deltas` mirrors this sequence exactly.
+    /// `threats::emit_post_move_deltas` + `unreplay_move_deltas` mirror this
+    /// sequence exactly, backwards.
     fn make_castle(&mut self, us: Color, from: u8, to: u8, gen_threats: bool) {
         let (rook_from, rook_to) = self.castle_rook_squares(us, to);
         if castle_is_simple(from, to, rook_from, rook_to) {
