@@ -259,9 +259,9 @@ mod linux {
     const MADV_COLLAPSE: libc::c_int = 25;
     const HUGE: usize = 2 * 1024 * 1024;
 
-    /// Map `len` bytes of `fd` read-only at a 2 MB-aligned address, so the
+    /// Map `len` bytes of `fd` shared at a 2 MB-aligned address, so the
     /// kernel can back the mapping with huge pages.
-    fn map_aligned(fd: libc::c_int, len: usize) -> Result<*mut libc::c_void, String> {
+    fn map_aligned(fd: libc::c_int, len: usize, prot: libc::c_int) -> Result<*mut libc::c_void, String> {
         unsafe {
             // Reserve address space with room to align, then map over it.
             let span = len + HUGE;
@@ -272,7 +272,7 @@ mod linux {
             }
             let base = r as usize;
             let aligned = (base + HUGE - 1) & !(HUGE - 1);
-            let p = libc::mmap(aligned as *mut libc::c_void, len, libc::PROT_READ,
+            let p = libc::mmap(aligned as *mut libc::c_void, len, prot,
                 libc::MAP_SHARED | libc::MAP_FIXED, fd, 0);
             if p == libc::MAP_FAILED {
                 let e = errno("mmap");
@@ -312,7 +312,7 @@ mod linux {
         if size != bytes.len() as i64 {
             return Err(format!("size mismatch ({} vs {})", size, bytes.len()));
         }
-        let p = map_aligned(fd, bytes.len())?;
+        let p = map_aligned(fd, bytes.len(), libc::PROT_READ)?;
         let mapped = unsafe { std::slice::from_raw_parts(p as *const u8, bytes.len()) };
         if mapped != bytes {
             unsafe { libc::munmap(p, bytes.len()) };
@@ -448,6 +448,16 @@ mod linux {
         if unsafe { libc::ftruncate(fd, bytes.len() as libc::off_t) } != 0 {
             return Err(errno("ftruncate"));
         }
+        // Preferred: collapse the still-empty object into 2 MB pages first and
+        // copy straight into them. Writing through 4 KB pages and collapsing
+        // afterwards (the fallback below, plus the collapse in map_verified)
+        // copies the ~92 MB twice; on the Zen 5 host this cut a publisher's
+        // startup from 56 ms to 35 ms (a private load takes 22 ms). Any step
+        // that fails leaves the plain write path, so a pre-6.1 kernel or a
+        // process with THP disabled behaves exactly as before.
+        if fill_huge(fd, bytes) {
+            return Ok(());
+        }
         let mut off = 0usize;
         while off < bytes.len() {
             let n = unsafe {
@@ -466,6 +476,50 @@ mod linux {
             off += n as usize;
         }
         Ok(())
+    }
+
+    /// Fill the object through a writable 2 MB-aligned mapping whose full
+    /// 2 MB extents were collapsed into huge pages beforehand. True only when
+    /// that worked; on false the caller rewrites everything with pwrite.
+    ///
+    /// Every byte that could need a fresh tmpfs page goes through pwrite,
+    /// which reports a full /dev/shm as ENOSPC. A store through the mapping
+    /// would instead raise SIGBUS, so the mapping is written only after a
+    /// successful collapse, when each full extent is one resident 2 MB page.
+    fn fill_huge(fd: libc::c_int, bytes: &[u8]) -> bool {
+        let full = bytes.len() & !(HUGE - 1);
+        if full == 0 {
+            return false;
+        }
+        let pwrite_at = |off: usize, n: usize| -> bool {
+            let w = unsafe {
+                libc::pwrite(fd, bytes[off..].as_ptr() as *const libc::c_void, n, off as libc::off_t)
+            };
+            w == n as isize
+        };
+        // Collapsing a wholly empty extent fails (EINVAL on Linux 6.8), so
+        // seed each one with its first 4 KB of real data. The partial tail
+        // cannot be a huge page; write it in full here.
+        let mut off = 0;
+        while off < full {
+            if !pwrite_at(off, 4096) {
+                return false;
+            }
+            off += HUGE;
+        }
+        if full < bytes.len() && !pwrite_at(full, bytes.len() - full) {
+            return false;
+        }
+        let Ok(p) = map_aligned(fd, bytes.len(), libc::PROT_READ | libc::PROT_WRITE) else { return false };
+        unsafe {
+            libc::madvise(p, full, libc::MADV_HUGEPAGE);
+            let collapsed = libc::madvise(p, full, MADV_COLLAPSE) == 0;
+            if collapsed {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, full);
+            }
+            libc::munmap(p, bytes.len());
+            collapsed
+        }
     }
 
     impl Drop for SharedRegion {

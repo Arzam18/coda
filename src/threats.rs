@@ -586,8 +586,22 @@ impl ThreatPair {
 struct ThreatTables {
     pairs: [[ThreatPair; NUM_COLORED_PIECES]; NUM_COLORED_PIECES],
     from_offset: [[i32; 64]; NUM_COLORED_PIECES],
-    ray_rank: [[[u8; 64]; 64]; NUM_COLORED_PIECES],
+    /// Empty-board attack set per attacker and from-square; `ray_rank` derives
+    /// a target's rank from it. 6 KB, replacing a precomputed
+    /// `[cp][from][to]` rank table of 48 KB — the size of Zen 5's whole L1d —
+    /// whose loads sat between each decoded delta and its weight-row prefetch.
+    empty_attacks: [[Bitboard; 64]; NUM_COLORED_PIECES],
     num_features: usize,
+}
+
+impl ThreatTables {
+    /// Rank of `to` within the attacker's empty-board target set from `from`:
+    /// how many of its target squares are numbered below `to`.
+    #[inline(always)]
+    fn ray_rank(&self, attacker: usize, from: usize, to: usize) -> i32 {
+        let below = (1u64 << to).wrapping_sub(1);
+        (self.empty_attacks[attacker][from] & below).count_ones() as i32
+    }
 }
 
 // Two feature spaces are built at startup and the loaded net selects one:
@@ -821,7 +835,7 @@ pub fn init_threats() {
 fn build_threat_tables(king_attacker: bool) -> ThreatTables {
     let mut pairs = [[ThreatPair::default(); NUM_COLORED_PIECES]; NUM_COLORED_PIECES];
     let mut from_offset = [[0i32; 64]; NUM_COLORED_PIECES];
-    let mut ray_rank = [[[0u8; 64]; 64]; NUM_COLORED_PIECES];
+    let mut empty_attacks = [[0u64; 64]; NUM_COLORED_PIECES];
 
     // Per colored piece: `slots` = number of (from-square, attack-target)
     // slots it can occupy; `block_base` = first feature index of the piece's
@@ -874,19 +888,13 @@ fn build_threat_tables(king_attacker: bool) -> ThreatTables {
         }
     }
 
-    // Per attacker + from-square: rank of each to-square within the ray order
-    // (how many of the attacker's target squares precede it).
     for cp in 0..NUM_COLORED_PIECES {
         for from in 0..64u32 {
-            let attacks = piece_attacks_empty(cp, from);
-            for to in 0..64u32 {
-                let below = if to > 0 { (1u64 << to) - 1 } else { 0 };
-                ray_rank[cp][from as usize][to as usize] = popcount(below & attacks) as u8;
-            }
+            empty_attacks[cp][from as usize] = piece_attacks_empty(cp, from);
         }
     }
 
-    ThreatTables { pairs, from_offset, ray_rank, num_features }
+    ThreatTables { pairs, from_offset, empty_attacks, num_features }
 }
 
 /// Compute a single threat feature index.
@@ -924,7 +932,7 @@ pub fn threat_index(
 
     pair.base
         + tables.from_offset[attacker][from_f]
-        + tables.ray_rank[attacker][from_f][to_f] as i32
+        + tables.ray_rank(attacker, from_f, to_f)
 }
 
 /// Enumerate all threat features active in a position.
@@ -1071,12 +1079,12 @@ fn threat_index_bullet_ref(
     let to_f = (to_phys ^ flip) as usize;
     pair.base
         + tables.from_offset[attacker][from_f]
-        + tables.ray_rank[attacker][from_f][to_f] as i32
+        + tables.ray_rank(attacker, from_f, to_f)
 }
 
-/// Byte-exact match of Bullet's post-C8fix-2 `map_features` (required for net interop)
-/// (`bullet/crates/bullet_lib/src/game/inputs/chess_threats.rs` lines 374-578,
-/// commit 62931d1 + a8e2c7d).
+/// Byte-exact reference for the trainer's threat-input encoding as of the
+/// C8fix-2 change (required for net interop: training and inference must
+/// enumerate identical feature indices).
 ///
 /// Bullet operates in **bf-frame** internally (bulletformat rank-flips
 /// bitboards and color-swaps when real STM = Black). It compensates for
@@ -1243,6 +1251,10 @@ pub struct PieceState {
 }
 
 impl PieceState {
+    /// Placeholder for a scratch state that will not be read.
+    pub const EMPTY: Self =
+        Self { pieces: [0; 6], colors: [0; 2], mailbox: [NO_PIECE_TYPE; 64], castle_rooks: [0; 4] };
+
     #[inline]
     pub fn from_board(b: &crate::board::Board) -> Self {
         Self { pieces: b.pieces, colors: b.colors, mailbox: b.mailbox, castle_rooks: b.castle_rooks }
@@ -1277,96 +1289,156 @@ impl PieceState {
     }
 }
 
-/// Regenerate the threat deltas for `mv` from the PRE-move piece state,
-/// advancing `st` to the post-move state as a side effect.
+/// Read-only view of a piece state: the live board's arrays or a scratch
+/// `PieceState`'s. Lets the first generation step of a move read the board in
+/// place, so the common case never copies anything (see `materialize_deltas`).
+#[derive(Clone, Copy)]
+pub struct PieceView<'a> {
+    pub pieces: &'a [Bitboard; 6],
+    pub colors: &'a [Bitboard; 2],
+    pub mailbox: &'a [u8; 64],
+}
+
+impl<'a> PieceView<'a> {
+    #[inline(always)]
+    pub fn of_board(b: &'a crate::board::Board) -> Self {
+        Self { pieces: &b.pieces, colors: &b.colors, mailbox: &b.mailbox }
+    }
+    #[inline(always)]
+    pub fn of_state(st: &'a PieceState) -> Self {
+        Self { pieces: &st.pieces, colors: &st.colors, mailbox: &st.mailbox }
+    }
+    #[inline(always)]
+    pub fn occ(&self) -> Bitboard { self.colors[0] | self.colors[1] }
+}
+
+/// Lazy delta generation walks BACKWARDS from the live board: each ply's
+/// deltas are produced from its POST-move state while the scratch state is
+/// stepped back to the PRE-move state, which is the post-move state of the ply
+/// below. Generation is split in two because the first step needs no mutation:
 ///
-/// This mirrors the mutation-and-emit sequence inside `Board::make_move`
-/// exactly, and it has to: each emit call observes a DIFFERENT intermediate
-/// state, so reordering them changes the deltas. In particular the promotion
-/// case applies BOTH mutations before either emit, so both emits see the
-/// post-promotion board.
+/// - `emit_post_move_deltas` emits what `Board::make_move` emitted on the
+///   final (post-move) state, reading `post` in place;
+/// - `unreplay_move_deltas` steps a scratch state back through the move's
+///   intermediate states, emitting what `make_move` emitted on each.
 ///
-/// The duplication of that sequence is deliberate — the alternative was routing
-/// `make_move`'s own mutations through this type, which would have put a scratch
-/// abstraction in the hottest path in the engine. The cost of duplicating is
-/// drift, and `lazy_deltas_match_eager_generation` is the guard against it:
-/// it walks the fuzz corpus asserting this function reproduces `make_move`'s
-/// deltas exactly, so the two cannot silently diverge.
+/// Every emit call sees exactly the state it saw inside `make_move`, so the
+/// deltas are the same multiset; only their order differs (reverse stage
+/// order). Order is irrelevant downstream: the accumulator applies i16
+/// wrapping adds and subs, which commute, and the overflow test depends only
+/// on the count. `unreplay_matches_eager_generation` asserts the multiset.
 ///
-/// `inline(always)`: the only production caller is
-/// `ThreatStack::materialize_deltas`, which inlined this by itself until the
-/// pawn-pair regeneration it now also carries pushed it past the inliner's
-/// budget; the resulting call was ~0.25% of instructions.
+/// The stage sequence mirrors `make_move` and `make_castle`, and the
+/// duplication is deliberate: routing `make_move`'s own mutations through a
+/// scratch type would put that abstraction in the hottest path in the engine.
+/// The differential test is the guard against drift.
+///
+/// `pt_post` is the piece on `to` after the move (`ThreatEntry::moved_pt`),
+/// passed in rather than read from the state; for castling it is unused.
 #[inline(always)]
-pub fn replay_move_deltas(
+pub fn emit_post_move_deltas(
+    post: PieceView,
+    castle_rooks: &[u8; 4],
+    us: Color,
+    mv: Move,
+    pt_post: u8,
+    out: &mut Vec<RawThreatDelta>,
+) {
+    let from = move_from(mv);
+    let to = move_to(mv);
+    let flags = move_flags(mv);
+    let occ = post.occ();
+
+    if flags == FLAG_CASTLE {
+        let (rook_from, rook_to) = crate::board::castle_rook_squares(castle_rooks, us, to);
+        if crate::board::castle_is_simple(from, to, rook_from, rook_to) {
+            push_threats_on_move(out, post.pieces, post.colors, post.mailbox, occ,
+                                 us, ROOK, rook_from as u32, rook_to as u32);
+        } else {
+            push_threats_on_change(out, post.pieces, post.colors, post.mailbox, occ,
+                                   us, ROOK, rook_to as u32, true);
+        }
+        return;
+    }
+    if is_promotion(mv) {
+        // make_move applies both promotion mutations before either emit.
+        push_threats_on_change(out, post.pieces, post.colors, post.mailbox, occ,
+                               us, PAWN, to as u32, false);
+        push_threats_on_change(out, post.pieces, post.colors, post.mailbox, occ,
+                               us, pt_post, to as u32, true);
+        return;
+    }
+    push_threats_on_move(out, post.pieces, post.colors, post.mailbox, occ,
+                         us, pt_post, from as u32, to as u32);
+}
+
+/// Second half of backward generation (see `emit_post_move_deltas`): step `st`
+/// from the post-move state to the pre-move state, emitting the deltas of each
+/// intermediate state on the way. Undoes `make_move`'s mutations in reverse
+/// order, each emit placed where its forward counterpart observed that state.
+#[inline(always)]
+pub fn unreplay_move_deltas(
     st: &mut PieceState,
     us: Color,
     mv: Move,
     captured: u8,
+    pt_post: u8,
     out: &mut Vec<RawThreatDelta>,
 ) {
-    out.clear();
     let from = move_from(mv);
     let to = move_to(mv);
     let flags = move_flags(mv);
     let them = flip_color(us);
-    let pt = st.mailbox[from as usize];
 
-    // Castling: the same two sequences as `Board::make_castle`.
     if flags == FLAG_CASTLE {
         let (rook_from, rook_to) =
             crate::board::castle_rook_squares(&st.castle_rooks, us, to);
         if crate::board::castle_is_simple(from, to, rook_from, rook_to) {
-            st.shift(us, KING, from, to);
+            st.shift(us, ROOK, rook_to, rook_from);
             push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
                                  st.occ(), us, KING, from as u32, to as u32);
-            st.shift(us, ROOK, rook_from, rook_to);
-            push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
-                                 st.occ(), us, ROOK, rook_from as u32, rook_to as u32);
+            st.shift(us, KING, to, from);
         } else {
-            st.remove(us, ROOK, rook_from);
-            push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
-                                   st.occ(), us, ROOK, rook_from as u32, false);
+            st.remove(us, ROOK, rook_to);
             if from != to {
-                st.shift(us, KING, from, to);
                 push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
                                      st.occ(), us, KING, from as u32, to as u32);
+                st.shift(us, KING, to, from);
             }
-            st.put(us, ROOK, rook_to);
             push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
-                                   st.occ(), us, ROOK, rook_to as u32, true);
+                                   st.occ(), us, ROOK, rook_from as u32, false);
+            st.put(us, ROOK, rook_from);
         }
         return;
     }
 
+    debug_assert_eq!(st.mailbox[to as usize], pt_post, "pt_post must be the piece on `to`");
+    let pt = if is_promotion(mv) {
+        st.remove(us, pt_post, to);
+        st.put(us, PAWN, to);
+        push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
+                             st.occ(), us, PAWN, from as u32, to as u32);
+        PAWN
+    } else {
+        pt_post
+    };
+    st.shift(us, pt, to, from);
+
     if flags == FLAG_EN_PASSANT {
         let cap_sq = if us == WHITE { to.wrapping_sub(8) } else { to.wrapping_add(8) };
-        st.remove(them, PAWN, cap_sq);
         push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
                                st.occ(), them, PAWN, cap_sq as u32, false);
+        st.put(them, PAWN, cap_sq);
     } else if captured != NO_PIECE_TYPE {
-        st.remove(them, captured, to);
         push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
                                st.occ(), them, captured, to as u32, false);
-    }
-
-    st.shift(us, pt, from, to);
-    push_threats_on_move(out, &st.pieces, &st.colors, &st.mailbox,
-                         st.occ(), us, pt, from as u32, to as u32);
-
-    if is_promotion(mv) {
-        let promo_pt = promotion_piece_type(mv);
-        st.remove(us, pt, to);
-        st.put(us, promo_pt, to);
-        push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
-                               st.occ(), us, pt, to as u32, false);
-        push_threats_on_change(out, &st.pieces, &st.colors, &st.mailbox,
-                               st.occ(), us, promo_pt, to as u32, true);
+        st.put(them, captured, to);
     }
 }
 
 /// Step `st` BACKWARDS over `mv`, turning a post-move piece state into the
-/// pre-move one. Undoes in the reverse of `replay_move_deltas`'s order.
+/// pre-move one, without emitting anything (see `unreplay_move_deltas` for the
+/// emitting form). Undoes `make_move`'s mutations in reverse order.
 ///
 /// This is what makes lazy generation possible without snapshotting boards:
 /// `UndoInfo` already carries `mv` and `captured` for every ply on the current
@@ -1465,13 +1537,24 @@ fn push_threats_for_piece(
     #[cfg(feature = "profile-threats")]
     let s1_deltas_before = deltas.len() as u64;
 
+    // Step 2 needs the rook and bishop rays from `square` under this same
+    // `occ`, and those are exactly a slider's own attack set here. Computing
+    // them first lets step 1 select the piece's attacks from them instead of
+    // calling `piece_attacks_occ`, which repeated one or two of the same magic
+    // lookups behind an out-of-line call and a jump table.
+    let rook_att = rook_attacks(square, occ);
+    let bishop_att = bishop_attacks(square, occ);
+
     // No-king space: the king emits no attacker-side features, so skip the
     // enumeration rather than emitting deltas the index mapping discards.
-    let skip_king_attacks = piece_type == 5 && !king_attacker_on();
-    let my_attacks = if skip_king_attacks {
-        0
-    } else {
-        piece_attacks_occ(piece_type, piece_color, square, occ)
+    let my_attacks = match piece_type {
+        PAWN => pawn_attacks(piece_color, square),
+        KNIGHT => knight_attacks(square),
+        BISHOP => bishop_att,
+        ROOK => rook_att,
+        QUEEN => bishop_att | rook_att,
+        KING if king_attacker_on() => king_attacks(square),
+        _ => 0,
     };
     let mut attacked_occ = my_attacks & occ;
     while attacked_occ != 0 {
@@ -1529,9 +1612,6 @@ fn push_threats_for_piece(
     let s2_start = crate::threats::thr_stats::rdtsc();
     #[cfg(feature = "profile-threats")]
     let s2_deltas_before = deltas.len() as u64;
-    let rook_att = rook_attacks(square, occ);
-    let bishop_att = bishop_attacks(square, occ);
-
     let diagonal_sliders = (pieces_bb[BISHOP as usize] | pieces_bb[QUEEN as usize]) & bishop_att;
     let orthogonal_sliders = (pieces_bb[ROOK as usize] | pieces_bb[QUEEN as usize]) & rook_att;
 
@@ -2068,7 +2148,7 @@ unsafe fn apply_threat_deltas_dual_body(
         let to_w = (to ^ flip_w) as usize;
         let idx_w = pair_w.base
             + tables.from_offset[attacker][from_w]
-            + tables.ray_rank[attacker][from_w][to_w] as i32;
+            + tables.ray_rank(attacker, from_w, to_w);
         debug_assert!(!pair_w.skip(from, to) && (idx_w as usize) < num_threats);
         unsafe {
             adds_w_ptr.add(n_adds_w).write(idx_w as usize);
@@ -2085,7 +2165,7 @@ unsafe fn apply_threat_deltas_dual_body(
         let to_b = (to ^ flip_b) as usize;
         let idx_b = pair_b.base
             + tables.from_offset[attacker_b][from_b]
-            + tables.ray_rank[attacker_b][from_b][to_b] as i32;
+            + tables.ray_rank(attacker_b, from_b, to_b);
         debug_assert!(!pair_b.skip(from, to) && (idx_b as usize) < num_threats);
         unsafe {
             adds_b_ptr.add(n_adds_b).write(idx_b as usize);
@@ -3195,23 +3275,27 @@ mod tests {
         assert!(elapsed.as_secs() < 10, "Benchmark took too long: {:?}", elapsed);
     }
 
-    /// THE gate for lazy threat-delta generation. `replay_move_deltas`
-    /// duplicates the mutation-and-emit sequence inside `Board::make_move`, so
-    /// the two can drift apart silently — and a divergence would not crash, it
-    /// would quietly feed a wrong accumulator into every eval downstream.
+    /// THE gate for lazy threat-delta generation. `emit_post_move_deltas` and
+    /// `unreplay_move_deltas` duplicate the mutation-and-emit sequence inside
+    /// `Board::make_move` (backwards), so the two can drift apart silently —
+    /// and a divergence would not crash, it would quietly feed a wrong
+    /// accumulator into every eval downstream.
     ///
     /// Walks random legal games from varied positions and, for every single
     /// move, checks all three properties the lazy scheme depends on:
     ///   1. `undo_move_state` turns the post-move piece state back into exactly
     ///      the pre-move one (the inverse is exact);
-    ///   2. replaying forward from that recovered state reproduces `make_move`'s
-    ///      deltas EXACTLY — same values, same order, same length;
-    ///   3. replaying forward leaves the piece state where `make_move` left it.
+    ///   2. generating backwards from the post-move state reproduces
+    ///      `make_move`'s deltas — same multiset, same length;
+    ///   3. the backward generator leaves the piece state exactly where
+    ///      `undo_move_state` does, i.e. at the pre-move state.
     ///
-    /// Property 2 is the one that matters. Order is asserted, not just the
-    /// multiset: each emit observes a different intermediate board, so an
-    /// ordering difference means the sequence was mirrored wrongly even if the
-    /// set happens to match on these positions.
+    /// Property 2 compares multisets, not sequences, because the backward walk
+    /// emits the stages in reverse order; downstream the deltas become i16
+    /// wrapping adds and subs, which commute. A mirrored-wrongly stage still
+    /// shows up: it observes a different intermediate board and emits a
+    /// different set, which these 20k+ moves (seeded towards promotions, EP and
+    /// 960 castling) catch.
     #[test]
     fn lazy_deltas_match_eager_generation() {
         use crate::board::Board;
@@ -3271,7 +3355,7 @@ mod tests {
                     if legal.len == 0 { break; }
                     // Bias one move in four toward a special move when one is
                     // legal. Promotions, castles and EP are exactly the cases
-                    // where `replay_move_deltas` does something other than
+                    // where the lazy generator does something other than
                     // "remove victim, shift piece", so leaving them to chance
                     // would leave the interesting half of the function unproven.
                     let mut special: Vec<Move> = Vec::new();
@@ -3305,24 +3389,29 @@ mod tests {
                     assert_eq!(walked.colors, pre.colors, "colors mismatch after undo, fen {fen_idx} game {game} mv {mv:#06x}");
                     assert_eq!(walked.mailbox, pre.mailbox, "mailbox mismatch after undo, fen {fen_idx} game {game} mv {mv:#06x}");
 
-                    // 2. forward replay from the recovered state == eager deltas
+                    // 2. backward generation from the post-move state == eager
+                    //    deltas (as a multiset). `pt_post` is what absorb_deltas
+                    //    records as `moved_pt`.
+                    let pt_post = board.mailbox[move_to(mv) as usize];
                     let mut lazy = Vec::new();
-                    replay_move_deltas(&mut walked, us, mv, captured, &mut lazy);
+                    emit_post_move_deltas(PieceView::of_state(&post), &post.castle_rooks,
+                                          us, mv, pt_post, &mut lazy);
+                    let mut back = post;
+                    unreplay_move_deltas(&mut back, us, mv, captured, pt_post, &mut lazy);
                     assert_eq!(lazy.len(), eager.len(),
                         "delta COUNT differs (lazy {} vs eager {}), fen {fen_idx} game {game} mv {mv:#06x}",
                         lazy.len(), eager.len());
-                    for (i, (l, e)) in lazy.iter().zip(eager.iter()).enumerate() {
-                        assert_eq!(l.0, e.0,
-                            "delta {i} differs, fen {fen_idx} game {game} mv {mv:#06x}: \
-                             lazy(att={} from={} vic={} to={} add={}) \
-                             eager(att={} from={} vic={} to={} add={})",
-                            l.attacker_cp(), l.from_sq(), l.victim_cp(), l.to_sq(), l.add(),
-                            e.attacker_cp(), e.from_sq(), e.victim_cp(), e.to_sq(), e.add());
-                    }
+                    let mut l_sorted: Vec<u32> = lazy.iter().map(|d| d.0).collect();
+                    let mut e_sorted: Vec<u32> = eager.iter().map(|d| d.0).collect();
+                    l_sorted.sort_unstable();
+                    e_sorted.sort_unstable();
+                    assert_eq!(l_sorted, e_sorted,
+                        "delta MULTISET differs, fen {fen_idx} game {game} mv {mv:#06x}");
 
-                    // 3. forward replay lands on the real post-move state
-                    assert_eq!(walked.pieces, post.pieces, "replay end-state pieces, fen {fen_idx} game {game}");
-                    assert_eq!(walked.mailbox, post.mailbox, "replay end-state mailbox, fen {fen_idx} game {game}");
+                    // 3. backward generation lands on the pre-move state
+                    assert_eq!(back.pieces, pre.pieces, "unreplay end-state pieces, fen {fen_idx} game {game}");
+                    assert_eq!(back.colors, pre.colors, "unreplay end-state colors, fen {fen_idx} game {game}");
+                    assert_eq!(back.mailbox, pre.mailbox, "unreplay end-state mailbox, fen {fen_idx} game {game}");
 
                     checked += 1;
                     if is_promotion(mv) { promos += 1; }

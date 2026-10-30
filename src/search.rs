@@ -266,6 +266,25 @@ tunables!(
     // the full derivation.
     (NO_INC_MTG_BASE, 34, 20, 80, 4.0, false),
     (NO_INC_MTG_GROWTH_PCT, 94, 0, 200, 10.0, false),
+    // Cap on that growing divisor: never assume more moves left than a
+    // quarter of Coda's games still have. Fitted to the 75th percentile of
+    // moves remaining in Coda's own no-increment lichess games (both bots,
+    // June-October 2026, 3,898 games): fullmove 10/20/30/40/50/60/80 ->
+    // 61/52/46/42/40/36/31, i.e. cap = max(31, 64 - 0.5 * fullmove). The
+    // growth alone reached ~58 by move 60 (the 90th percentile there), and
+    // games ended with 40-53% of the clock unused at every no-increment TC;
+    // the cap first binds around move 43, so the opening and early
+    // middlegame are paced exactly as before.
+    (NO_INC_CAP_START, 64, 40, 90, 3.0, false),
+    (NO_INC_CAP_SLOPE_100, 50, 20, 100, 5.0, false),
+    (NO_INC_CAP_FLOOR, 31, 20, 50, 2.0, false),
+    // Clock held back from no-increment pacing once the cap binds, in ms.
+    // Every move costs ~10-16 ms of wall time however small its budget
+    // (measured in local 10+0 games, where pacing with no reserve flagged
+    // eight games past move 110 on that cost alone), so the reserve has to
+    // carry the long tail: 15 ms x 110 moves, the 99th percentile of moves
+    // still to play at fullmove 40-60 in the same lichess games = 1650 ms.
+    (NO_INC_RESERVE_MS, 1650, 0, 4000, 100.0, false),
     // TM window + factor constants. Coda's own parameters, tuned and validated
     // on Coda's own search and net; provenance in
     // docs/license_analysis_2026-07-13.md. All non-core, for the reason given
@@ -616,7 +635,8 @@ tunables!(
     // Reduce later moves more once this node has already raised alpha N times
     // (alpha_raises reduction, a known LMR refinement). Fixed-point ×10: reduction += raises *
     // VALUE/10. Only fires at PV nodes (cut nodes break on the first fail-high
-    // before alpha is raised). Default 5 = +0.5 reduction per prior alpha-raise.
+    // before alpha is raised). Default 10 = +1.0 ply (LMR_SCALE centi-ply) per
+    // prior alpha-raise.
     (LMR_ALPHA_RAISE_10X, 10, 0, 40, 5.0, false),
     (FUT_THREATS_MARGIN, 42, 0, 200, 10.0, true),
     // Continuation-history weight in quiet move ordering. Range runs to 0 so
@@ -1602,6 +1622,12 @@ pub struct SearchInfo {
     /// byte-identical.
     pub root_ban: Vec<Move>,
     static_evals: [i32; MAX_PLY + 1],
+    /// Checkers handed from parent to child: slot `ply` holds the hash of the
+    /// position the parent reached at that ply and its checker set, which the
+    /// parent computes anyway (`gives_check`). The child reuses it only on an
+    /// exact hash match, so a null-move child, a position the parent never
+    /// wrote, or a stale slot falls back to `Board::checkers`.
+    checkers_hint: [(u64, Bitboard); MAX_PLY + 1],
     /// Per-ply tt_pv, so a child can inherit its parent's PV-region flag.
     tt_pv_stack: [bool; MAX_PLY + 1],
     /// LMR reduction applied at each ply (for hindsight reduction gating)
@@ -1739,6 +1765,7 @@ impl SearchInfo {
             trace_line_mv: Vec::new(),
             nmp_min_ply: 0,
             static_evals: [0; MAX_PLY + 1],
+            checkers_hint: [(0, 0); MAX_PLY + 1],
             tt_pv_stack: [false; MAX_PLY + 1],
             reductions: [0; MAX_PLY + 1],
             excluded_move: [NO_MOVE; MAX_PLY + 1],
@@ -2222,6 +2249,19 @@ impl SearchInfo {
                                 }
                             },
                         );
+                        // Pawn-pair rows share the threat weight array above the
+                        // threat block; refresh appends them, so the scratch sum
+                        // must too or every pawn-pair net reads as a mismatch.
+                        if self.threat_stack.pp_features > 0 {
+                            crate::pawn_pair::enumerate_pawn_pairs(
+                                board.pieces[PAWN as usize], &board.colors, pov, mirrored,
+                                |pp_idx| {
+                                    if ni < crate::threat_accum::MAX_ACTIVE_THREAT_FEATURES {
+                                        indices[ni] = net.num_threat_features + pp_idx; ni += 1;
+                                    } else { overflow = true; }
+                                },
+                            );
+                        }
                         let mut check = [0i16; crate::threat_accum::MAX_FT_SIZE];
                         crate::threats::add_weight_rows(
                             &mut check[..h], &net.threat_weights, h, &indices[..ni]);
@@ -2584,6 +2624,65 @@ fn cont_corr_value(info: &SearchInfo, ply: usize) -> i64 {
     sum
 }
 
+/// Prefetch the five correction-history rows `correction_value` will read
+/// for this position. Every index derives from board state (and the move
+/// stacks) available at node entry, so the fetch overlaps the TT probe and
+/// the NNUE eval that precede the read. Prefetch-only: never a correctness
+/// path. No-op off x86_64.
+#[inline(always)]
+fn prefetch_corr_rows(info: &SearchInfo, board: &Board, ply: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let stm = board.side_to_move as usize;
+        unsafe {
+            let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
+            _mm_prefetch(&info.corr.pawn[stm][pawn_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+            let wnp_idx = (board.non_pawn_key[WHITE as usize] as usize) & (CORR_HIST_SIZE - 1);
+            _mm_prefetch(&info.corr.np[stm][WHITE as usize][wnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+            let bnp_idx = (board.non_pawn_key[BLACK as usize] as usize) & (CORR_HIST_SIZE - 1);
+            _mm_prefetch(&info.corr.np[stm][BLACK as usize][bnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+            if let Some(last) = board.undo_stack.last() {
+                if last.mv != NO_MOVE {
+                    let trans_idx = ((board.hash ^ last.hash) as usize) & (CORR_HIST_SIZE - 1);
+                    _mm_prefetch(&info.corr.trans[stm][trans_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+                }
+            }
+            // cont_corr rows: same index derivation as cont_corr_value.
+            if ply >= 2 {
+                let cur_p = info.moved_piece_stack[ply - 1] as usize;
+                let cur_t = info.moved_to_stack[ply - 1] as usize;
+                if cur_p != 0 && cur_p < 13 && cur_t < 64 {
+                    for off in [2usize, 4] {
+                        if ply >= off {
+                            let pp = info.moved_piece_stack[ply - off] as usize;
+                            let pt = info.moved_to_stack[ply - off] as usize;
+                            if pp != 0 && pp < crate::movepicker::CONT_PLANES && pt < 64 {
+                                _mm_prefetch(&info.corr.cont[pp][pt][cur_p][cur_t] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (info, board, ply);
+}
+
+/// This node's checker set: the parent's hint when it is for this exact
+/// position (see `SearchInfo::checkers_hint`), else computed fresh.
+#[inline(always)]
+fn checkers_for_node(info: &SearchInfo, board: &Board, ply: usize) -> Bitboard {
+    match info.checkers_hint.get(ply) {
+        Some(&(key, chk)) if key == board.hash => {
+            debug_assert_eq!(chk, board.checkers(), "stale checkers hint at ply {}", ply);
+            chk
+        }
+        _ => board.checkers(),
+    }
+}
+
 /// Compute the correction value alone (the centipawn delta corrhist would apply
 /// to raw eval). Used by SE-margin formulas to gate extension confidence on
 /// |correction| — a larger correction lowers the double-extension margin,
@@ -2604,9 +2703,25 @@ fn correction_value(info: &SearchInfo, board: &Board, ply: usize) -> i32 {
             info.corr.trans[stm][trans_idx].load(Ordering::Relaxed) as i64
         } else { 0 }
     } else { 0 };
-    let total_corr = (pawn_corr * tp(&CORR_W_PAWN) as i64 + white_np_corr * tp(&CORR_W_NP) as i64 + black_np_corr * tp(&CORR_W_NP) as i64
-        + cont_corr * tp(&CORR_W_CONT) as i64 + trans_corr * tp(&CORR_W_TRANS) as i64) / tp(&CORR_HIST_DIV) as i64;
-    (total_corr as i32) / tp(&CORR_HIST_GRAIN_T)
+    // i32 throughout, one divide by DIV * GRAIN. Bit-identical to the former
+    // i64 sum followed by two divides in series:
+    // - truncating division with positive divisors satisfies
+    //   (x / a) / b == x / (a * b);
+    // - every entry is bounded by CORR_HIST_LIMIT (cont contributes two) and
+    //   setoption clamps each weight to its tunable range, so |sum| stays far
+    //   below i32::MAX (`corr_blend_fits_i32` checks the bound from the live
+    //   ranges).
+    // Why it matters: LLVM guarded the i64 divide with a "fits in 32 bits?"
+    // test that every NEGATIVE correction fails, a ~50/50 data-dependent
+    // branch that also sent half the calls down the slow 64-bit divide, and
+    // the second divide was serial behind it on the static-eval chain.
+    let weighted = pawn_corr as i32 * tp(&CORR_W_PAWN)
+        + white_np_corr as i32 * tp(&CORR_W_NP)
+        + black_np_corr as i32 * tp(&CORR_W_NP)
+        + cont_corr as i32 * tp(&CORR_W_CONT)
+        + trans_corr as i32 * tp(&CORR_W_TRANS);
+    let divisor = tp(&CORR_HIST_DIV).max(1) * tp(&CORR_HIST_GRAIN_T).max(1);
+    weighted / divisor
 }
 
 /// Apply correction history to raw static eval.
@@ -3267,9 +3382,24 @@ pub fn compute_tm_budgets(
     // Any change here needs both a forfeit count and a non-regression SPRT.
     let no_inc_mtg_base = tp(&NO_INC_MTG_BASE).max(1) as u64;
     let no_inc_growth_pct = tp(&NO_INC_MTG_GROWTH_PCT).max(0) as u64;
-    let no_inc_effective_mtg = no_inc_mtg_base
+    let no_inc_grown_mtg = no_inc_mtg_base
         + (fullmove as u64).saturating_sub(no_inc_mtg_base) * no_inc_growth_pct / 100;
+    // ...capped at the 75th percentile of moves actually left (NO_INC_CAP_*).
+    let no_inc_cap = (tp(&NO_INC_CAP_START) as i64
+        - tp(&NO_INC_CAP_SLOPE_100) as i64 * fullmove as i64 / 100)
+        .max(tp(&NO_INC_CAP_FLOOR).max(2) as i64) as u64;
+    let no_inc_effective_mtg = no_inc_grown_mtg.min(no_inc_cap);
     let mtg_divisor = if no_inc_sd { no_inc_effective_mtg.max(1) } else { default_moves_to_go };
+    // Once the cap binds, no-increment pacing never touches the last
+    // NO_INC_RESERVE_MS of the clock (at most half of it), so per-move latency
+    // in a very long game cannot drain it. Before that the growing divisor
+    // already holds far more back, and the early game stays exactly as it was.
+    let paced_time = if no_inc_sd && no_inc_cap < no_inc_grown_mtg {
+        let reserve = (tp(&NO_INC_RESERVE_MS).max(0) as u64).min(time_left / 2);
+        (time_left - reserve).max(1)
+    } else {
+        time_left
+    };
 
     let opt_time_base = if movestogo > 0 {
         // Movestogo: divisor is clamped to [2, default_mtg]. The increment
@@ -3281,7 +3411,8 @@ pub fn compute_tm_budgets(
         (computed.min(max_time) * opt_window_pct / 100).max(1)
     } else {
         // Sudden death (or with inc). Add 94% of inc to base computed window.
-        let computed = time_left / mtg_divisor + our_inc * inc_frac_pct / 100;
+        // paced_time == time_left except on the capped no-increment path.
+        let computed = paced_time / mtg_divisor + our_inc * inc_frac_pct / 100;
         ((computed.min(max_time) * opt_window_pct / 100).min(hard_time)).max(1)
     };
 
@@ -3606,6 +3737,7 @@ pub(crate) fn search_helper(board: &mut Board, info: &mut SearchInfo, _limits: &
     // NOT clear it here. Reset only per-search scratch state.
     info.stats = PruneStats::default();
     info.static_evals = [0; MAX_PLY + 1];
+    info.checkers_hint = [(0, 0); MAX_PLY + 1];
     info.reductions = [0; MAX_PLY + 1];
     info.excluded_move = [NO_MOVE; MAX_PLY + 1];
     info.moved_piece_stack = [0; MAX_PLY + 1];
@@ -3950,6 +4082,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     }
     // Clear static evals, excluded moves, depth tracking
     info.static_evals = [0; MAX_PLY + 1];
+    info.checkers_hint = [(0, 0); MAX_PLY + 1];
     info.depth_nodes = [0; MAX_PLY + 1];
     info.completed_depth = 0;
     // Reset the shared instant-reply gate inputs for THIS search. The UCI
@@ -4062,7 +4195,25 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
             info.tm_no_inc = our_inc == 0 && limits.movestogo == 0;
         }
     } else if limits.movetime > 0 {
-        info.time_limit = limits.movetime;
+        // `movetime` is a hard limit on the reply as the GUI measures it, so
+        // the search has to end early enough to stop, unwind and print within
+        // it. Searching the full movetime left no room: at `go movetime 250`
+        // under load (16 threads, load 21) replies arrived at median 263 ms,
+        // p99 331, max 343 -- the stop is only polled every 4096 nodes, which
+        // is several ms on a loaded core -- and a 9.7k-game st=0.25 round
+        // robin with a 100 ms tolerance lost 4% of games on time. Take
+        // MoveOverhead off, as the clock path does, but never more than a
+        // fifth of the movetime: a short movetime keeps most of its budget,
+        // and a fifth of 250 ms (50 ms) still covers the measured p99 overrun
+        // (81 ms) once added to the GUI's own tolerance. Only for a plain
+        // `go movetime`: the ponderhit fresh-search also arrives as a movetime,
+        // but it is already budgeted from the clock and carries abs_clock.
+        let margin = if limits.abs_clock == 0 {
+            info.move_overhead.min(limits.movetime / 5)
+        } else {
+            0
+        };
+        info.time_limit = (limits.movetime - margin).max(1);
         // Respect caller-supplied minimum think time (ponderhit fresh-search uses
         // this to enforce the increment floor; plain `go movetime` callers leave
         // it at 0 so they get exactly the movetime they asked for).
@@ -5486,41 +5637,7 @@ fn negamax(
     // All indices derive from board state available right now. Wasted on
     // TT-cutoff / in-check exits — measured +0.5% median cycles, 63/100
     // positive pairs, sign-test p=0.006 (same-binary toggle protocol).
-    #[cfg(target_arch = "x86_64")]
-    {
-        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-        let stm = board.side_to_move as usize;
-        unsafe {
-            let pawn_idx = (board.pawn_hash as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.corr.pawn[stm][pawn_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-            let wnp_idx = (board.non_pawn_key[WHITE as usize] as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.corr.np[stm][WHITE as usize][wnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-            let bnp_idx = (board.non_pawn_key[BLACK as usize] as usize) & (CORR_HIST_SIZE - 1);
-            _mm_prefetch(&info.corr.np[stm][BLACK as usize][bnp_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-            if let Some(last) = board.undo_stack.last() {
-                if last.mv != NO_MOVE {
-                    let trans_idx = ((board.hash ^ last.hash) as usize) & (CORR_HIST_SIZE - 1);
-                    _mm_prefetch(&info.corr.trans[stm][trans_idx] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-                }
-            }
-            // cont_corr rows: same index derivation as cont_corr_value.
-            if ply_u >= 2 {
-                let cur_p = info.moved_piece_stack[ply_u - 1] as usize;
-                let cur_t = info.moved_to_stack[ply_u - 1] as usize;
-                if cur_p != 0 && cur_p < 13 && cur_t < 64 {
-                    for off in [2usize, 4] {
-                        if ply_u >= off {
-                            let pp = info.moved_piece_stack[ply_u - off] as usize;
-                            let pt = info.moved_to_stack[ply_u - off] as usize;
-                            if pp != 0 && pp < crate::movepicker::CONT_PLANES && pt < 64 {
-                                _mm_prefetch(&info.corr.cont[pp][pt][cur_p][cur_t] as *const std::sync::atomic::AtomicI32 as *const i8, _MM_HINT_T0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    prefetch_corr_rows(info, board, ply_u);
     let tt_cur_gen = info.tt.current_generation();
     let tt_cross_gen = tt_hit && tt_entry.generation != tt_cur_gen;
     info.stats.tt_probes += 1;
@@ -5767,9 +5884,10 @@ fn negamax(
 
     // (Leaf-node quiescence dispatch happens at the top of negamax.)
 
-    // Compute pinned, checkers, in_check
-    let pinned = board.pinned();
-    let checkers = board.checkers();
+    // Compute checkers, in_check. `pinned` is computed later, just before
+    // ProbCut: only the move loops read it, so the RFP / NMP / razoring exits
+    // above that point never pay for the pin scan.
+    let checkers = checkers_for_node(info, board, ply_u);
     let in_check = checkers != 0;
 
     // Compute static eval for pruning and LMR improving detection.
@@ -6189,6 +6307,11 @@ fn negamax(
 
     // (RFP moved above NMP — see pre-NMP site.)
 
+    // First reader of `pinned` (ProbCut, then the main move loop). The board
+    // is back in this node's position after NMP / razoring, so this equals the
+    // value it would have had at node entry.
+    let pinned = board.pinned();
+
     // ProbCut: at moderate+ depths, if a shallow search of captures with
     // raised beta confirms the position is winning, prune the node.
     //
@@ -6430,8 +6553,10 @@ fn negamax(
             continue;
         }
 
-        // Legality check: evasion picker returns legal moves, non-evasion needs explicit check
-        if !in_check && !board.is_legal(mv, pinned, checkers) {
+        // Legality check: evasion picker returns legal moves, non-evasion needs explicit check.
+        // Not in check here, so king moves are tested against the enemy-attack
+        // map this node already holds (exact without checkers; see the method).
+        if !in_check && !board.is_legal_unchecked_side(mv, pinned, enemy_attacks) {
             continue;
         }
 
@@ -6745,8 +6870,14 @@ let singular_beta = tt_score_local - depth;
             info.threat_stack.absorb_deltas(board);
         }
 
-        // Check if move gives check (opponent is now in check after make_move)
-        let gives_check = board.in_check();
+        // Check if move gives check (opponent is now in check after make_move).
+        // The child at ply + 1 reads the same checker set from the hint slot
+        // instead of recomputing it.
+        let child_checkers = board.checkers();
+        let gives_check = child_checkers != 0;
+        if ply_u + 1 <= MAX_PLY {
+            info.checkers_hint[ply_u + 1] = (board.hash, child_checkers);
+        }
 
         let extension = 0;
         // `extension` is 0: there is no promotion-imminent (7th-rank pawn
@@ -6894,8 +7025,11 @@ let singular_beta = tt_score_local - depth;
                     reduction += LMR_SCALE;
                 }
 
-                // Reduce less when moving a piece away from a pawn-attacked square
-                if enemy_attacks & (1u64 << from) != 0 {
+                // Reduce less when moving a piece away from a pawn-attacked square.
+                // Pawn attacks only, as originally measured: the term was written
+                // against enemy pawn attacks and silently widened to every enemy
+                // attack when `enemy_attacks` was broadened for history indexing.
+                if enemy_pawn_attacks & (1u64 << from) != 0 {
                     reduction -= LMR_SCALE;
                 }
 
@@ -7806,7 +7940,9 @@ fn quiescence_with_depth(
         return apply_halfmove_scale(info.eval(board), board.halfmove);
     }
 
-    // Prefetch TT bucket early
+    // Prefetch TT bucket early. (No correction-row prefetch here, unlike
+    // negamax: measured no gain on the stand-pat read, and it would fetch
+    // five lines at every TT-cutoff and in-check QS node.)
     info.tt.prefetch(board.hash);
 
     info.nodes += 1;
@@ -7874,14 +8010,16 @@ fn quiescence_with_depth(
         }
     }
 
-    // Check detection
-    let qs_pinned = board.pinned();
-    let qs_checkers = board.checkers();
+    // Check detection. The pin scan is deferred to the two move loops below
+    // (evasions, captures): most quiescence nodes leave at stand-pat and never
+    // read it.
+    let qs_checkers = checkers_for_node(info, board, ply as usize);
     let qs_in_check = qs_checkers != 0;
 
     // When in check, generate all evasion moves using main MovePicker
     // Full history scoring for quiet evasions
     if qs_in_check {
+        let qs_pinned = board.pinned();
         let qs_prev_move = if !board.undo_stack.is_empty() {
             board.undo_stack[board.undo_stack.len() - 1].mv
         } else {
@@ -8116,6 +8254,8 @@ fn quiescence_with_depth(
         return best_score;
     }
 
+    let qs_pinned = board.pinned();
+
     // Use main MovePicker in quiescence mode.
     // This partitions captures into good (SEE>=0) and bad, and uses staged ordering.
     let mut picker = MovePicker::new_quiescence(tt_move, &info.history, &info.cont, qs_checkers, qs_pinned);
@@ -8336,7 +8476,17 @@ pub const BENCH_PATHOLOGY_POSITIONS: &[&str] = &[
 
 /// Run bench: fixed-depth search on standard positions, return total nodes.
 pub fn bench(depth: i32, nnue_path: Option<&str>) -> u64 {
-    bench_inner(depth, nnue_path, true)
+    bench_inner(depth, nnue_path, true, None).0
+}
+
+/// Bench that also returns the time spent searching, excluding net load and
+/// table setup. `coda bench` reports NPS from this, so the figure is search
+/// speed and does not move with startup cost (e.g. the SharedWeights publish).
+/// With a barrier, every thread loads its net first and they start searching
+/// together, so the slowest thread's duration is the aggregate wall-clock.
+pub fn bench_timed(depth: i32, nnue_path: Option<&str>, print_stats: bool,
+                   start_together: Option<&std::sync::Barrier>) -> (u64, std::time::Duration) {
+    bench_inner(depth, nnue_path, print_stats, start_together)
 }
 
 /// Run pathology bench: per-position node + wall-clock report. Returns
@@ -8390,10 +8540,11 @@ pub fn bench_pathology(depth: i32, node_threshold: u64, nnue_path: Option<&str>)
 
 /// Run bench without printing stats (for multi-threaded bench).
 pub fn bench_silent(depth: i32, nnue_path: Option<&str>) -> u64 {
-    bench_inner(depth, nnue_path, false)
+    bench_inner(depth, nnue_path, false, None).0
 }
 
-fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
+fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool,
+               start_together: Option<&std::sync::Barrier>) -> (u64, std::time::Duration) {
     let positions = BENCH_POSITIONS;
 
     let mut info = SearchInfo::new(16);
@@ -8422,6 +8573,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         ..SearchLimits::new()
     };
 
+    if let Some(b) = start_together { b.wait(); }
+    let search_start = std::time::Instant::now();
     for fen in positions {
         let mut board = Board::from_fen(fen);
         info.nodes = 0;
@@ -8450,7 +8603,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         }
     }
 
-    if !print_stats { return total_nodes; }
+    let search_time = search_start.elapsed();
+    if !print_stats { return (total_nodes, search_time); }
 
     // Print pruning stats (accumulated across all positions)
     let s = &total_stats;
@@ -8642,7 +8796,7 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool) -> u64 {
         crate::threats::refresh_stats::report();
     }
 
-    total_nodes
+    (total_nodes, search_time)
 }
 
 fn reset_bench_position_state(info: &mut SearchInfo) {
@@ -8668,6 +8822,27 @@ pub(crate) fn test_net_path() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `correction_value` blends in i32. That is exact only while the largest
+    /// possible weighted sum fits: every entry at CORR_HIST_LIMIT (the cont
+    /// source sums two entries) and every weight at the top of its tunable
+    /// range, which is the most setoption can store. Also checks the fused
+    /// divisor. Fails if a range is widened past what i32 can hold.
+    #[test]
+    fn corr_blend_fits_i32() {
+        let max_of = |name: &str| -> i64 {
+            tunable_params().into_iter().find(|t| t.0 == name)
+                .unwrap_or_else(|| panic!("tunable {} missing", name)).4 as i64
+        };
+        let lim = CORR_HIST_LIMIT as i64;
+        let worst = lim * max_of("CORR_W_PAWN")
+            + 2 * lim * max_of("CORR_W_NP")
+            + 2 * lim * max_of("CORR_W_CONT")
+            + lim * max_of("CORR_W_TRANS");
+        assert!(worst < i32::MAX as i64, "corr blend can overflow i32: {}", worst);
+        let div = max_of("CORR_HIST_DIV") * max_of("CORR_HIST_GRAIN_T");
+        assert!(div < i32::MAX as i64, "fused corr divisor overflows i32: {}", div);
+    }
 
     // Supply WDL through the real cache, and raw eval through the TT. These
     // tests need neither tablebase files nor an NNUE net. Any unexpected
@@ -9637,6 +9812,42 @@ mod tests {
                 "ponder-on opt at t={} inc={} mtg={} fm={}: got {}, want {}",
                 t, inc, mtg, fm, opt_p, expected);
             assert!(opt_p >= opt_np);
+        }
+    }
+
+    /// Play a game where every move spends exactly its opt budget (factor
+    /// product 1.0, no ponder, a fixed per-move latency). Returns our clock in
+    /// ms after each move.
+    fn simulate_clock(base_ms: u64, inc_ms: u64, moves: u16, latency_ms: u64) -> Vec<u64> {
+        let mut clock = base_ms;
+        let mut out = Vec::new();
+        for fm in 1..=moves {
+            let (opt, _, _, _) = compute_tm_budgets(clock, inc_ms, 0, 100, fm, false, 0);
+            clock = clock.saturating_sub(opt + latency_ms) + inc_ms;
+            out.push(clock);
+        }
+        out
+    }
+
+    /// Without increment, a 200-move 1+0 game (the longest in Coda's lichess
+    /// history) with 15 ms of latency on every move must not flag.
+    #[test]
+    fn no_increment_long_game_never_flags() {
+        let clk = simulate_clock(60_000, 0, 200, 15);
+        assert!(clk.iter().all(|&c| c > 0), "1+0 clock ran out: last {:?}", &clk[200..]);
+    }
+
+    /// The no-increment cap leaves the opening and early middlegame exactly as
+    /// the growing divisor paced them: identical budgets up to move 40.
+    #[test]
+    fn no_increment_cap_leaves_early_game_unchanged() {
+        let (cap0, cap1, floor) = (tp(&NO_INC_CAP_START), tp(&NO_INC_CAP_SLOPE_100), tp(&NO_INC_CAP_FLOOR));
+        let base = tp(&NO_INC_MTG_BASE) as i64;
+        let growth = tp(&NO_INC_MTG_GROWTH_PCT) as i64;
+        for fm in 1..=40i64 {
+            let grown = base + (fm - base).max(0) * growth / 100;
+            let cap = (cap0 as i64 - cap1 as i64 * fm / 100).max(floor as i64);
+            assert!(cap >= grown, "cap binds at fm {}: {} < {}", fm, cap, grown);
         }
     }
 

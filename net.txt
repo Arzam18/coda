@@ -1,1 +1,1 @@
-https://github.com/adamtwiss/coda/releases/download/v0.9-nets/net-0F08CC1B.nnue
+https://github.com/adamtwiss/coda/releases/download/v0.9-nets/net-FCEDBEFC.nnue
