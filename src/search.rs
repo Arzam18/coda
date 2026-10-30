@@ -488,6 +488,17 @@ tunables!(
     // PROBCUT_TT_DEPTH_SLACK: TT depth must be >= current depth - SLACK for
     // ProbCut-TT-noshot to consider the entry.
     (PROBCUT_TT_DEPTH_SLACK, 3, 0, 10, 0.5, false),
+    // TT_CONTRA_DECAY: plies a same-key TT entry loses when a write to it is
+    // refused (the stored entry is much deeper, see `TT::store`) AND the
+    // refused main-search result is a bound disjoint from the stored one, i.e.
+    // the shallower re-search contradicts the deep claim. Repeated
+    // contradictions erode the entry until the next write gets through.
+    // Seed 1: the smallest step of the depth field, and the same one-ply unit
+    // as the TT cutoff's one-ply allowance for upper-bound entries. At 1 an
+    // entry's 4-ply refusal margin is spent after at most 4 contradictions.
+    // Max 4 = that refusal margin (one contradiction then reopens the slot);
+    // 0 disables the mechanism.
+    (TT_CONTRA_DECAY, 1, 0, 4, 0.5, false),
     (HIST_BONUS_MULT, 235, 50, 400, 17.5, true),
     (HIST_BONUS_MAX, 1711, 500, 3000, 125.0, true),
     // History bonus uses the offset shape `clamp(0, MAX, MULT*d - OFFSET)`

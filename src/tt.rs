@@ -535,6 +535,24 @@ impl TT {
                 let stored_key = key_upper ^ (stored_data as u32);
                 bucket.data[special].store(stored_data, Ordering::Release);
                 bucket.keys[special].store(stored_key, Ordering::Release);
+            } else if depth > 0 && bounds_contradict(unpack_flag(slot_data), unpack_score(slot_data), flag, score) {
+                // Refused write that CONTRADICTS the deep entry: the shallower
+                // main-search result is a bound disjoint from the stored one.
+                // Keep the entry (it is still the deeper evidence) but let it
+                // count for less depth, so persistent contradiction eventually
+                // lets a fresh result replace it. Depth > 0 restricts the
+                // evidence to main-search results: QS (-1) and eval-only stubs
+                // (-2, score -INFINITY) are not searches at a comparable
+                // horizon. Depth sits in bits 48-55, outside the low 32 bits
+                // the key is XORed with, so the key stays valid; a CAS keeps
+                // a concurrent writer's entry from being clobbered.
+                let decay = crate::search::TT_CONTRA_DECAY.load(Ordering::Relaxed);
+                if decay > 0 {
+                    let decayed = (slot_data & !(0xFFu64 << 48))
+                        | (((slot_depth - decay).clamp(-128, 127) as i8 as u8 as u64) << 48);
+                    let _ = bucket.data[special].compare_exchange(
+                        slot_data, decayed, Ordering::AcqRel, Ordering::Relaxed);
+                }
             }
             return;
         }
@@ -590,6 +608,21 @@ impl TT {
         }
         used * 1000 / (sample as u32 * BUCKET_SIZE as u32)
     }
+}
+
+/// True when two TT bounds on the same position cannot both hold: a lower
+/// bound above an upper bound, or an exact score outside a bound. Scores are
+/// in TT space (mate/TB distances relative to this position), so they compare
+/// directly regardless of the ply each was stored from.
+#[inline(always)]
+fn bounds_contradict(old_flag: u8, old_score: i32, new_flag: u8, new_score: i32) -> bool {
+    let new_lo_over = (new_flag == TT_FLAG_LOWER || new_flag == TT_FLAG_EXACT)
+        && (old_flag == TT_FLAG_UPPER || old_flag == TT_FLAG_EXACT)
+        && new_score > old_score;
+    let new_hi_under = (new_flag == TT_FLAG_UPPER || new_flag == TT_FLAG_EXACT)
+        && (old_flag == TT_FLAG_LOWER || old_flag == TT_FLAG_EXACT)
+        && new_score < old_score;
+    new_lo_over || new_hi_under
 }
 
 /// Adjust mate and TB scores for TT storage (add ply).
@@ -916,7 +949,9 @@ mod tests {
         // Write deep
         tt.store(h, 20, 100, TT_FLAG_EXACT, 0x200, 0, false);
         // Same-gen shallow attempt: 16 is not > 20-4 = 16, should NOT overwrite.
-        tt.store(h, 16, 500, TT_FLAG_LOWER, 0x300, 0, false);
+        // The bound (>= 50) agrees with the exact 100, so no contradiction
+        // decay either (see tt_contradicting_refused_write_decays_depth).
+        tt.store(h, 16, 50, TT_FLAG_LOWER, 0x300, 0, false);
 
         let e = tt.probe(h);
         assert!(e.hit);
@@ -929,6 +964,57 @@ mod tests {
         // Depth 19 > 20-4 = 16, so overwrite allowed.
         assert_eq!(e2.depth, 19);
         assert_eq!(e2.score, 999);
+    }
+
+    /// A refused same-gen shallow write whose bound is disjoint from the deep
+    /// entry costs that entry TT_CONTRA_DECAY plies (default 1) and nothing
+    /// else: score, flag and move are kept, and the key still verifies.
+    #[test]
+    fn tt_contradicting_refused_write_decays_depth() {
+        let decay = crate::search::TT_CONTRA_DECAY.load(Ordering::Relaxed);
+        assert!(decay > 0, "test assumes the mechanism is on");
+        let tt = TT::new(4);
+        let h = mk_hash(11);
+        tt.store(h, 20, 100, TT_FLAG_LOWER, 0x200, 0, false);
+        // Upper bound 40 < lower bound 100: contradiction, refused (8 <= 16).
+        tt.store(h, 8, 40, TT_FLAG_UPPER, 0x300, 0, false);
+        let e = tt.probe(h);
+        assert!(e.hit);
+        assert_eq!(e.depth, 20 - decay);
+        assert_eq!(e.score, 100);
+        assert_eq!(e.flag, TT_FLAG_LOWER);
+        assert_eq!(e.best_move, 0x200);
+
+        // A consistent refused write (upper 150 >= lower 100) leaves it alone.
+        tt.store(h, 8, 150, TT_FLAG_UPPER, 0x300, 0, false);
+        assert_eq!(tt.probe(h).depth, 20 - decay);
+
+        // QS (-1) and eval-only (-2) writes are not evidence.
+        tt.store(h, -1, 40, TT_FLAG_UPPER, 0x300, 0, false);
+        tt.store(h, -2, -30000, TT_FLAG_UPPER, 0x300, 0, false);
+        assert_eq!(tt.probe(h).depth, 20 - decay);
+
+        // Upper-bound entry contradicted by a higher lower bound.
+        let h2 = mk_hash(12);
+        tt.store(h2, 20, -50, TT_FLAG_UPPER, 0x200, 0, false);
+        tt.store(h2, 6, 10, TT_FLAG_LOWER, 0x300, 0, false);
+        assert_eq!(tt.probe(h2).depth, 20 - decay);
+        assert_eq!(tt.probe(h2).score, -50);
+    }
+
+    #[test]
+    fn bounds_contradict_truth_table() {
+        let (l, u, x) = (TT_FLAG_LOWER, TT_FLAG_UPPER, TT_FLAG_EXACT);
+        assert!(bounds_contradict(l, 100, u, 99));
+        assert!(!bounds_contradict(l, 100, u, 100));
+        assert!(!bounds_contradict(l, 100, l, -500));
+        assert!(bounds_contradict(u, 100, l, 101));
+        assert!(!bounds_contradict(u, 100, u, 500));
+        assert!(bounds_contradict(x, 100, l, 101));
+        assert!(bounds_contradict(x, 100, u, 99));
+        assert!(!bounds_contradict(x, 100, l, 100));
+        assert!(bounds_contradict(l, 100, x, 50));
+        assert!(bounds_contradict(u, 100, x, 150));
     }
 
     /// Store returns early on empty slot; the store-loop scans all
