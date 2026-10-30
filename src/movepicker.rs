@@ -693,6 +693,11 @@ impl MovePicker {
         let quiet_check_bonus = crate::search::QUIET_CHECK_BONUS.load(Ordering::Relaxed);
         let quiet_check_see_margin = crate::search::QUIET_CHECK_SEE_MARGIN.load(Ordering::Relaxed);
         let kf_bonus = crate::search::KNIGHT_FORK_BONUS.load(Ordering::Relaxed);
+        // Threat-lift numerator, hoisted: QUIET_CHECK_BONUS * SCALE/100 (at
+        // most 30000 * 2, so `offense_base * t` stays far inside i32).
+        let offense_base =
+            quiet_check_bonus * crate::search::OFFENSE_SCALE_PCT.load(Ordering::Relaxed) / 100;
+        let offense_mover_w = crate::search::OFFENSE_MOVER_W_PCT.load(Ordering::Relaxed);
         let us = board.side_to_move;
         let them = 1 - us;
         let occ = board.colors[us as usize] | board.colors[them as usize];
@@ -771,14 +776,24 @@ impl MovePicker {
                 score += quiet_check_bonus;
             }
 
-
-
-            // "Offense bonus": quiet move that lands on a square
-            // attacking an enemy non-pawn piece. +6000 flat. Not yet present
-            // in Coda; consensus places it at ~+6000. Signal: does our piece on
-            // `to` attack an enemy worth threatening?
-            // Safety filter: skip if `to` is attacked by any lower-value enemy
-            // piece (the capture back would be net negative for us).
+            // Threat lift: a quiet that lands attacking an enemy
+            // non-pawn piece is the quiet analogue of the check bonus above,
+            // so it is priced in the check bonus's own units. With t the
+            // see_value of the most valuable piece attacked from `to` and m the
+            // see_value of the mover:
+            //
+            //     lift = QUIET_CHECK_BONUS * SCALE/100 * t / (t + m*W/100)
+            //
+            // t / (t + m) is the target's share of the material on the
+            // exchange: one half for an even threat (t == m), rising toward 1
+            // as the target dwarfs the mover (a pawn hitting a queen), falling
+            // toward 0 as the mover dwarfs it (a queen hitting a minor, which
+            // can usually just be defended). It is one continuous term in
+            // Coda's SEE units; the bound below 1 means that at SCALE=100 a
+            // threat never outranks a quiet check. W weights the mover so SPSA
+            // can sharpen or flatten that contrast (see OFFENSE_SCALE_PCT).
+            // Safety filter: skip if `to` is attacked by an enemy pawn (the
+            // pawn recapture would be net negative for any non-pawn mover).
             if piece != NO_PIECE {
                 if pt < 6 {
                     // We'd be on `to` after the move; compute attacks from `to` by our piece type.
@@ -788,37 +803,21 @@ impl MovePicker {
                         2 => bishop_attacks(to as u32, occ & !(1u64 << from)),  // bishop: occ minus our from-square
                         3 => rook_attacks(to as u32, occ & !(1u64 << from)),    // rook
                         4 => queen_attacks(to as u32, occ & !(1u64 << from)),   // queen
-                        _ => 0,  // king — no offense bonus, too risky
+                        _ => 0,  // king — no threat lift, too risky
                     };
                     if attacks_from_to & enemy_non_pawns != 0 {
-                        // Safety check: skip if `to` is attacked by enemy pawn
-                        // (which could recapture us).
                         // Only skip if WE would be a bigger target than a pawn
                         let unsafe_square = pt != 0 && (enemy_pawn_attacks & (1u64 << to)) != 0;
                         if !unsafe_square {
-                            score += 6000;
-                            // "Good quiet": the offense move's strongest target
-                            // is worth more than the piece making the move — a
-                            // cheap proxy for positive quiet-SEE. The 6687 is a
-                            // tuned value and ablation-confirmed load-bearing
-                            // (~2 Elo), not an arbitrary constant.
-                            {
-                                let our_val = see_value(pt);
-                                let mut hits = attacks_from_to & enemy_non_pawns;
-                                let mut max_t_val = 0;
-                                while hits != 0 {
-                                    let t_sq = hits.trailing_zeros() as u8;
-                                    hits &= hits - 1;
-                                    let t_pt = board.piece_type_at(t_sq);
-                                    if t_pt < 6 {
-                                        let v = see_value(t_pt);
-                                        if v > max_t_val { max_t_val = v; }
-                                    }
-                                }
-                                if max_t_val > our_val {
-                                    score += 6687;
-                                }
+                            let mut hits = attacks_from_to & enemy_non_pawns;
+                            let mut t_val = 0;
+                            while hits != 0 {
+                                let t_sq = hits.trailing_zeros() as u8;
+                                hits &= hits - 1;
+                                t_val = t_val.max(see_value(board.piece_type_at(t_sq)));
                             }
+                            score += offense_base * t_val
+                                / (t_val + see_value(pt) * offense_mover_w / 100);
                         }
                         // Knight-fork bonus: knight move attacking 2+ enemy
                         // non-pawn pieces from `to` is a fork. Tunable
@@ -1849,6 +1848,51 @@ mod quiet_check_bonus_tests {
         // A plain king step gives no check.
         let kd1 = scores.iter().find(|&&(m, _)| move_from(m) == 4 && move_to(m) == 3).unwrap();
         assert_eq!(kd1.1, 0);
+    }
+
+    /// The threat lift as the scorer prices it, from the live tunables.
+    fn threat_lift(target_pt: u8, mover_pt: u8) -> i32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let base = bonus() * crate::search::OFFENSE_SCALE_PCT.load(Relaxed) / 100;
+        let w = crate::search::OFFENSE_MOVER_W_PCT.load(Relaxed);
+        let (t, m) = (see_value(target_pt), see_value(mover_pt));
+        base * t / (t + m * w / 100)
+    }
+
+    fn score_of(scores: &[(Move, i32)], from: u8, to: u8) -> i32 {
+        scores
+            .iter()
+            .find(|&&(m, _)| move_from(m) == from && move_to(m) == to)
+            .unwrap_or_else(|| panic!("move {}{} not generated", from, to))
+            .1
+    }
+
+    /// Ng1-f3 and Ng1-e2 both hit the d4 rook (no checks, no pawns, one
+    /// target, so no fork): each scores exactly the threat lift. Ng1-h3
+    /// attacks nothing and scores zero.
+    #[test]
+    fn threat_lift_prices_target_against_mover() {
+        let scores = quiet_scores("k7/8/8/8/3r4/8/8/6NK w - - 0 1");
+        let lift = threat_lift(ROOK, KNIGHT);
+        assert!(lift > 0);
+        assert_eq!(score_of(&scores, 6, 21), lift, "Ng1-f3");
+        assert_eq!(score_of(&scores, 6, 12), lift, "Ng1-e2");
+        assert_eq!(score_of(&scores, 6, 23), 0, "Ng1-h3");
+    }
+
+    /// The lift is continuous in the material at stake: a pawn hitting a
+    /// knight outranks a knight hitting a rook, which outranks a queen
+    /// hitting a knight, and at default tunables none outranks a quiet check.
+    #[test]
+    fn threat_lift_orders_by_target_share() {
+        let scores = quiet_scores("8/7k/8/2n5/8/1P6/8/Q6K w - - 0 1");
+        let pawn_on_knight = score_of(&scores, 17, 25); // b3-b4 hits c5
+        let queen_on_knight = score_of(&scores, 0, 16); // Qa1-a3 hits c5
+        assert_eq!(pawn_on_knight, threat_lift(KNIGHT, PAWN));
+        assert_eq!(queen_on_knight, threat_lift(KNIGHT, QUEEN));
+        let knight_on_rook = threat_lift(ROOK, KNIGHT);
+        assert!(pawn_on_knight > knight_on_rook && knight_on_rook > queen_on_knight);
+        assert!(pawn_on_knight < bonus(), "a threat outranked a quiet check");
     }
 }
 

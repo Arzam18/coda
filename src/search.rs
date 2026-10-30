@@ -660,6 +660,18 @@ tunables!(
     // avoid contributing loose-knob false gradients to the sweep.
     (PAWN_HIST_MULT_10X, 14, 0, 80, 10.0, false),
     (KNIGHT_FORK_BONUS, 8722, 0, 20000, 1000.0, false),
+    // Threat ordering lift for a quiet that lands attacking an enemy
+    // non-pawn piece: QUIET_CHECK_BONUS * SCALE/100 * t / (t + m*W/100),
+    // t = see_value of the best target, m = see_value of the mover (see
+    // movepicker). The unweighted form (SCALE = W = 100) needs no constant of
+    // its own: an even threat (t == m) earns half a check, and the lift
+    // approaches a full check only as the target dwarfs the mover. Values are
+    // SPSA-tuned from that unweighted seed.
+    (OFFENSE_SCALE_PCT, 97, 20, 200, 10.0, false),
+    // Weight on the mover's value in the denominator: > 100 penalises heavy
+    // movers (a queen threatening a minor) harder and sharpens the contrast
+    // between favourable and even threats; < 100 flattens it.
+    (OFFENSE_MOVER_W_PCT, 102, 25, 400, 20.0, false),
     // --- Pruning depth gates ---
     // These are sensitive to eval quality and want re-calibrating after a net
     // change, which is why they are tunable rather than hardcoded.
