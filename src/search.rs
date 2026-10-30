@@ -657,11 +657,11 @@ tunables!(
     // threat quiets at the 1154285-node tree): the unweighted form averages
     // 6971 per threat vs 7228 for the flat-plus-step form it replaced (ratio
     // 1.04), so SCALE=100 starts inside the band the old lift occupied.
-    (OFFENSE_SCALE_PCT, 100, 20, 200, 10.0, false),
+    (OFFENSE_SCALE_PCT, 97, 20, 200, 10.0, false),
     // Weight on the mover's value in the denominator: > 100 penalises heavy
     // movers (a queen threatening a minor) harder and sharpens the contrast
     // between favourable and even threats; < 100 flattens it.
-    (OFFENSE_MOVER_W_PCT, 100, 25, 400, 20.0, false),
+    (OFFENSE_MOVER_W_PCT, 102, 25, 400, 20.0, false),
     // --- Pruning depth gates ---
     // These are sensitive to eval quality and want re-calibrating after a net
     // change, which is why they are tunable rather than hardcoded.
