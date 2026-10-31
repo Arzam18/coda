@@ -452,6 +452,19 @@ tunables!(
     (LMR_ROOT_THRESH, 15, 6, 30, 1.5, false),
     (LMR_ROOT_COEF_10X, 4, 0, 800, 40.0, true),
     (BAD_NOISY_MARGIN, 87, 30, 150, 6.0, true),
+    // BNFP optimistic-gain credit. The bound credits the captured piece at
+    // VICTIM_PCT% of its eval-unit value, i.e. see_value(victim) bridged by
+    // SEE_MATERIAL_SCALE exactly as the QS delta prune does, so the term is in
+    // the same units as static_eval and BAD_NOISY_MARGIN. (A June test credited
+    // raw see_value, which at SEE_MATERIAL_SCALE=211 is under half the victim's
+    // eval-unit worth.) Seeded at 100 = the full optimistic gain.
+    (BNFP_VICTIM_PCT, 100, 0, 150, 10.0, true),
+    // BNFP capture-history credit: capt_hist / DIV. Derivation: capt_hist is
+    // bounded by MAX_HISTORY = 16384, and one minor in eval units is
+    // see_value(KNIGHT) * SEE_MATERIAL_SCALE / 100 = 420 * 2.11 = 886, so
+    // 16384 / 886 = 18.5 -> 18 makes a maxed-out history worth about one minor
+    // (and a fully negative one take about one minor off the bound).
+    (BNFP_CAPT_HIST_DIV, 18, 6, 60, 3.0, true),
     (PROBCUT_MARGIN, 162, 80, 300, 11.0, true),
     // ProbCut margin reduction when improving (Stockfish/Alexandria shape):
     // improving positions verify against a lower beta, non-improving nodes
@@ -488,6 +501,17 @@ tunables!(
     // PROBCUT_TT_DEPTH_SLACK: TT depth must be >= current depth - SLACK for
     // ProbCut-TT-noshot to consider the entry.
     (PROBCUT_TT_DEPTH_SLACK, 3, 0, 10, 0.5, false),
+    // TT_CONTRA_DECAY: plies a same-key TT entry loses when a write to it is
+    // refused (the stored entry is much deeper, see `TT::store`) AND the
+    // refused main-search result is a bound disjoint from the stored one, i.e.
+    // the shallower re-search contradicts the deep claim. Repeated
+    // contradictions erode the entry until the next write gets through.
+    // Seed 1: the smallest step of the depth field, and the same one-ply unit
+    // as the TT cutoff's one-ply allowance for upper-bound entries. At 1 an
+    // entry's 4-ply refusal margin is spent after at most 4 contradictions.
+    // Max 4 = that refusal margin (one contradiction then reopens the slot);
+    // 0 disables the mechanism.
+    (TT_CONTRA_DECAY, 1, 0, 4, 0.5, false),
     (HIST_BONUS_MULT, 235, 50, 400, 17.5, true),
     (HIST_BONUS_MAX, 1711, 500, 3000, 125.0, true),
     // History bonus uses the offset shape `clamp(0, MAX, MULT*d - OFFSET)`
@@ -647,6 +671,18 @@ tunables!(
     // avoid contributing loose-knob false gradients to the sweep.
     (PAWN_HIST_MULT_10X, 14, 0, 80, 10.0, false),
     (KNIGHT_FORK_BONUS, 8722, 0, 20000, 1000.0, false),
+    // Threat ordering lift for a quiet that lands attacking an enemy
+    // non-pawn piece: QUIET_CHECK_BONUS * SCALE/100 * t / (t + m*W/100),
+    // t = see_value of the best target, m = see_value of the mover (see
+    // movepicker). The unweighted form (SCALE = W = 100) needs no constant of
+    // its own: an even threat (t == m) earns half a check, and the lift
+    // approaches a full check only as the target dwarfs the mover. Values are
+    // SPSA-tuned from that unweighted seed.
+    (OFFENSE_SCALE_PCT, 97, 20, 200, 10.0, false),
+    // Weight on the mover's value in the denominator: > 100 penalises heavy
+    // movers (a queen threatening a minor) harder and sharpens the contrast
+    // between favourable and even threats; < 100 flattens it.
+    (OFFENSE_MOVER_W_PCT, 102, 25, 400, 20.0, false),
     // --- Pruning depth gates ---
     // These are sensitive to eval quality and want re-calibrating after a net
     // change, which is why they are tunable rather than hardcoded.
@@ -1223,6 +1259,7 @@ prune_stats! {
     tt_cross_gen_cutoffs: u64,
     tt_cutoffs: u64,
     tt_near_miss: u64,
+    tt_bound_decays: u64,
     nmp_attempts: u64,
     nmp_cutoffs: u64,
     nmp_verify: u64,
@@ -2481,7 +2518,7 @@ fn tt_cutoff_child_disagrees(
     depth: i32,
     ply: i32,
 ) -> bool {
-    if depth < 7 || tt_move == NO_MOVE || is_decisive(tt_score) {
+    if depth < crate::tt::TT_DEEP_ENTRY_DEPTH || tt_move == NO_MOVE || is_decisive(tt_score) {
         return false;
     }
     // Full legality validation before speculatively making the move (stale TT
@@ -5705,6 +5742,20 @@ fn negamax(
                 // from the post-mate-dist window. alpha here is still
                 // alpha_orig — TT narrowing happens after this check.
                 let tt_cut_is_pv = beta - alpha > 1;
+                // Wrong-bound decay. The entry is deep enough to decide this
+                // node but bounded on the other side of beta, so it cannot
+                // cut and only takes a slot that a usable entry could hold.
+                // Lower its stored depth by one ply: an entry that keeps
+                // being reached from windows it cannot answer loses its
+                // replacement priority a ply at a time, while one that does
+                // cut is never touched. Same "stale deep entries should not
+                // be trusted at full weight" reasoning as the child check
+                // below, gated at the same node depth.
+                if !tt_cut_is_pv && !bound_matches && depth >= crate::tt::TT_DEEP_ENTRY_DEPTH
+                    && info.tt.decay_wrong_bound(board.hash, tt_depth, tt_entry.flag)
+                {
+                    info.stats.tt_bound_decays += 1;
+                }
                 // Child-consistency verification for DEEP cutoffs (concept
                 // from SF, independently re-implemented): at depth>=7,
                 // make the TT move, probe the child's entry, unmake; decline
@@ -6830,11 +6881,20 @@ let singular_beta = tt_score_local - depth;
         // earlier still, right after the skip_quiets check — SF Step-14 order.)
 
         // Bad noisy pruning: skip losing captures when eval is far below alpha.
+        // The optimistic bound credits what the capture could gain: the
+        // victim's eval-unit value plus a capture-history term, so a losing
+        // QxR is not judged by the same bound as a losing QxP, and captures
+        // that have historically produced cutoffs keep a wider bound (the same
+        // signal the SEE-capture gate above already uses).
         // Applied before MakeMove. Direct-check carve-out: don't prune moves
         // that give direct check.
         if FEAT_BAD_NOISY.load(Ordering::Relaxed) && is_cap && !in_check && ply > 0 && depth <= tp10(&BAD_NOISY_DEPTH_10X) && mv != tt_move
             && !is_promo && !is_loss(best_score)
-            && static_eval > -INFINITY && static_eval + depth * tp(&BAD_NOISY_MARGIN) <= alpha
+            && static_eval > -INFINITY
+            && static_eval + depth * tp(&BAD_NOISY_MARGIN)
+                + see_value(captured_pt) * tp(&SEE_MATERIAL_SCALE) / 100 * tp(&BNFP_VICTIM_PCT) / 100
+                + crate::movepicker::capt_hist_score_static(board, &info.history, mv) / tp(&BNFP_CAPT_HIST_DIV).max(1)
+                <= alpha
             && !see_ge(board, mv, 0)
             && !board.gives_direct_check(mv)
         {
@@ -8621,6 +8681,8 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool,
         s.tt_cross_gen_cutoffs,
         if s.tt_cutoffs > 0 { s.tt_cross_gen_cutoffs as f64 / s.tt_cutoffs as f64 * 100.0 } else { 0.0 });
     eprintln!("TT near-miss:   {:>8}", s.tt_near_miss);
+    eprintln!("TT bound decay: {:>8}  ({:.2}% of TT hits)", s.tt_bound_decays,
+        if s.tt_hits > 0 { s.tt_bound_decays as f64 / s.tt_hits as f64 * 100.0 } else { 0.0 });
     // Root aspiration failures. These were accumulated but never printed, so
     // nobody had seen that ~75% of windows fail their first search (2026-09-06
     // audit). Games say the narrow window is optimal regardless -- the
