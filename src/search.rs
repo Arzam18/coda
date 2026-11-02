@@ -113,27 +113,18 @@ tunables!(
     // ROUNDS rather than truncates. Whole raw bands therefore collapse to one
     // effective value, so such a parameter can post a large SPSA percentage
     // while changing nothing at all. Check the bucket before acting on a mover.
-    (NMP_BASE_R_10X, 58, 20, 80, 15.0, true),
-    (NMP_DEPTH_DIV_10X, 32, 10, 200, 15.0, true),
-    (NMP_EVAL_DIV, 51, 50, 400, 17.5, true),
+    (NMP_BASE_R_10X, 60, 20, 80, 15.0, true),
+    (NMP_DEPTH_DIV_10X, 40, 10, 200, 15.0, true),
+    (NMP_EVAL_DIV, 54, 50, 400, 17.5, true),
     (NMP_EVAL_MAX_10X, 35, 10, 60, 5.0, false),
     // Depth at/above which an NMP cutoff must be re-searched to verify it.
     // Must stay ABOVE the min-depth gate: if it sits below, every NMP cutoff
     // pays a verification re-search and NMP never gets a cheap cutoff. Below
     // this depth the cutoff is taken unverified; above it the re-search acts
     // as the zugzwang guard.
-    // Null-move cutoffs are verified from depth 7 (was 8 after the core SPSA
-    // retune #3436 moved this 68 -> 80). Corpus finding 2026-09-07: among the
-    // retune's 64 parameters this one alone recovers nearly the whole 18%
-    // nodes-to-depth cost the retune added on resolved endgames (0.86x, best
-    // p90 of every single-knob revert); the mechanism is unverified spurious
-    // null-move fail-highs in drawn positions leaving TT bounds that are
-    // later refused and re-searched. Strength-neutral in a 516-game endgame
-    // match; this SPRT is the fleet read.
-    (NMP_VERIFY_DEPTH_10X, 68, 40, 200, 20.0, true),
     (RFP_DEPTH, 17, 2, 20, 2.0, true),
-    (RFP_MARGIN_IMP, 24, 0, 150, 6.0, true),
-    (RFP_MARGIN_NOIMP, 32, 0, 200, 7.5, true),
+    (RFP_MARGIN_IMP, 25, 0, 150, 6.0, true),
+    (RFP_MARGIN_NOIMP, 36, 0, 200, 7.5, true),
     // Root-depth-aware RFP relaxation (single-set, self-adapts STC<->LTC):
     // demand MORE static-eval confidence to RFP-cut as the OVERALL search
     // depth grows past RFP_ROOT_THRESH (diminishing-returns of depth — the
@@ -144,20 +135,20 @@ tunables!(
     // root_depth, not on TC. Warm-TT measurement at 250ms/move: root_depth > 18
     // on 39% of moves overall — 0% in the opening but 92% through the late
     // middlegame. Cold-TT probes understate this badly.
-    (RFP_ROOT_THRESH, 17, 6, 30, 1.5, true),
+    (RFP_ROOT_THRESH, 18, 6, 30, 1.5, true),
     (RFP_ROOT_COEF, 20, 0, 150, 7.5, false),
     // Additional depth-local RFP relaxation: current main already scales RFP
     // by overall root depth; this term raises the margin for high remaining
     // depth regardless of TC. Consensus engines either cap RFP around d9-11
     // or use a quadratic/deepening margin so static eval does not keep
     // cheaply pruning d12+ nodes.
-    (RFP_DEEP_KNEE_10X, 47, 40, 170, 20.0, true),
-    (RFP_DEEP_LINEAR, 45, 0, 200, 10.0, true),
+    (RFP_DEEP_KNEE_10X, 44, 40, 170, 20.0, true),
+    (RFP_DEEP_LINEAR, 53, 0, 200, 10.0, true),
     // Razoring: drop straight to qsearch when static eval is far enough below
     // alpha that a full search is unlikely to recover it. Margin scales with
     // depth, gated to shallow depths only.
     (RAZOR_MULT, 294, 100, 500, 20.0, false),
-    (RAZOR_DEPTH_10X, 35, 10, 80, 5.0, true),
+    (RAZOR_DEPTH_10X, 34, 10, 80, 5.0, true),
     // Razoring is disabled once |alpha| exceeds this, so it only fires in
     // positions that are still in the balance. The MAX IS DELIBERATELY FAR
     // BELOW TB_WIN (28800): the tablebase floor/ceiling can only be set when
@@ -174,14 +165,14 @@ tunables!(
     // Futility margin: base + per-depth, compared against alpha at the
     // frontier. History adjusts the effective lmr_depth used here, so these
     // interact with the LMR history terms — retune the pair together.
-    (FUT_BASE, 84, 0, 200, 9.0, true),
-    (FUT_PER_DEPTH, 94, 40, 250, 10.5, true),
+    (FUT_BASE, 85, 0, 200, 9.0, true),
+    (FUT_PER_DEPTH, 96, 40, 250, 10.5, true),
     // Strong-history exemption for quiet futility: a quiet whose main history
     // exceeds this is never futility-pruned. It was the hardcoded literal 12000
     // sitting inside the gate at search.rs while every other term around it was
     // SPSA-tunable -- so SPSA has been optimising a formula with one frozen
     // input. Exposing it costs nothing and is behaviour-identical at 12000.
-    (FUT_HIST_EXEMPT, 12628, 2000, 16384, 900.0, true),
+    (FUT_HIST_EXEMPT, 12103, 2000, 16384, 900.0, true),
     // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
     // One SPSA step either way changes under 0.04% of futility prunes, so
     // in core SPSA it would only add gradient noise. Kept at its value.
@@ -190,7 +181,7 @@ tunables!(
     // FUT_PER_DEPTH / 8 — one depth-ply of margin per eight moves; capped at
     // the depth term so the margin never drops below FUT_BASE. Futility is
     // evaluated per move across the quiet tail; LMP still bulk-skips.
-    (FUT_MC_PER_MOVE, 13, 0, 40, 2.0, true),
+    (FUT_MC_PER_MOVE, 12, 0, 40, 2.0, true),
     (SEE_QUIET_MULT, 16, 5, 80, 3.75, true),
     // Low-increment TM multiplier ceiling. The factor product
     // (stability×fail-low×forced×subtree×score-trend, up to ~13.8×) is only
@@ -261,24 +252,27 @@ tunables!(
     // bind), while capping 600+1 at 40s (was 276s) and 60+0.1 at 13s.
     (TM_INC_HARD_MULT, 30, 0, 120, 4.0, false),
     (TM_INC_HARD_FLOOR_MS, 10000, 0, 60000, 1000.0, false),
-    // No-inc adaptive mtg divisor: base assumed moves-to-go, and the growth
-    // rate once a game outlives that assumption — see compute_tm_budgets for
-    // the full derivation.
-    (NO_INC_MTG_BASE, 34, 20, 80, 4.0, false),
-    (NO_INC_MTG_GROWTH_PCT, 94, 0, 200, 10.0, false),
-    // Cap on that growing divisor: never assume more moves left than a
-    // quarter of Coda's games still have. Fitted to the 75th percentile of
-    // moves remaining in Coda's own no-increment lichess games (both bots,
-    // June-October 2026, 3,898 games): fullmove 10/20/30/40/50/60/80 ->
-    // 61/52/46/42/40/36/31, i.e. cap = max(31, 64 - 0.5 * fullmove). The
-    // growth alone reached ~58 by move 60 (the 90th percentile there), and
-    // games ended with 40-53% of the clock unused at every no-increment TC;
-    // the cap first binds around move 43, so the opening and early
-    // middlegame are paced exactly as before.
-    (NO_INC_CAP_START, 64, 40, 90, 3.0, false),
-    (NO_INC_CAP_SLOPE_100, 50, 20, 100, 5.0, false),
+    // Moves-left estimate for increment sudden-death pacing (see
+    // `moves_left_estimate`): moves_left = max(FLOOR, START - SLOPE/100 * fm),
+    // fitted to the median number of moves still to come in Coda's own
+    // increment lichess games (both bots, June-October 2026; 16,102 games).
+    // Median remaining at fullmove 10/20/30/40/60/80: 46/37/29/25/23/19 ->
+    // START 55, SLOPE 0.8, FLOOR 24. Past move ~40 a game still in progress
+    // has about as far to go as one that just reached 40, hence the floor.
+    (TM_ML_START, 55, 35, 80, 2.5, false),
+    (TM_ML_SLOPE_100, 80, 40, 120, 5.0, false),
+    (TM_ML_FLOOR, 24, 14, 40, 1.5, false),
+    // No-increment start of the same curve: median moves remaining in Coda's
+    // no-increment lichess games (3,898) at fullmove 10/20/30 is 39/31/25,
+    // i.e. START 47 with the shared 0.8 slope. Its floor is NO_INC_CAP_FLOOR
+    // (31, the 75th percentile once the remaining-moves distribution stops
+    // shrinking), so late no-increment pacing stays on the conservative side.
+    (TM_ML_NOINC_START, 47, 30, 70, 2.5, false),
+    // Late floor of the no-increment moves-left curve: the 75th percentile of
+    // moves remaining in Coda's no-increment lichess games (3,898) once that
+    // distribution stops shrinking (~31 from move 60 on).
     (NO_INC_CAP_FLOOR, 31, 20, 50, 2.0, false),
-    // Clock held back from no-increment pacing once the cap binds, in ms.
+    // Clock held back from no-increment pacing, in ms.
     // Every move costs ~10-16 ms of wall time however small its budget
     // (measured in local 10+0 games, where pacing with no reserve flagged
     // eight games past move 110 on that cost alone), so the reserve has to
@@ -342,14 +336,14 @@ tunables!(
     // Off when Ponder is enabled — see `reply_was_surprise`.
     // Bench-invariant (TM is never consulted at fixed depth).
     (TM_SURPRISE_STAB_STEPS_100, 100, 0, 300, 15.0, false),
-    (LMR_HIST_DIV, 23496, 2000, 100000, 4900.0, true),
+    (LMR_HIST_DIV, 24952, 2000, 100000, 4900.0, true),
     // Capture-LMR history divisor. Separate from the quiet divisor above:
     // capture history is single-source, so it needs a smaller divisor than
     // quiet history to produce an equivalent reduction magnitude. Both are
     // continuous (`R -= hist / DIV`), not stepped.
-    (LMR_HIST_DIV_CAP, 4865, 1000, 20000, 1500.0, true),
-    (LMR_C_QUIET, 179, 40, 300, 13.0, true),
-    (LMR_C_CAP, 253, 80, 350, 12.5, true),
+    (LMR_HIST_DIV_CAP, 4124, 1000, 20000, 1500.0, true),
+    (LMR_C_QUIET, 181, 40, 300, 13.0, true),
+    (LMR_C_CAP, 256, 80, 350, 12.5, true),
     // Two independent degrees of freedom on the LMR curve, both in centi-ply
     // (they need the fractional accumulator to express):
     //
@@ -359,27 +353,24 @@ tunables!(
     //             inflation `r += r*NUM/(256d+285)`, so proportionally MORE
     //             reduction shallow and LESS deep. A flat +1-ply all-node
     //             bump is the wrong shape for this.
-    (LMR_BASE_CENTI, 48, 0, 120, 6.0, true),
-    (LMR_ALLNODE_DECAY_NUM, 323, 0, 1600, 80.0, true),
+    (LMR_BASE_CENTI, 50, 0, 120, 6.0, true),
+    (LMR_ALLNODE_DECAY_NUM, 307, 0, 1600, 80.0, true),
     // Cut-node LMR bump, in centi-ply. Cut nodes reduce by this amount
     // (plus a further ply with no TT move); all-nodes keep +1.
     (LMR_CUTNODE_BUMP_CENTI, 271, 100, 500, 40.0, true),
-    // LMR correction battery — sub-ply terms in centi-ply, needing the
-    // fractional accumulator to express. These were seeded well below their
-    // source values because Coda's ln(d)·ln(m) base already carries a
-    // move-count term that the source shape omits, so the constants would
-    // otherwise double-count. Ranges run to 0 so SPSA can kill dead terms.
-    (LMR_WINBETA_CENTI, 32, 0, 250, 12.0, false),
-    (LMR_TTALPHA_CENTI, 25, 0, 150, 8.0, true),
+    // LMR correction terms — sub-ply, in centi-ply, needing the fractional
+    // accumulator to express. Kept small because Coda's ln(d)·ln(m) base
+    // already carries a move-count term. Ranges run to 0 so SPSA can kill
+    // dead terms.
+    (LMR_TTALPHA_CENTI, 32, 0, 150, 8.0, true),
     // Clock-keyed: LMR_TTALPHA_CENTI is the deep (root depth >= 17) value, the LTC walk #3709's 25; the
     // shallow value (root depth <= 14) is the STC walk #3701's 36 — see clock_blend.
     (LMR_TTALPHA_SHALLOW_CENTI, 36, 0, 150, 8.0, false),
-    (LMR_EXPECT_MULT, 20, 0, 120, 6.0, true),
     // cutoff_count LMR terms. When the child ply has failed high more than
     // twice under this node, reduce late moves more (with extra at non-PV
     // all-nodes). Seeded below source values for the double-counting reason
     // above. The >2 threshold is fixed, not a knob.
-    (LMR_CUTOFF_CNT_CENTI, 60, 0, 250, 12.0, true),
+    (LMR_CUTOFF_CNT_CENTI, 61, 0, 250, 12.0, true),
     (LMR_CUTOFF_ALLNODE_CENTI, 21, 0, 150, 8.0, true),
     // Minimum depth at which singular extension is attempted. Too low and
     // singular_depth is itself too shallow to judge singularity reliably.
@@ -403,7 +394,7 @@ tunables!(
     // Late move pruning: quiets searched before the cutoff, on the shape
     // `(BASE + d²·DEPTH) / (2 - improving)`. BASE dominates at shallow depth
     // and sets how many quiets survive at d=1.
-    (LMP_BASE_10X, 55, 10, 150, 20.0, true),
+    (LMP_BASE_10X, 54, 10, 150, 20.0, true),
     // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
     // One step down changes 0.02% of LMP prunes and one step up none: the
     // move-count limit already outgrows the move list at these depths.
@@ -420,7 +411,7 @@ tunables!(
     // again on the v10 net 2026-08-17, and the idea was closed then without
     // implementation. Tested anyway at Adam's request (2026-08-17) since the
     // predictor here differs from the post-hoc selector that was measured.
-    (LMP_MARGIN_THRESH, 61, 50, 500, 35.0, true),
+    (LMP_MARGIN_THRESH, 54, 50, 500, 35.0, true),
     // Root-depth-aware uplift on the LMP predictive margin, same shape as the
     // RFP_ROOT_* correction above with the sign flipped: that one demands MORE
     // confidence as the search gets deeper, this one demands more as it gets
@@ -434,9 +425,9 @@ tunables!(
     // KNEE = 17, the measured deep-search median, so the uplift is zero at LTC
     // and above and main is unchanged there. COEF = 8 = the STC walk's
     // preferred +23 divided by the measured 3-ply gap between the two medians.
-    (LMP_ROOT_KNEE, 17, 10, 24, 1.5, true),
+    (LMP_ROOT_KNEE, 19, 10, 24, 1.5, true),
     (LMP_ROOT_COEF, 8, 0, 20, 1.5, true),
-    (LMP_MARGIN_PCT, 55, 40, 100, 6.0, true),
+    (LMP_MARGIN_PCT, 58, 40, 100, 6.0, true),
     // Root-depth-aware LMR relaxation (single-set, self-adapts STC<->LTC):
     // reduce LESS as the OVERALL search depth grows past LMR_ROOT_THRESH
     // (diminishing returns — at LTC the reduced re-search is cheap vs the
@@ -450,8 +441,8 @@ tunables!(
     // what makes this term look dead — warm caches roughly double reached
     // depth, so measure with the TT warm or the answer inverts.
     (LMR_ROOT_THRESH, 15, 6, 30, 1.5, false),
-    (LMR_ROOT_COEF_10X, 4, 0, 800, 40.0, true),
-    (BAD_NOISY_MARGIN, 87, 30, 150, 6.0, true),
+    (LMR_ROOT_COEF_10X, 0, 0, 800, 40.0, true),
+    (BAD_NOISY_MARGIN, 85, 30, 150, 6.0, true),
     // BNFP optimistic-gain credit. The bound credits the captured piece at
     // VICTIM_PCT% of its eval-unit value, i.e. see_value(victim) bridged by
     // SEE_MATERIAL_SCALE exactly as the QS delta prune does, so the term is in
@@ -465,26 +456,26 @@ tunables!(
     // 16384 / 886 = 18.5 -> 18 makes a maxed-out history worth about one minor
     // (and a fully negative one take about one minor off the bound).
     (BNFP_CAPT_HIST_DIV, 18, 6, 60, 3.0, true),
-    (PROBCUT_MARGIN, 162, 80, 300, 11.0, true),
+    (PROBCUT_MARGIN, 164, 80, 300, 11.0, true),
     // ProbCut margin reduction when improving (Stockfish/Alexandria shape):
     // improving positions verify against a lower beta, non-improving nodes
     // keep the safer base margin. Effective improving margin is
     // PROBCUT_MARGIN - PROBCUT_MARGIN_IMP.
-    (PROBCUT_MARGIN_IMP, 48, 0, 120, 8.0, true),
+    (PROBCUT_MARGIN_IMP, 42, 0, 120, 8.0, true),
     // Root-depth-aware ProbCut: a more conservative margin is wanted at
     // shallow root depths than deep ones, so add an offset below
     // PROBCUT_ROOT_THRESH and fade it out as root depth grows.
     (PROBCUT_ROOT_THRESH, 17, 8, 28, 1.5, true),
-    (PROBCUT_ROOT_FADE_10X, 40, 10, 120, 10.0, true),
+    (PROBCUT_ROOT_FADE_10X, 47, 10, 120, 10.0, true),
     (PROBCUT_ROOT_MARGIN, 74, 0, 120, 8.0, false),
-    (HINDSIGHT_THRESH, 133, 50, 400, 17.5, true),
+    (HINDSIGHT_THRESH, 122, 50, 400, 17.5, true),
     (QS_DELTA_MARGIN, 361, 100, 500, 20.0, true),
     // Cap on captures actually SEARCHED in qsearch (delta/SEE-pruned moves
     // are not charged against it). Counting pruned moves here would let SPSA
     // detune the cap to near-off, which is what an earlier counting bug did.
     (QS_MAX_CAPTURES, 3, 2, 32, 2.0, false),
-    (CORR_W_PAWN, 142, 100, 600, 25.0, true),
-    (CORR_W_NP, 120, 0, 400, 17.5, true),
+    (CORR_W_PAWN, 126, 100, 600, 25.0, true),
+    (CORR_W_NP, 133, 0, 400, 17.5, true),
     // There is deliberately no minor-key or major-key correction source:
     // both are strict subsets of non_pawn_key, so such terms are redundant
     // with np_corr and simply consume SPSA budget at weight 0.
@@ -493,7 +484,7 @@ tunables!(
     // keyed by hash(ply-1) ^ hash(ply) — a hash of the last move IN CONTEXT
     // (from+to+captured+side), richer than cont_corr's [piece][to]. Captures
     // "this structural CHANGE tends to be mis-evaluated."
-    (CORR_W_TRANS, 108, 0, 400, 18.5, true),
+    (CORR_W_TRANS, 103, 0, 400, 18.5, true),
     (FH_BLEND_DEPTH_10X, 21, 0, 80, 15.0, false),
     // TT_DAMP_TT_WEIGHT: weight of tt_score in TT-LOWER non-PV cutoff score
     // dampening. Formula: (W*tt_score + beta) / (W+1).
@@ -512,25 +503,25 @@ tunables!(
     // Max 4 = that refusal margin (one contradiction then reopens the slot);
     // 0 disables the mechanism.
     (TT_CONTRA_DECAY, 1, 0, 4, 0.5, false),
-    (HIST_BONUS_MULT, 235, 50, 400, 17.5, true),
-    (HIST_BONUS_MAX, 1711, 500, 3000, 125.0, true),
+    (HIST_BONUS_MULT, 230, 50, 400, 17.5, true),
+    (HIST_BONUS_MAX, 1793, 500, 3000, 125.0, true),
     // History bonus uses the offset shape `clamp(0, MAX, MULT*d - OFFSET)`
     // rather than `min(MAX, MULT*d)`. Without the offset the formula
     // saturates early and d=5 and d=10 earn the same bonus; the offset buys
     // depth discrimination. Capture history uses the same shape.
     (HIST_BONUS_OFFSET, 18, 0, 400, 25.0, false),
-    (CAP_HIST_MULT, 341, 50, 400, 17.5, true),
-    (CAP_HIST_MAX, 1844, 500, 3000, 125.0, true),
+    (CAP_HIST_MULT, 340, 50, 400, 17.5, true),
+    (CAP_HIST_MAX, 1949, 500, 3000, 125.0, true),
     // Malus constants are SEPARATE from the bonus constants rather than
     // hardwired to -bonus, so SPSA can tune the two slopes independently.
     // Whether malus should be steeper or shallower than bonus is
     // engine-specific and only discoverable by tuning.
-    (HIST_MALUS_MULT, 498, 50, 900, 40.0, true),
+    (HIST_MALUS_MULT, 503, 50, 900, 40.0, true),
     (HIST_MALUS_OFFSET, 30, 0, 400, 25.0, false),
-    (HIST_MALUS_MAX, 1072, 500, 4000, 175.0, true),
-    (CAP_HIST_MALUS_MULT, 298, 50, 900, 40.0, true),
+    (HIST_MALUS_MAX, 1136, 500, 4000, 175.0, true),
+    (CAP_HIST_MALUS_MULT, 297, 50, 900, 40.0, true),
     (CAP_HIST_MALUS_BASE, 42, 0, 400, 25.0, false),
-    (CAP_HIST_MALUS_MAX, 2303, 500, 4000, 175.0, true),
+    (CAP_HIST_MALUS_MAX, 2294, 500, 4000, 175.0, true),
     // numFailHighs multiplicative history scaling (Starzix pattern):
     //   bonus = raw + raw * min(num_fail_highs, NFH_CAP) / NFH_DIV
     // so 0..NFH_CAP cascades produce 1.0x .. (1 + NFH_CAP/NFH_DIV)x bonus.
@@ -542,7 +533,7 @@ tunables!(
     // cutoffs, amplify the best move's bonus by
     // (quiets+caps searched)/HIST_SIBLING_DIV — a move that cut off after
     // more competition proved itself more strongly.
-    (HIST_SIBLING_DIV, 145, 64, 1024, 40.0, true),
+    (HIST_SIBLING_DIV, 167, 64, 1024, 40.0, true),
     // PV/quiet/correction-aware double-extension margin (Stockfish shape).
     //
     // dext_margin = DEXT_MARGIN_PV   * is_pv
@@ -566,8 +557,8 @@ tunables!(
     // tested for Coda's regime and the signal was not there.
     (DEXT_MARGIN_PV, 169, 50, 400, 15.0, false),
     (DEXT_MARGIN_QUIET, 17, 0, 100, 4.0, false),
-    (DEXT_MARGIN_CORR, 16, 0, 64, 3.0, true),
-    (DEXT_MARGIN_BASE, 28, -50, 150, 6.0, true),
+    (DEXT_MARGIN_CORR, 18, 0, 64, 3.0, true),
+    (DEXT_MARGIN_BASE, 29, -50, 150, 6.0, true),
     // Non-core: near-inert in warm-TT games (dead-knob audit 2026-09-24).
     // The cap binds on 0.02-0.15% of double-extension decisions. It is a
     // safety valve against extension runaway; keep the value, don't tune it.
@@ -613,8 +604,8 @@ tunables!(
     // displayed) fires the gate on nearly every non-drawish position and costs
     // 30% of bench — a units slip worth naming, since nothing about the number
     // looks wrong without the conversion.
-    (SE_ROOT_DECIDED_CP, 716, 250, 5000, 150.0, true),
-    (SE_ROOT_DECIDED_DEPTH, 9, 4, 32, 2.0, true),
+    (SE_ROOT_DECIDED_CP, 755, 250, 5000, 150.0, true),
+    (SE_ROOT_DECIDED_DEPTH, 8, 4, 32, 2.0, true),
     (QUIET_CHECK_BONUS, 14805, 2000, 30000, 1400.0, false),
     // SEE gate on the quiet check bonus (a common cross-engine idea: only
     // bonus a check that is not badly losing). Without it Coda orders losing
@@ -631,10 +622,10 @@ tunables!(
     // is deliberately low: a bound this parameter pins against would be setting
     // the value instead of the optimum. Keep c_end well under the operating
     // point, or perturbations clamp against the floor every iteration.
-    (CORR_HIST_DIV, 311, 64, 4096, 64.0, true),
+    (CORR_HIST_DIV, 299, 64, 4096, 64.0, true),
     // Caps the per-update weight. The ceiling suits depth-proportional weights;
     // a much lower cap only makes sense in a sign-only (error-clamped) regime.
-    (CORR_UPDATE_WEIGHT_MAX, 16, 4, 48, 2.2, true),
+    (CORR_UPDATE_WEIGHT_MAX, 15, 4, 48, 2.2, true),
     // Fixed-point /10.
     (CORR_BONUS_CAP_DIV_10X, 38, 10, 160, 15.0, false),
     (CORR_HIST_GRAIN_T, 13, 1, 32, 1.55, false),
@@ -652,20 +643,20 @@ tunables!(
     (ESCAPE_BONUS_MINOR, 5250, 0, 30000, 1000.0, false),
     // Null-move threat-escape bonus in quiet ordering.
     (NULL_THREAT_ESCAPE_BONUS, 8321, 0, 30000, 1000.0, false),
-    (NMP_KING_ZONE_MAX_10X, 20, 20, 90, 15.0, true),
-    (PROBCUT_KING_ZONE_MAX_10X, 86, 20, 90, 15.0, true),
-    (LMR_THREAT_DIV_10X, 42, 10, 50, 15.0, true),
-    (LMR_KING_PRESSURE_DIV_10X, 78, 20, 90, 15.0, true),
+    (NMP_KING_ZONE_MAX_10X, 22, 20, 90, 15.0, true),
+    (PROBCUT_KING_ZONE_MAX_10X, 85, 20, 90, 15.0, true),
+    (LMR_THREAT_DIV_10X, 39, 10, 50, 15.0, true),
+    (LMR_KING_PRESSURE_DIV_10X, 72, 20, 90, 15.0, true),
     // Reduce later moves more once this node has already raised alpha N times
     // (alpha_raises reduction, a known LMR refinement). Fixed-point ×10: reduction += raises *
     // VALUE/10. Only fires at PV nodes (cut nodes break on the first fail-high
     // before alpha is raised). Default 10 = +1.0 ply (LMR_SCALE centi-ply) per
     // prior alpha-raise.
     (LMR_ALPHA_RAISE_10X, 10, 0, 40, 5.0, false),
-    (FUT_THREATS_MARGIN, 42, 0, 200, 10.0, true),
+    (FUT_THREATS_MARGIN, 33, 0, 200, 10.0, true),
     // Continuation-history weight in quiet move ordering. Range runs to 0 so
     // SPSA can disable the term entirely rather than pinning at a floor.
-    (CONT_HIST_MULT_10X, 20, 0, 80, 15.0, true),
+    (CONT_HIST_MULT_10X, 21, 0, 80, 15.0, true),
     // Pawn-history weight in quiet move ordering, relative to main/cont/etc.
     // core: false — not yet validated Elo-positive, so kept out of --core to
     // avoid contributing loose-knob false gradients to the sweep.
@@ -689,9 +680,9 @@ tunables!(
     //
     // Minimum depth for internal iterative reduction. Floor runs low so SPSA
     // can explore "fire at any depth >= 1" rather than being clamped out of it.
-    (IIR_MIN_DEPTH_10X, 34, 5, 100, 15.0, true),
+    (IIR_MIN_DEPTH_10X, 41, 5, 100, 15.0, true),
     (PROBCUT_MIN_DEPTH_10X, 12, 10, 120, 15.0, false),     // ProbCut activation gate
-    (PROBCUT_ROOT_MIN_DEPTH_10X, 23, 0, 80, 8.0, true),
+    (PROBCUT_ROOT_MIN_DEPTH_10X, 29, 0, 80, 8.0, true),
     (SEE_CAP_DEPTH_10X, 99, 30, 150, 15.0, true),         // SEE capture prune depth cap
     // Capture-SEE prune margin, a common cross-engine shape: margin =
     // depth*MULT + capt_hist*HIST/1024, prune if SEE < -margin. MULT is
@@ -702,15 +693,15 @@ tunables!(
     // historically-good captures (the ones that produce cutoffs) so the base
     // can be lowered without over-pruning them. Dropping the base alone,
     // without the history term, cost +17% bench nodes.
-    (SEE_CAP_MULT, 94, 40, 250, 12.0, true),
-    (SEE_CAP_HIST, 12, 0, 40, 2.0, true),
-    (BAD_NOISY_DEPTH_10X, 57, 40, 150, 15.0, true),       // BNFP depth cap
+    (SEE_CAP_MULT, 85, 40, 250, 12.0, true),
+    (SEE_CAP_HIST, 11, 0, 40, 2.0, true),
+    (BAD_NOISY_DEPTH_10X, 45, 40, 150, 15.0, true),       // BNFP depth cap
     // NMP activation gate (2 sites). This can sit low because RFP runs FIRST:
     // shallow NMP then only sees nodes static pruning could not already cut,
     // so it no longer intercepts free cutoffs. Reordering NMP ahead of RFP
     // would require pushing this gate back up to compensate.
-    (NMP_MIN_DEPTH_10X, 65, 20, 200, 15.0, true),
-    (HINDSIGHT_MIN_DEPTH_10X, 26, 0, 200, 15.0, true),
+    (NMP_MIN_DEPTH_10X, 78, 20, 200, 15.0, true),
+    (HINDSIGHT_MIN_DEPTH_10X, 13, 0, 200, 15.0, true),
     // Net output scale in percent: the final NNUE eval is multiplied by
     // PCT/100. Nets train to very different natural scales (eval RMS has
     // ranged 219-369 across same-recipe runs) while every cp-denominated
@@ -1141,6 +1132,10 @@ pub struct SearchLimits {
     /// guard applies there too (start_time is reset to the ponderhit moment).
     /// 0 = no clock concept (plain `go movetime`/depth). See SearchInfo::abs_deadline.
     pub abs_clock: u64,
+    /// Extra optimum budget (ms) paid out of the ponder bank: clock that
+    /// earlier ponder hits saved against their planned budget. Always 0
+    /// without pondering. See `PONDER_BANK_SPREAD` in uci.rs.
+    pub tm_credit_ms: u64,
 }
 
 impl Default for SearchLimits {
@@ -1163,6 +1158,7 @@ impl SearchLimits {
             movetime_floor: 0,
             min_think_ms: 0,
             abs_clock: 0,
+            tm_credit_ms: 0,
         }
     }
 }
@@ -3194,7 +3190,7 @@ pub(crate) fn helper_run(
     let placeholder = SearchLimits {
         depth: max_depth, fixed_depth: true, movetime: 0, wtime: 0, btime: 0, winc: 0, binc: 0,
         movestogo: 0, nodes: 0, infinite: false, movetime_floor: 0,
-        min_think_ms: 0, abs_clock: 0,
+        min_think_ms: 0, abs_clock: 0, tm_credit_ms: 0,
     };
     let mv = search_helper(board, info, &placeholder, thread_id);
     let ponder = if info.pv_len[0] >= 2 { info.pv_table[0][1] } else { NO_MOVE };
@@ -3284,6 +3280,14 @@ pub fn behind_on_clock_factor(our_time: u64, opp_time: u64) -> f64 {
     (1.0 - slope * deficit).clamp(floor, 1.0)
 }
 
+/// Expected number of moves still to be played at `fullmove` in an increment
+/// game, from the median remaining game length in Coda's own lichess games
+/// (derivation at the TM_ML_* tunables). Linear in fullmove down to a floor.
+pub fn moves_left_estimate(fullmove: u16) -> f64 {
+    let slope = tp(&TM_ML_SLOPE_100).max(0) as f64 / 100.0;
+    (tp(&TM_ML_START) as f64 - slope * fullmove as f64).max(tp(&TM_ML_FLOOR).max(2) as f64)
+}
+
 /// Compute time-management budgets from clock state. Returns
 /// (soft, hard, max, soft_floor) all in milliseconds.
 ///
@@ -3309,6 +3313,24 @@ pub fn compute_tm_budgets(
     fullmove: u16,
     ponder_on: bool,
     opp_time: u64,
+) -> (u64, u64, u64, u64) {
+    compute_tm_budgets_credited(our_time, our_inc, movestogo, overhead, fullmove,
+                                ponder_on, opp_time, 0)
+}
+
+/// `compute_tm_budgets` plus `credit_ms` added to the optimum before the hard
+/// clamp: the ponder-bank payout (`SearchLimits::tm_credit_ms`). With a zero
+/// credit the result is identical to `compute_tm_budgets`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_tm_budgets_credited(
+    our_time: u64,
+    our_inc: u64,
+    movestogo: u32,
+    overhead: u64,
+    fullmove: u16,
+    ponder_on: bool,
+    opp_time: u64,
+    credit_ms: u64,
 ) -> (u64, u64, u64, u64) {
     // TM windows: opt/hard/max model with a multiplicative factor product —
     // the structure common to modern engines (SF, Obsidian, Hobbes and
@@ -3394,44 +3416,10 @@ pub fn compute_tm_budgets(
         (time_left * hard_window_pct / 100).min(max_time).max(1)
     };
 
-    // No-inc sudden death needs a higher moves-left assumption than
-    // moderate-inc TCs: each spent ms is gone forever, and real 3+0 games
-    // run 40-80 moves. The default-moves-to-go 24 (sudden-death pacing) was
-    // calibrated for inc TCs where the inc term dominates pacing — at
-    // no-inc the 24 produces an opt that's high enough for the factor
-    // multiplier (up to ~6.5×) to consistently blow past hard_time,
-    // making hard the binding constraint every move — a flat uniform-spend
-    // pattern, seen in live 3+0 play.
-    //
-    // The assumption also has to ADAPT: a fixed base never tightens as a game
-    // outlives it (at move 80 it still assumes "40 moves left"). Symptom, from
-    // both live losses and local no-adjudication RR at 30+0: 70-88% of the
-    // clock burned by move ~60 in games running 130-220+ plies, then an
-    // out-of-time forfeit, while peer engines forfeited none. So once fullmove
-    // exceeds NO_INC_MTG_BASE, grow the divisor by NO_INC_MTG_GROWTH_PCT% of
-    // the overrun:
-    //     effective_mtg = base + growth_pct/100 * max(0, fullmove - base)
-    //
-    // These two must stay TUNABLE, not hardcoded. Fixed constants (base=40,
-    // growth=100%) eliminate forfeits entirely yet still lose ~3.5 Elo: the
-    // mechanism is right but that operating point over-tightens mid-game
-    // allocation in the majority of games, which were never going to forfeit.
-    // Any change here needs both a forfeit count and a non-regression SPRT.
-    let no_inc_mtg_base = tp(&NO_INC_MTG_BASE).max(1) as u64;
-    let no_inc_growth_pct = tp(&NO_INC_MTG_GROWTH_PCT).max(0) as u64;
-    let no_inc_grown_mtg = no_inc_mtg_base
-        + (fullmove as u64).saturating_sub(no_inc_mtg_base) * no_inc_growth_pct / 100;
-    // ...capped at the 75th percentile of moves actually left (NO_INC_CAP_*).
-    let no_inc_cap = (tp(&NO_INC_CAP_START) as i64
-        - tp(&NO_INC_CAP_SLOPE_100) as i64 * fullmove as i64 / 100)
-        .max(tp(&NO_INC_CAP_FLOOR).max(2) as i64) as u64;
-    let no_inc_effective_mtg = no_inc_grown_mtg.min(no_inc_cap);
-    let mtg_divisor = if no_inc_sd { no_inc_effective_mtg.max(1) } else { default_moves_to_go };
-    // Once the cap binds, no-increment pacing never touches the last
-    // NO_INC_RESERVE_MS of the clock (at most half of it), so per-move latency
-    // in a very long game cannot drain it. Before that the growing divisor
-    // already holds far more back, and the early game stays exactly as it was.
-    let paced_time = if no_inc_sd && no_inc_cap < no_inc_grown_mtg {
+    // No-increment pacing never touches the last NO_INC_RESERVE_MS of the
+    // clock (at most half of it), so per-move latency in a very long game
+    // cannot drain it.
+    let paced_time = if no_inc_sd {
         let reserve = (tp(&NO_INC_RESERVE_MS).max(0) as u64).min(time_left / 2);
         (time_left - reserve).max(1)
     } else {
@@ -3446,11 +3434,43 @@ pub fn compute_tm_budgets(
         let divisor = (movestogo as u64).clamp(2, default_moves_to_go);
         let computed = time_left / divisor + our_inc * inc_frac_pct / 100;
         (computed.min(max_time) * opt_window_pct / 100).max(1)
+    } else if no_inc_sd {
+        // Sudden death, no increment: an even share of the clock (less the
+        // latency reserve) over the moves we expect to play,
+        //   opt = (clock - reserve) / moves_left   (x phase damp below)
+        // with moves_left = max(NO_INC_CAP_FLOOR, TM_ML_NOINC_START - 0.8 fm).
+        // The old divisor (34, growing past move 34) divided by the 0.73
+        // window and the damp paced as if ~68 moves were left at move 20,
+        // where Coda's games have a median of 31; no-increment games ended
+        // with 40-77% of the clock unused (e.g. lichess E9lXxHrc, 600+0: 463 s
+        // left at the end). Simulated with 15 ms latency per move, a game
+        // survives to move ~220 at 60+0; the 10%/15% hard/max caps still
+        // bound every move.
+        let slope = tp(&TM_ML_SLOPE_100).max(0) as f64 / 100.0;
+        let moves_left = (tp(&TM_ML_NOINC_START) as f64 - slope * fullmove as f64)
+            .max(tp(&NO_INC_CAP_FLOOR).max(2) as f64);
+        let share = (paced_time as f64 / moves_left) as u64;
+        share.min(max_time).min(hard_time).max(1)
     } else {
-        // Sudden death (or with inc). Add 94% of inc to base computed window.
-        // paced_time == time_left except on the capped no-increment path.
-        let computed = paced_time / mtg_divisor + our_inc * inc_frac_pct / 100;
-        ((computed.min(max_time) * opt_window_pct / 100).min(hard_time)).max(1)
+        // Increment, sudden death: an even share of everything still to come
+        // -- the clock plus the increments of the moves we expect to play --
+        // over those moves:
+        //
+        //   opt = (clock + F * inc * (moves_left - 1)) / moves_left
+        //
+        // moves_left comes from Coda's own game lengths (TM_ML_*), so a game
+        // that leaves the book at move 21 with a full clock paces from the
+        // ~37 moves actually left, not from a fixed divisor. The old form,
+        // W * (clock/24 + F * inc), applied the 0.73 window to the increment
+        // too and settled at a fixed point of ~10 increments that were never
+        // spent (lichess 1+1: 14 s left at move 80); here the late fixed
+        // point is ~(1 - F) * moves_left increments, about 2-3. No window: the
+        // phase damp below still governs the opening, which is what lost when
+        // a moves-left pacing was tried without it (#4663, -6.2).
+        let moves_left = moves_left_estimate(fullmove);
+        let future_inc = our_inc as f64 * inc_frac_pct as f64 / 100.0 * (moves_left - 1.0);
+        let share = ((paced_time as f64 + future_inc) / moves_left) as u64;
+        share.min(max_time).min(hard_time).max(1)
     };
 
     // Opening-phase damp (Hobbes pattern). Without it the opening is grossly
@@ -3504,7 +3524,7 @@ pub fn compute_tm_budgets(
     } else {
         opt_time
     };
-    let opt_time = opt_time.max(1).min(hard_time);
+    let opt_time = (opt_time + credit_ms).max(1).min(hard_time);
 
     // soft_floor: preserved at a small value (10ms) for stockpile sleep
     // compatibility. The factor multiplier in dynamic TM block can pull
@@ -4265,8 +4285,9 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
         }
     } else if our_time > 0 {
         let (soft, hard, max_time, soft_floor) =
-            compute_tm_budgets(our_time, our_inc, limits.movestogo, info.move_overhead,
-                               board.fullmove, ponder_enabled(), opp_time);
+            compute_tm_budgets_credited(our_time, our_inc, limits.movestogo, info.move_overhead,
+                                        board.fullmove, ponder_enabled(), opp_time,
+                                        limits.tm_credit_ms);
         info.soft_limit = soft;
         info.hard_limit = hard;
         info.tm_max_time = max_time;
@@ -6300,8 +6321,14 @@ fn negamax(
             // Clamp mate scores to beta to avoid inflated mate distance
             let nmp_score = if is_decisive(null_score) { beta } else { null_score };
 
-            // Verification search at high depths to guard against zugzwang
-            if depth >= tp10(&NMP_VERIFY_DEPTH_10X) {
+            // Every null-move cutoff is verified by a reduced search, to guard
+            // against zugzwang. This used to be gated on a separate depth knob
+            // (NMP_VERIFY_DEPTH_10X), but at its live value it rounded to the
+            // same depth as the NMP activation gate, so every cutoff was
+            // already verified; un-verifying the shallowest cutoffs lost
+            // (#4691, -5.0) and LTC tune #4643 walked the knob below the gate,
+            // where it had no effect at all. Verification is now unconditional.
+            {
                 info.stats.nmp_verify += 1;
                 // Set ply barrier so NMP cannot fire again inside the verification
                 // subtree. Every peer engine sets such a barrier; ours spans three
@@ -6326,9 +6353,6 @@ fn negamax(
                     return nmp_score;
                 }
                 info.stats.nmp_verify_fail += 1;
-            } else {
-                info.stats.nmp_cutoffs += 1;
-                return nmp_score;
             }
         } else {
             // NMP failed low: extract opponent's best reply from TT for threat detection
@@ -6588,6 +6612,33 @@ fn negamax(
     // for that has never been localised.
     let mut skip_quiets = false;
 
+    // PV TT-move depth floor. At a PV node the TT move is searched first and
+    // full-window, so its search IS the PV line. When that move comes from an
+    // entry we have strong reason to trust, a new_depth of 0 would hand it to
+    // qsearch, which sees captures and evasions only: a quiet TT move is then
+    // scored by the child's stand-pat, discarding exactly the line the entry
+    // vouched for. Flooring its new_depth at one ply restores a real reply
+    // search for one move per PV node, which is cheap.
+    //
+    // "Strong reason to trust" reuses Coda's own thresholds, not a new knob:
+    // - deep: `tt_entry.depth >= TT_DEEP_ENTRY_DEPTH`, the depth from which
+    //   the TT already treats an entry as expensive enough for its extra
+    //   consistency checks. The floor only bites when new_depth <= 0, i.e. at
+    //   most a ply or two of depth remains, so such an entry carries several
+    //   plies more evidence than this node is about to spend.
+    // - decisive: a mate/TB-band score, whose line can continue with a quiet
+    //   move that qsearch cannot find. `tt_entry.depth >= 1` restricts this to
+    //   main-search stores (qsearch stores at depth -1), so a capture-only
+    //   proof does not qualify.
+    // Evaluated here, before any make_move, because score_from_tt reads this
+    // node's halfmove clock.
+    let pv_tt_depth_floor = is_pv
+        && tt_hit
+        && tt_move != NO_MOVE
+        && tt_entry.depth >= 1
+        && (tt_entry.depth >= crate::tt::TT_DEEP_ENTRY_DEPTH
+            || is_decisive(score_from_tt(tt_entry.score, ply, board.halfmove)));
+
     loop {
         let mv = picker.next(board);
         if mv == NO_MOVE { break; }
@@ -6787,7 +6838,17 @@ let singular_beta = tt_score_local - depth;
                     return 0;
                 }
 
-                if singular_score >= singular_beta && singular_beta >= beta {
+                // Multi-cut fires on the verification VALUE: an alternative
+                // that reaches beta by itself is a cutoff in its own right,
+                // whether or not the lowered singular_beta also clears beta.
+                // When singular_beta < beta the fail-soft score is still a
+                // lower bound (it cleared singular_beta), and clearing beta
+                // as well means the node fails high without the TT move.
+                // Before this, such nodes fell through to a negative
+                // extension and paid for a reduced TT-move search plus the
+                // alternatives before cutting on the same evidence.
+                let multicut_bound = singular_beta.max(beta);
+                if singular_score >= multicut_bound {
                     // Multi-cut: alternatives are also good enough — prune the whole node.
                     // Return singular_score (SF pattern) — tighter score
                     // for downstream TT propagation than singular_beta floor.
@@ -6799,9 +6860,16 @@ let singular_beta = tt_score_local - depth;
                     // singularBeta. Suppressing multicut entirely in mate
                     // shapes tested WORSE here, so keep FIRING and fix only the
                     // returned value.
+                    //
+                    // The decisive fallback returns the threshold the
+                    // verification actually proved, `multicut_bound`. When
+                    // singular_beta >= beta that is singular_beta, unchanged;
+                    // when singular_beta < beta, returning singular_beta would
+                    // report a fail-high node with a score below beta, so the
+                    // proven bound is beta.
                     info.stats.multicut += 1;
                     if is_decisive(singular_score) {
-                        return singular_beta;
+                        return multicut_bound;
                     }
                     return singular_score;
                 }
@@ -6846,11 +6914,18 @@ let singular_beta = tt_score_local - depth;
                     // Cut node with competitive alternatives — moderate reduce
                     singular_extension = competitive_se_reduction(-2, singular_score, singular_beta);
                     info.stats.negative_ext += 1;
-                } else {
-                    // All-node with competitive alternatives — mild reduce
-                    singular_extension = competitive_se_reduction(-1, singular_score, singular_beta);
-                    info.stats.negative_ext += 1;
                 }
+                // Expected all-node (or PV) with competitive alternatives and
+                // a TT score below beta: no reduction, the TT move keeps its
+                // full depth. Both remaining rungs carry evidence that the
+                // node will cut (the TT move already beats beta, or the node
+                // is expected to cut) so the TT move can be searched cheaply
+                // and an alternative relied on. Here neither holds: the node
+                // is expected to fail low, every move has to be refuted, and
+                // "an alternative reaches singular_beta" (a margin BELOW the
+                // TT score) says nothing about the TT move being any less
+                // likely to be best. Reducing it only weakens the refutation
+                // of the move most likely to matter.
             }
         }
 
@@ -6980,6 +7055,11 @@ let singular_beta = tt_score_local - depth;
             new_depth = 0;
         }
 
+        // PV TT-move depth floor (see `pv_tt_depth_floor`).
+        if pv_tt_depth_floor && mv == tt_move && new_depth <= 0 {
+            new_depth = 1;
+        }
+
         let score;
 
         // Track quiet moves for history penalty on beta cutoff
@@ -7104,26 +7184,13 @@ let singular_beta = tt_score_local - depth;
                     reduction -= LMR_SCALE;
                 }
 
-                // LMR correction battery.
-                // (a) Winning beta: the window is already in the proven-win band,
-                //     move precision matters less — reduce more.
-                if is_win(beta) {
-                    reduction += tp(&LMR_WINBETA_CENTI);
-                }
+                // LMR correction: TT bound already below alpha.
                 if tt_hit && tt_entry.flag != TT_FLAG_NONE {
                     let tt_score_node = score_from_tt(tt_entry.score, ply, board.halfmove);
-                    // (b) TT already says this node can't beat alpha.
+                    // TT already says this node can't beat alpha.
                     if tt_score_node <= alpha {
                         reduction += clock_blend(info.root_depth, tp(&LMR_TTALPHA_CENTI), tp(&LMR_TTALPHA_SHALLOW_CENTI));
                     }
-                }
-                // (d) Quiet expectation gap: eval far below alpha → this node is
-                //     underperforming its window, reduce late quiets more (and
-                //     slightly less when eval already exceeds alpha). Continuous,
-                //     ~0.32 centi/cp at default. In-check static_eval is the
-                //     -INFINITY sentinel, so this term must remain disabled there.
-                if !in_check {
-                    reduction += tp(&LMR_EXPECT_MULT) * (alpha - static_eval).clamp(-65, 91) / 128;
                 }
 
                 // cutoff_count: the child ply keeps failing high under
@@ -7254,12 +7321,8 @@ let singular_beta = tt_score_local - depth;
                         reduction -= LMR_SCALE;
                     }
 
-                    // Correction battery (a)-(c) — applied to noisy
-                    // moves too (computed before the quiet/noisy
-                    // split). Same tunables as the quiet block.
-                    if is_win(beta) {
-                        reduction += tp(&LMR_WINBETA_CENTI);
-                    }
+                    // TT-says-below-alpha term, applied to noisy moves
+                    // too. Same tunables as the quiet block.
                     if tt_hit && tt_entry.flag != TT_FLAG_NONE {
                         let tt_score_node = score_from_tt(tt_entry.score, ply, board.halfmove);
                         if tt_score_node <= alpha {
@@ -7522,17 +7585,10 @@ let singular_beta = tt_score_local - depth;
                         let scale_factor = num_fail_highs.min(tp10(&NFH_CAP_10X));
                         // Fixed-point divisor (stored × 10).
                         let mut bonus = raw_bonus + raw_bonus * scale_factor * 10 / NFH_DIV_10X.load(Ordering::Relaxed).max(1);
-                        // SF searched-count scale: the more moves were refuted
-                        // before this one cut, the more informative the cutoff
-                        // — scale the bonus up by moves-searched/256 at non-PV
-                        // nodes.
-                        if !is_pv {
-                            bonus += bonus * (move_count - 1).max(0) / 256;
-                        }
-                        // Also from SF: at non-PV nodes, amplify the cutoff move's
-                        // bonus by the number of moves searched before it cut off
-                        // (more competition survived = stronger signal). Best-move
-                        // bonus only — the malus is left unscaled.
+                        // At non-PV nodes, amplify the cutoff move's bonus by the
+                        // number of moves searched before it cut off (more
+                        // competition survived = stronger signal). Best-move bonus
+                        // only — the malus is left unscaled.
                         if !is_pv {
                             let siblings = (quiets_count + n_captures_tried) as i32;
                             bonus += bonus * siblings / tp(&HIST_SIBLING_DIV);
@@ -7645,11 +7701,7 @@ let singular_beta = tt_score_local - depth;
                         let raw_cap_bonus = capture_history_bonus(cap_bonus_depth);
                         let scale_factor = num_fail_highs.min(tp10(&NFH_CAP_10X));
                         // Fixed-point divisor (stored × 10).
-                        let mut cap_bonus = raw_cap_bonus + raw_cap_bonus * scale_factor * 10 / NFH_DIV_10X.load(Ordering::Relaxed).max(1);
-                        // SF searched-count scale (see quiet site above).
-                        if !is_pv {
-                            cap_bonus += cap_bonus * (move_count - 1).max(0) / 256;
-                        }
+                        let cap_bonus = raw_cap_bonus + raw_cap_bonus * scale_factor * 10 / NFH_DIV_10X.load(Ordering::Relaxed).max(1);
                         // captured_pt == NO_PIECE_TYPE here means a non-capture
                         // promotion (the only non-capture route into this branch):
                         // train slot 0 ("empty") — the slot capt_hist_score_static
@@ -8703,7 +8755,7 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool,
     eprintln!("Singular ext:   {:>8}  (single +1 ply)", s.singular_ext);
     eprintln!("Double ext:     {:>8}  (additional +1 on top of singular)", s.double_ext);
     eprintln!("Negative ext:   {:>8}  (-1/-2/-3 fail-high reduce)", s.negative_ext);
-    eprintln!("Multi-cut:      {:>8}  (return singular_score; singular_beta if decisive)", s.multicut);
+    eprintln!("Multi-cut:      {:>8}  (return singular_score; max(singular_beta, beta) if decisive)", s.multicut);
     eprintln!("QS nodes:       {:>8}  ({:.1}% of total)", s.qnodes, s.qnodes as f64 / total_nodes as f64 * 100.0);
     if s.beta_cutoffs > 0 {
         let avg_pos = s.cutoff_movecount_sum as f64 / s.beta_cutoffs as f64;
@@ -9418,6 +9470,7 @@ mod tests {
             movetime_floor: 0,
             min_think_ms: 0,
             abs_clock: 0,
+            tm_credit_ms: 0,
         };
 
         search(&mut board, &mut info, &limits);
@@ -9475,6 +9528,7 @@ mod tests {
             movetime_floor: 0,
             min_think_ms: 0,
             abs_clock: 0,
+            tm_credit_ms: 0,
         };
 
         search(&mut board, &mut info, &limits);
@@ -9899,36 +9953,6 @@ mod tests {
         assert!(clk.iter().all(|&c| c > 0), "1+0 clock ran out: last {:?}", &clk[200..]);
     }
 
-    /// The no-increment cap leaves the opening and early middlegame exactly as
-    /// the growing divisor paced them: identical budgets up to move 40.
-    #[test]
-    fn no_increment_cap_leaves_early_game_unchanged() {
-        let (cap0, cap1, floor) = (tp(&NO_INC_CAP_START), tp(&NO_INC_CAP_SLOPE_100), tp(&NO_INC_CAP_FLOOR));
-        let base = tp(&NO_INC_MTG_BASE) as i64;
-        let growth = tp(&NO_INC_MTG_GROWTH_PCT) as i64;
-        for fm in 1..=40i64 {
-            let grown = base + (fm - base).max(0) * growth / 100;
-            let cap = (cap0 as i64 - cap1 as i64 * fm / 100).max(floor as i64);
-            assert!(cap >= grown, "cap binds at fm {}: {} < {}", fm, cap, grown);
-        }
-    }
-
-    /// P2 — PonderhitCreditPct defaults to the -1 sentinel = INERT = full
-    /// 100% charge of pondered time (the Option C 50% default is retired;
-    /// explicit sets still work for local A/B).
-    #[test]
-    fn ponderhit_credit_default_is_full_charge() {
-        let saved = PONDERHIT_CREDIT_PCT.load(Ordering::Relaxed);
-        PONDERHIT_CREDIT_PCT.store(-1, Ordering::Relaxed);
-        assert_eq!(ponderhit_credit_pct(), 100, "sentinel must mean full charge");
-        PONDERHIT_CREDIT_PCT.store(50, Ordering::Relaxed);
-        assert_eq!(ponderhit_credit_pct(), 50, "explicit set must be honored");
-        PONDERHIT_CREDIT_PCT.store(0, Ordering::Relaxed);
-        assert_eq!(ponderhit_credit_pct(), 0);
-        PONDERHIT_CREDIT_PCT.store(saved, Ordering::Relaxed);
-        // Fresh-binary default is the sentinel.
-        assert_eq!(saved, -1, "shipping default must be the -1 sentinel");
-    }
 
     /// A quiet, clearly-not-forced middlegame with many legal moves and no
     /// mate in sight — the ponder-arming tests need the ordinary ID-loop
