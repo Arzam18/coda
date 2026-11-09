@@ -418,6 +418,16 @@ tunables!(
     // already carries a move-count term. Ranges run to 0 so SPSA can kill
     // dead terms.
     (LMR_TTALPHA_CENTI, 32, 0, 150, 8.0, true),
+    // Child-eval LMR (idea from Incipit, where it was invented independently):
+    // after the move is made, compare the child's corrected static eval
+    // (from this node's side) with alpha. A move whose resulting position
+    // already sits below alpha is reduced more, one sitting above alpha less.
+    // DIV is centipawns per ply of adjustment; default = FUT_PER_DEPTH's 96,
+    // i.e. the same cp-per-ply exchange rate futility uses for its depth
+    // margin. CAP bounds the term at one ply (LMR_SCALE) either way; its range
+    // stops short of 0 so SPSA cannot silently disable the term.
+    (LMR_CHILD_EVAL_DIV, 96, 40, 400, 12.0, true),
+    (LMR_CHILD_EVAL_CAP_CENTI, 100, 25, 200, 12.0, true),
     // Clock-keyed: LMR_TTALPHA_CENTI is the deep (root depth >= 17) value, the LTC walk #3709's 25; the
     // shallow value (root depth <= 14) is the STC walk #3701's 36 — see clock_blend.
     (LMR_TTALPHA_SHALLOW_CENTI, 36, 0, 150, 8.0, false),
@@ -1758,6 +1768,12 @@ pub struct SearchInfo {
     /// exact hash match, so a null-move child, a position the parent never
     /// wrote, or a stale slot falls back to `Board::checkers`.
     checkers_hint: [(u64, Bitboard); MAX_PLY + 1],
+    /// Raw (halfmove-independent, uncorrected) static eval handed from parent
+    /// to child, same contract as `checkers_hint`: slot `ply` holds the hash of
+    /// the position and the value `info.eval` returned for it. Child-eval LMR
+    /// evaluates the child before choosing its reduction; the child then reuses
+    /// that value instead of paying for a second NNUE evaluation.
+    eval_hint: [(u64, i32); MAX_PLY + 1],
     /// Per-ply tt_pv, so a child can inherit its parent's PV-region flag.
     tt_pv_stack: [bool; MAX_PLY + 1],
     /// LMR reduction applied at each ply (for hindsight reduction gating)
@@ -1896,6 +1912,7 @@ impl SearchInfo {
             nmp_min_ply: 0,
             static_evals: [0; MAX_PLY + 1],
             checkers_hint: [(0, 0); MAX_PLY + 1],
+            eval_hint: [(0, 0); MAX_PLY + 1],
             tt_pv_stack: [false; MAX_PLY + 1],
             reductions: [0; MAX_PLY + 1],
             excluded_move: [NO_MOVE; MAX_PLY + 1],
@@ -2305,8 +2322,17 @@ impl SearchInfo {
     /// this same number instead of re-deriving a raw net output that drifts
     /// every time a term is added here.
     pub(crate) fn eval(&mut self, board: &Board) -> i32 {
-        // Ensure threat accumulator is computed before eval
-        if self.threat_stack.active {
+        // Fused PSQ+threat accumulator: one materialization replays both
+        // halves from the threat stack's deltas, and the threat stack's own
+        // value arrays are not used. evaluate_nnue's materialize below is then
+        // a cached skip.
+        let fused = self.nnue_acc.as_ref().is_some_and(|a| a.threat_fused());
+        if fused {
+            if let (Some(net), Some(acc)) = (&self.nnue_net, &mut self.nnue_acc) {
+                acc.materialize_with(net, board, Some(&mut self.threat_stack));
+            }
+        } else if self.threat_stack.active {
+            // Ensure threat accumulator is computed before eval
             if let Some(ref net) = self.nnue_net {
                 self.threat_stack.ensure_computed(&net.threat_weights, net.num_threat_features,
                                                   net.num_pawn_pair_features, board);
@@ -2320,7 +2346,21 @@ impl SearchInfo {
             static VERIFY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             if *VERIFY_ENABLED.get_or_init(|| std::env::var("CODA_VERIFY_NNUE").is_ok()) {
                 let n = VERIFY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Compare the accumulator itself, not only the eval it
+                // produces: a small drift can round to the same score. Under
+                // threat fusion this is the whole psq + threat value.
+                let live: Vec<i16> = [acc.white(), acc.black()].concat();
                 acc.force_recompute(net, board);
+                if live[..] != [acc.white(), acc.black()].concat()[..] {
+                    static ACC_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let m = ACC_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if m < 20 {
+                        eprintln!("NNUE ACCUMULATOR MISMATCH n={} hash={:016x} fused={}", n, board.hash, fused);
+                    }
+                    if std::env::var("CODA_VERIFY_THREATS").as_deref() == Ok("panic") {
+                        panic!("NNUE accumulator mismatch (CODA_VERIFY_THREATS=panic)");
+                    }
+                }
                 let s2 = evaluate_nnue(board, net, acc, &self.threat_stack);
                 if s != s2 {
                     let m = VERIFY_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2346,7 +2386,10 @@ impl SearchInfo {
                 // uses is perturbed. Opt-in via CODA_VERIFY_NNUE (this whole
                 // block); CODA_VERIFY_THREATS=panic upgrades mismatch to panic.
                 // ---------------------------------------------------------------
-                if self.threat_stack.active && net.has_threats {
+                // Under threat fusion the stack's value arrays are not
+                // maintained; the check above already compared the combined
+                // accumulator against a from-scratch rebuild of both halves.
+                if self.threat_stack.active && net.has_threats && !fused {
                     static THREAT_PANIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                     static THREAT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     static THREAT_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2547,7 +2590,9 @@ impl SearchInfo {
     fn materialize_tt_barrier(&mut self, board: &Board) {
         if let (Some(net), Some(acc)) = (&self.nnue_net, &mut self.nnue_acc) {
             if acc.has_unmaterialized_psq_barrier() {
-                acc.materialize(net, board);
+                // Under threat fusion the other perspective may replay, which
+                // needs the threat deltas (ignored when unfused).
+                acc.materialize_with(net, board, Some(&mut self.threat_stack));
             }
         }
     }
@@ -2798,6 +2843,15 @@ fn prefetch_corr_rows(info: &SearchInfo, board: &Board, ply: usize) {
 /// This node's checker set: the parent's hint when it is for this exact
 /// position (see `SearchInfo::checkers_hint`), else computed fresh.
 #[inline(always)]
+/// Raw static eval for the node at `ply`: the parent's handed-down value when it
+/// is for this exact position (see `SearchInfo::eval_hint`), else a fresh eval.
+fn raw_eval_for_node(info: &mut SearchInfo, board: &Board, ply: usize) -> i32 {
+    match info.eval_hint.get(ply) {
+        Some(&(key, ev)) if key == board.hash => ev,
+        _ => info.eval(board),
+    }
+}
+
 fn checkers_for_node(info: &SearchInfo, board: &Board, ply: usize) -> Bitboard {
     match info.checkers_hint.get(ply) {
         Some(&(key, chk)) if key == board.hash => {
@@ -3887,6 +3941,7 @@ pub(crate) fn search_helper(board: &mut Board, info: &mut SearchInfo, _limits: &
     info.stats = PruneStats::default();
     info.static_evals = [0; MAX_PLY + 1];
     info.checkers_hint = [(0, 0); MAX_PLY + 1];
+    info.eval_hint = [(0, 0); MAX_PLY + 1];
     info.reductions = [0; MAX_PLY + 1];
     info.excluded_move = [NO_MOVE; MAX_PLY + 1];
     info.moved_piece_stack = [0; MAX_PLY + 1];
@@ -3936,6 +3991,15 @@ pub(crate) fn search_helper(board: &mut Board, info: &mut SearchInfo, _limits: &
             info.threat_stack.refresh(&net.threat_weights, net.num_threat_features, board, WHITE);
             info.threat_stack.refresh(&net.threat_weights, net.num_threat_features, board, BLACK);
         }
+    }
+    // Fused PSQ+threat accumulator (NNUEAccumulator::set_threat_fusion):
+    // decided per search, after REFRESH_MODE, because it needs the threat
+    // deltas that refresh mode stops generating. A mode change invalidates the
+    // stack, so rebuild the root here.
+    if let (Some(net), Some(acc)) = (&info.nnue_net, &mut info.nnue_acc) {
+        acc.set_threat_fusion(info.threat_stack.active && net.threat_fusion_ok()
+            && !crate::threat_accum::refresh_mode());
+        acc.materialize(net, board);
     }
 
     let root_legal = generate_legal_moves(board);
@@ -4167,6 +4231,15 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
             info.threat_stack.refresh(&net.threat_weights, net.num_threat_features, board, BLACK);
         }
     }
+    // Fused PSQ+threat accumulator (NNUEAccumulator::set_threat_fusion):
+    // decided per search, after REFRESH_MODE, because it needs the threat
+    // deltas that refresh mode stops generating. A mode change invalidates the
+    // stack, so rebuild the root here.
+    if let (Some(net), Some(acc)) = (&info.nnue_net, &mut info.nnue_acc) {
+        acc.set_threat_fusion(info.threat_stack.active && net.threat_fusion_ok()
+            && !crate::threat_accum::refresh_mode());
+        acc.materialize(net, board);
+    }
 
     info.start_time = Instant::now();
     // Note: stop flag AND ponderhit_time are cleared by the UCI thread before
@@ -4232,6 +4305,7 @@ pub fn search(board: &mut Board, info: &mut SearchInfo, limits: &SearchLimits) -
     // Clear static evals, excluded moves, depth tracking
     info.static_evals = [0; MAX_PLY + 1];
     info.checkers_hint = [(0, 0); MAX_PLY + 1];
+    info.eval_hint = [(0, 0); MAX_PLY + 1];
     info.depth_nodes = [0; MAX_PLY + 1];
     info.completed_depth = 0;
     // Reset the shared instant-reply gate inputs for THIS search. The UCI
@@ -6090,7 +6164,7 @@ fn negamax(
             info.stats_tt_static_eval_hits += 1;
             tt_static_eval_hit = true;
         } else {
-            raw_eval = info.eval(board);
+            raw_eval = raw_eval_for_node(info, board, ply_u);
             // Eval-only TT writeback: when we paid for an NNUE eval AND
             // there's no existing TT entry, seed the TT with static_eval
             // so later visits of this position (from different move
@@ -7359,6 +7433,36 @@ let singular_beta = tt_score_local - depth;
                     reduction -= complexity * LMR_SCALE / tp(&LMR_COMPLEXITY_DIV); // CONTINUOUS
                 }
 
+                // Child-eval LMR (see LMR_CHILD_EVAL_DIV). The board is
+                // post-make_move, so this is the eval the child would compute
+                // itself: TT static eval if present, else NNUE, handed down
+                // via eval_hint so the child does not evaluate twice. Skipped
+                // when the child is in check (no static eval there) and when
+                // alpha is a decisive score (the gap would be meaningless).
+                if !gives_check && !crate::tt::is_decisive(alpha) && ply_u + 1 <= MAX_PLY {
+                    let child_tt = info.tt.probe(board.hash);
+                    let child_raw = if FEAT_TT_STATIC_EVAL.load(Ordering::Relaxed)
+                        && child_tt.hit && child_tt.static_eval > -4095
+                    {
+                        child_tt.static_eval
+                    } else {
+                        let ev = info.eval(board);
+                        info.eval_hint[ply_u + 1] = (board.hash, ev);
+                        ev
+                    };
+                    let child_scaled = apply_halfmove_scale(child_raw, board.halfmove);
+                    let child_eval = if FEAT_CORRECTION.load(Ordering::Relaxed) {
+                        corrected_eval(info, board, child_scaled, ply_u + 1)
+                    } else {
+                        child_scaled
+                    };
+                    // Shortfall of the move's resulting position below alpha,
+                    // from this node's side: positive = looks bad, reduce more.
+                    let shortfall = alpha + child_eval;
+                    let cap = tp(&LMR_CHILD_EVAL_CAP_CENTI);
+                    reduction += (shortfall * LMR_SCALE / tp(&LMR_CHILD_EVAL_DIV)).clamp(-cap, cap); // CONTINUOUS
+                }
+
                 // Threat-density LMR: reduce less when multiple pieces are
                 // under pawn attack. Tactical positions need deeper search.
                 // Fixed-point divisor: stored × 10. Avoids tp10 swallowing
@@ -8395,7 +8499,7 @@ fn quiescence_with_depth(
         info.stats_tt_static_eval_hits += 1;
         tt_entry.static_eval
     } else {
-        info.eval(board)
+        raw_eval_for_node(info, board, (ply as usize).min(MAX_PLY))
     };
     // Apply correction history to the QS stand-pat, mirroring negamax's
     // static-eval path (halfmove-scale THEN corrected_eval).
@@ -9016,6 +9120,9 @@ fn bench_inner(depth: i32, nnue_path: Option<&str>, print_stats: bool,
                   if full > 0 { acc.stats_rebuild_chain as f64 * 100.0 / full as f64 } else { 0.0 });
         eprintln!("NNUE incremental:   {:>10} ({:>5.2}% of evals)", incr,
                   if total_evals > 0 { incr as f64 * 100.0 / total_evals as f64 } else { 0.0 });
+        if acc.stats_block_swaps > 0 {
+            eprintln!("  of which block swaps: {}", acc.stats_block_swaps);
+        }
         eprintln!("TT static-eval hit: {:>10} ({:>5.2}% of call sites)", tt,
                   if eval_call_attempts > 0 { tt as f64 * 100.0 / eval_call_attempts as f64 } else { 0.0 });
         eprintln!("Already-computed:   {:>10}", skip);
